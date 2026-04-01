@@ -1,8 +1,12 @@
 """Main entry point for the agent framework."""
 
+import argparse
 import asyncio
 import logging
 import os
+import signal
+import sys
+import time
 
 from dotenv import load_dotenv
 
@@ -24,6 +28,206 @@ logger = logging.getLogger(__name__)
 # Configuration - API key and model ID from environment variables with fallbacks
 API_KEY = os.environ.get("NVIDIA_API_KEY", "")
 MODEL_ID = os.environ.get("MODEL_ID", "moonshotai/kimi-k2-instruct-0905")
+PID_FILE = "agentzero.pid"
+
+
+def daemonize() -> None:
+    """Detach the current process and continue execution in the background."""
+    if os.name != "posix":
+        raise RuntimeError("Daemon mode is only supported on POSIX systems")
+
+    # First fork: parent exits, child continues.
+    if os.fork() > 0:
+        os._exit(0)
+
+    os.setsid()
+
+    # Second fork: prevent reacquiring a controlling terminal.
+    if os.fork() > 0:
+        os._exit(0)
+
+    sys.stdout.flush()
+    sys.stderr.flush()
+
+    with open(os.devnull, "r", encoding="utf-8") as stdin_handle, open(
+        "agentzero.out.log", "a", encoding="utf-8"
+    ) as stdout_handle, open(
+        "agentzero.err.log", "a", encoding="utf-8"
+    ) as stderr_handle:
+        os.dup2(stdin_handle.fileno(), sys.stdin.fileno())
+        os.dup2(stdout_handle.fileno(), sys.stdout.fileno())
+        os.dup2(stderr_handle.fileno(), sys.stderr.fileno())
+
+
+def _pid_is_running(pid: int) -> bool:
+    """Check whether a process ID exists."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _read_pid_file() -> int | None:
+    """Read PID from PID file if it exists and is valid."""
+    if not os.path.exists(PID_FILE):
+        return None
+
+    try:
+        with open(PID_FILE, "r", encoding="utf-8") as handle:
+            return int(handle.read().strip())
+    except (ValueError, OSError):
+        return None
+
+
+def write_pid_file() -> None:
+    """Write current daemon PID to disk, rejecting duplicate live daemon."""
+    existing_pid = _read_pid_file()
+    if existing_pid and _pid_is_running(existing_pid):
+        raise RuntimeError(
+            f"AgentZero daemon already appears to be running with PID {existing_pid}."
+        )
+
+    # Remove stale or invalid PID file before writing current PID.
+    if os.path.exists(PID_FILE):
+        try:
+            os.remove(PID_FILE)
+        except OSError:
+            pass
+
+    with open(PID_FILE, "w", encoding="utf-8") as handle:
+        handle.write(str(os.getpid()))
+
+
+def _find_orphan_daemon_pids() -> list[int]:
+    """Find orphaned AgentZero daemon PIDs by inspecting /proc cmdlines."""
+    if os.name != "posix":
+        return []
+
+    matches: list[int] = []
+    proc_dir = "/proc"
+    if not os.path.isdir(proc_dir):
+        return []
+
+    for entry in os.listdir(proc_dir):
+        if not entry.isdigit():
+            continue
+
+        pid = int(entry)
+        if pid == os.getpid():
+            continue
+
+        cmdline_path = os.path.join(proc_dir, entry, "cmdline")
+        try:
+            with open(cmdline_path, "rb") as handle:
+                raw_cmdline = handle.read()
+        except OSError:
+            continue
+
+        if not raw_cmdline:
+            continue
+
+        argv = [
+            part.decode("utf-8", errors="ignore")
+            for part in raw_cmdline.split(b"\0")
+            if part
+        ]
+        cmdline = " ".join(argv)
+
+        if "main.py" in cmdline and "--daemon" in cmdline:
+            matches.append(pid)
+
+    return matches
+
+
+def _terminate_pid(pid: int) -> bool:
+    """Terminate a PID gracefully, escalating to SIGKILL if needed."""
+    if not _pid_is_running(pid):
+        return True
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as exc:
+        print(f"Failed to stop daemon PID {pid}: {exc}")
+        return False
+
+    # Wait briefly for graceful shutdown.
+    for _ in range(30):
+        if not _pid_is_running(pid):
+            return True
+        time.sleep(0.1)
+
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError as exc:
+        print(f"Failed to force-stop daemon PID {pid}: {exc}")
+        return False
+
+    for _ in range(20):
+        if not _pid_is_running(pid):
+            return True
+        time.sleep(0.1)
+
+    print(f"Daemon PID {pid} did not terminate after SIGKILL.")
+    return False
+
+
+def stop_daemon() -> int:
+    """Stop the daemon process referenced by the PID file."""
+    pid = _read_pid_file()
+    if pid is None:
+        orphan_pids = _find_orphan_daemon_pids()
+        if not orphan_pids:
+            print("No PID file found. Daemon does not appear to be running.")
+            return 1
+
+        failures = []
+        for orphan_pid in orphan_pids:
+            if _terminate_pid(orphan_pid):
+                print(f"Stopped orphaned daemon PID {orphan_pid}.")
+            else:
+                failures.append(orphan_pid)
+
+        if failures:
+            return 1
+
+        return 0
+
+    if not _pid_is_running(pid):
+        print(f"Stale PID file found for PID {pid}. Removing it.")
+        try:
+            os.remove(PID_FILE)
+        except OSError:
+            pass
+        orphan_pids = _find_orphan_daemon_pids()
+        if not orphan_pids:
+            return 1
+
+        failures = []
+        for orphan_pid in orphan_pids:
+            if _terminate_pid(orphan_pid):
+                print(f"Stopped orphaned daemon PID {orphan_pid}.")
+            else:
+                failures.append(orphan_pid)
+
+        if failures:
+            return 1
+
+        return 0
+
+    if not _terminate_pid(pid):
+        return 1
+
+    if os.path.exists(PID_FILE):
+        try:
+            os.remove(PID_FILE)
+        except OSError:
+            pass
+
+    print(f"Stopped daemon PID {pid}.")
+    return 0
 
 
 def initialize_agent() -> AgentHandler:
@@ -80,6 +284,29 @@ def initialize_agent() -> AgentHandler:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run AgentZero integrations")
+    parser.add_argument(
+        "--daemon",
+        action="store_true",
+        help="Run the process in the background (POSIX only).",
+    )
+    parser.add_argument(
+        "--stop",
+        action="store_true",
+        help="Stop a running daemon process.",
+    )
+    args = parser.parse_args()
+
+    if args.daemon and args.stop:
+        parser.error("--daemon and --stop cannot be used together")
+
+    if args.stop:
+        sys.exit(stop_daemon())
+
+    if args.daemon:
+        daemonize()
+        write_pid_file()
+
     # Initialize the agent
     handler = initialize_agent()
 

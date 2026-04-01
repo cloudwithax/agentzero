@@ -27,6 +27,21 @@ cp .env.example .env
 python main.py
 ```
 
+### Run the agent as a daemon:
+```bash
+python main.py --daemon
+```
+
+In daemon mode, output is written to `agentzero.out.log` and `agentzero.err.log`.
+
+### Stop the daemon:
+```bash
+python main.py --stop
+```
+
+Daemon mode uses `agentzero.pid` to track the running background process.
+If the PID file is missing or stale, `--stop` will also try to find and stop orphaned `main.py --daemon` processes.
+
 This will run the agent with both Telegram and iMessage (using SendBlue) channels enabled. You can interact with the agent through either platform. The bot will refuse to start if the required API keys are not set.
 
 ## Features
