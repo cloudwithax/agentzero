@@ -34,7 +34,10 @@ cp .env.example .env
 Optional Sendblue reliability settings:
 - `SENDBLUE_WEBHOOK_PORT` - Run local webhook server instead of polling.
 - `SENDBLUE_RECEIVE_WEBHOOK_URL` - If set, periodically verifies your Sendblue `receive` webhook and re-adds it if missing using append-only `POST /api/account/webhooks`.
+- `SENDBLUE_TYPING_WEBHOOK_URL` - Optional dedicated URL for Sendblue `typing_indicator` webhook registration. If unset, the bot reuses `SENDBLUE_RECEIVE_WEBHOOK_URL`.
 - `SENDBLUE_WEBHOOK_CHECK_INTERVAL` - Seconds between webhook checks (default: `60`, min enforced: `10`).
+- `SENDBLUE_ATTACHMENT_DEBOUNCE_SECONDS` - Debounce window for attachment-first inbound webhook sequences before sending to the agent (default: `2.0`).
+- `SENDBLUE_TYPING_DEBOUNCE_SECONDS` - Optional debounce extension window for typing webhook events when a sender already has pending queued content (default: attachment debounce value).
 
 ## Usage
 

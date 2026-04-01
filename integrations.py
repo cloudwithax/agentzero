@@ -5,7 +5,7 @@ import json
 import logging
 import os
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 import aiohttp
 from aiohttp import web
@@ -96,6 +96,145 @@ def _extract_sendblue_attachment_urls(payload: dict[str, Any]) -> list[str]:
     for key in ("media_url", "media_urls", "attachments"):
         attachments.extend(_normalize_attachment_urls(payload.get(key)))
     return _normalize_attachment_urls(attachments)
+
+
+def _extract_sendblue_sender_number(payload: dict[str, Any]) -> str:
+    """Extract the contact number from Sendblue webhook payloads."""
+    value = (
+        payload.get("number")
+        or payload.get("phone_number")
+        or payload.get("from_number")
+    )
+    if not isinstance(value, str):
+        return ""
+    return value.strip()
+
+
+def _extract_sendblue_typing_state(payload: dict[str, Any]) -> bool | None:
+    """Return typing state if payload appears to be a typing-indicator event."""
+    if "is_typing" in payload:
+        return _to_bool(payload.get("is_typing"))
+
+    if "isTyping" in payload:
+        return _to_bool(payload.get("isTyping"))
+
+    for key in ("event", "type", "status", "action"):
+        value = payload.get(key)
+        if not isinstance(value, str):
+            continue
+        normalized = value.strip().lower()
+        if normalized in {
+            "typing",
+            "typing_start",
+            "typing_started",
+            "started_typing",
+            "typing-indicator",
+            "typing_indicator",
+        }:
+            return True
+        if normalized in {
+            "typing_stop",
+            "typing_stopped",
+            "stopped_typing",
+        }:
+            return False
+
+    if "typing" in payload:
+        return _to_bool(payload.get("typing"))
+
+    return None
+
+
+def _schedule_sendblue_pending_flush_locked(
+    pending_sendblue_messages: dict[str, dict[str, Any]],
+    sender_number: str,
+    pending_sendblue_lock: asyncio.Lock,
+    debounce_seconds: float,
+    process_callback: Callable[[str, str, list[str]], Awaitable[None]],
+) -> None:
+    """Reset and schedule delayed processing for a queued sender payload."""
+    pending_payload = pending_sendblue_messages.get(sender_number)
+    if pending_payload is None:
+        return
+
+    existing_task = pending_payload.get("task")
+    if isinstance(existing_task, asyncio.Task):
+        existing_task.cancel()
+
+    async def _flush_after_delay() -> None:
+        try:
+            await asyncio.sleep(debounce_seconds)
+            async with pending_sendblue_lock:
+                payload = pending_sendblue_messages.pop(sender_number, None)
+
+            if not payload:
+                return
+
+            text_parts = payload.get("text_parts", [])
+            text = "\n".join(
+                part for part in text_parts if isinstance(part, str) and part.strip()
+            ).strip()
+            attachments = _normalize_attachment_urls(payload.get("attachments", []))
+
+            if not text and not attachments:
+                return
+
+            await process_callback(sender_number, text, attachments)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logger.error("Error flushing Sendblue debounce queue: %s", e)
+
+    pending_payload["task"] = asyncio.create_task(_flush_after_delay())
+
+
+async def _queue_sendblue_pending_message(
+    pending_sendblue_messages: dict[str, dict[str, Any]],
+    pending_sendblue_lock: asyncio.Lock,
+    sender_number: str,
+    text: str,
+    attachments: list[str],
+    debounce_seconds: float,
+    process_callback: Callable[[str, str, list[str]], Awaitable[None]],
+    *,
+    create_if_missing: bool = True,
+) -> bool:
+    """Queue or update a sender payload, then debounce-send it to the agent."""
+    normalized_text = (text or "").strip()
+    normalized_attachments = _normalize_attachment_urls(attachments)
+
+    async with pending_sendblue_lock:
+        payload = pending_sendblue_messages.get(sender_number)
+        if payload is None:
+            if not create_if_missing:
+                return False
+            payload = {"text_parts": [], "attachments": [], "task": None}
+            pending_sendblue_messages[sender_number] = payload
+
+        if normalized_text:
+            payload["text_parts"].append(normalized_text)
+        if normalized_attachments:
+            payload["attachments"].extend(normalized_attachments)
+
+        _schedule_sendblue_pending_flush_locked(
+            pending_sendblue_messages,
+            sender_number,
+            pending_sendblue_lock,
+            debounce_seconds,
+            process_callback,
+        )
+
+    return True
+
+
+async def _has_pending_sendblue_message(
+    pending_sendblue_messages: dict[str, dict[str, Any]],
+    pending_sendblue_lock: asyncio.Lock,
+    sender_number: str,
+) -> bool:
+    """Check whether a sender currently has a queued Sendblue payload."""
+    async with pending_sendblue_lock:
+        return sender_number in pending_sendblue_messages
 
 
 def _model_supports_multimodal() -> bool:
@@ -520,6 +659,42 @@ async def add_sendblue_receive_webhook(
             await session.close()
 
 
+async def add_sendblue_typing_webhook(
+    webhook_url: str, session: Optional[aiohttp.ClientSession] = None
+) -> dict:
+    """Append a typing_indicator webhook using Sendblue POST /account/webhooks."""
+    api_key = os.environ.get("SENDBLUE_API_KEY")
+    api_secret = os.environ.get("SENDBLUE_API_SECRET")
+    if not api_key or not api_secret:
+        return {"success": False, "error": "Credentials missing"}
+
+    headers = {
+        "Content-Type": "application/json",
+        "sb-api-key-id": api_key,
+        "sb-api-secret-key": api_secret,
+    }
+    payload = {"webhooks": [webhook_url], "type": "typing_indicator"}
+
+    close_session = False
+    if session is None:
+        session = aiohttp.ClientSession()
+        close_session = True
+
+    try:
+        async with session.post(
+            "https://api.sendblue.co/api/account/webhooks",
+            json=payload,
+            headers=headers,
+        ) as resp:
+            data = await resp.json()
+            return {"success": resp.status == 200, "data": data, "status": resp.status}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+    finally:
+        if close_session:
+            await session.close()
+
+
 def _extract_webhook_urls(values) -> set:
     """Extract URL strings from mixed webhook entries (string/object)."""
     urls = set()
@@ -532,6 +707,20 @@ def _extract_webhook_urls(values) -> set:
             url = entry.get("url")
             if isinstance(url, str):
                 urls.add(url.strip())
+    return urls
+
+
+def _extract_webhook_type_urls(hooks: Any, webhook_type: str) -> set:
+    """Extract webhook URLs for a specific Sendblue webhook type."""
+    if not isinstance(hooks, dict):
+        return set()
+
+    urls = _extract_webhook_urls(hooks.get(webhook_type, []))
+
+    # Backward-compatible alias support for typing webhooks.
+    if webhook_type == "typing_indicator":
+        urls.update(_extract_webhook_urls(hooks.get("typing", [])))
+
     return urls
 
 
@@ -555,13 +744,46 @@ async def ensure_sendblue_receive_webhook(
 
         data = listed.get("data", {})
         hooks = data.get("webhooks", {}) if isinstance(data, dict) else {}
-        receive_urls = _extract_webhook_urls(hooks.get("receive", []))
+        receive_urls = _extract_webhook_type_urls(hooks, "receive")
         if target in receive_urls:
             return {"success": True, "already_present": True}
 
         added = await add_sendblue_receive_webhook(target, session=session)
         if added.get("success"):
             logger.warning("Re-added missing Sendblue receive webhook: %s", target)
+        return added
+    finally:
+        if close_session:
+            await session.close()
+
+
+async def ensure_sendblue_typing_webhook(
+    webhook_url: str, session: Optional[aiohttp.ClientSession] = None
+) -> dict:
+    """Ensure the typing_indicator webhook exists; add it via POST if missing."""
+    target = webhook_url.strip()
+    if not target:
+        return {"success": False, "error": "Empty webhook URL"}
+
+    close_session = False
+    if session is None:
+        session = aiohttp.ClientSession()
+        close_session = True
+
+    try:
+        listed = await list_sendblue_webhooks(session=session)
+        if not listed.get("success"):
+            return listed
+
+        data = listed.get("data", {})
+        hooks = data.get("webhooks", {}) if isinstance(data, dict) else {}
+        typing_urls = _extract_webhook_type_urls(hooks, "typing_indicator")
+        if target in typing_urls:
+            return {"success": True, "already_present": True}
+
+        added = await add_sendblue_typing_webhook(target, session=session)
+        if added.get("success"):
+            logger.warning("Re-added missing Sendblue typing webhook: %s", target)
         return added
     finally:
         if close_session:
@@ -588,6 +810,30 @@ async def monitor_sendblue_receive_webhook() -> None:
                 )
         except Exception as e:
             logger.error("Sendblue receive webhook monitor error: %s", e)
+        await asyncio.sleep(interval)
+
+
+async def monitor_sendblue_typing_webhook(webhook_url: Optional[str] = None) -> None:
+    """Periodically re-add missing typing_indicator webhook using append-only API."""
+    target_url = webhook_url or os.environ.get("SENDBLUE_TYPING_WEBHOOK_URL", "")
+    target_url = target_url.strip()
+    if not target_url:
+        return
+
+    interval = int(os.environ.get("SENDBLUE_WEBHOOK_CHECK_INTERVAL", "60"))
+    interval = max(interval, 10)
+
+    logger.info("Sendblue typing webhook monitor enabled (interval: %ss)", interval)
+    while True:
+        try:
+            result = await ensure_sendblue_typing_webhook(target_url)
+            if not result.get("success"):
+                logger.error(
+                    "Sendblue typing webhook check failed: %s",
+                    result.get("error") or result,
+                )
+        except Exception as e:
+            logger.error("Sendblue typing webhook monitor error: %s", e)
         await asyncio.sleep(interval)
 
 
@@ -663,6 +909,43 @@ async def start_sendblue_webhook_server(handler: AgentHandler, port: int):
     own_number = os.environ.get("SENDBLUE_NUMBER")
     processed_handles = set()
     dedup_ttl_seconds = 60
+    pending_sendblue_messages: dict[str, dict[str, Any]] = {}
+    pending_sendblue_lock = asyncio.Lock()
+
+    attachment_debounce_seconds = 2.0
+    try:
+        attachment_debounce_seconds = max(
+            0.1,
+            float(os.environ.get("SENDBLUE_ATTACHMENT_DEBOUNCE_SECONDS", "2.0")),
+        )
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid SENDBLUE_ATTACHMENT_DEBOUNCE_SECONDS, defaulting to %.1fs",
+            attachment_debounce_seconds,
+        )
+
+    typing_debounce_seconds = attachment_debounce_seconds
+    try:
+        typing_debounce_seconds = max(
+            0.1,
+            float(
+                os.environ.get(
+                    "SENDBLUE_TYPING_DEBOUNCE_SECONDS",
+                    str(attachment_debounce_seconds),
+                )
+            ),
+        )
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid SENDBLUE_TYPING_DEBOUNCE_SECONDS, defaulting to %.1fs",
+            typing_debounce_seconds,
+        )
+
+    async def _process_queued_sender_payload(
+        sender_number: str, text: str, attachments: list[str]
+    ) -> None:
+        user_content = _build_user_message_content(text, attachments)
+        await process_imessage_and_reply(handler, sender_number, user_content)
 
     async def webhook_endpoint(request):
         try:
@@ -673,11 +956,7 @@ async def start_sendblue_webhook_server(handler: AgentHandler, port: int):
                 form_data = await request.post()
                 data = dict(form_data)
 
-            sender_number = (
-                data.get("from_number")
-                or data.get("number")
-                or data.get("phone_number")
-            )
+            sender_number = _extract_sendblue_sender_number(data)
             content = data.get("content") or data.get("message") or data.get("text", "")
             attachments = _extract_sendblue_attachment_urls(data)
             direction = str(data.get("direction", "")).lower()
@@ -706,10 +985,51 @@ async def start_sendblue_webhook_server(handler: AgentHandler, port: int):
                 ):
                     return web.Response(status=200, text="OK")
 
+                typing_state = _extract_sendblue_typing_state(data)
+                if typing_state is not None:
+                    if typing_state:
+                        queued = await _queue_sendblue_pending_message(
+                            pending_sendblue_messages,
+                            pending_sendblue_lock,
+                            sender_number,
+                            "",
+                            [],
+                            typing_debounce_seconds,
+                            _process_queued_sender_payload,
+                            create_if_missing=False,
+                        )
+                        if queued:
+                            logger.debug(
+                                "Extended Sendblue debounce for typing event from %s",
+                                sender_number,
+                            )
+                    return web.Response(status=200, text="OK")
+
                 if not content.strip() and not attachments:
                     logger.info(
                         "Ignoring webhook event with empty content and no attachments: %s",
                         data,
+                    )
+                    return web.Response(status=200, text="OK")
+
+                has_pending = await _has_pending_sendblue_message(
+                    pending_sendblue_messages,
+                    pending_sendblue_lock,
+                    sender_number,
+                )
+                should_debounce = bool(
+                    (attachments and not content.strip()) or has_pending
+                )
+
+                if should_debounce:
+                    await _queue_sendblue_pending_message(
+                        pending_sendblue_messages,
+                        pending_sendblue_lock,
+                        sender_number,
+                        content,
+                        attachments,
+                        attachment_debounce_seconds,
+                        _process_queued_sender_payload,
                     )
                     return web.Response(status=200, text="OK")
 
@@ -748,12 +1068,21 @@ async def start_sendblue_webhook_server(handler: AgentHandler, port: int):
 
     app.router.add_post("/webhook", webhook_endpoint)
     app.router.add_post("/webhook/receive", webhook_endpoint)
+    app.router.add_post("/webhook/typing", webhook_endpoint)
+    app.router.add_post("/webhooks/typing", webhook_endpoint)
+    app.router.add_post("/webhook/typing-indicator", webhook_endpoint)
     app.router.add_post("/", webhook_endpoint)
     app.router.add_get("/webhook", webhook_healthcheck)
     app.router.add_get("/webhook/receive", webhook_healthcheck)
+    app.router.add_get("/webhook/typing", webhook_healthcheck)
+    app.router.add_get("/webhooks/typing", webhook_healthcheck)
+    app.router.add_get("/webhook/typing-indicator", webhook_healthcheck)
     app.router.add_get("/", webhook_healthcheck)
     app.router.add_head("/webhook", webhook_healthcheck)
     app.router.add_head("/webhook/receive", webhook_healthcheck)
+    app.router.add_head("/webhook/typing", webhook_healthcheck)
+    app.router.add_head("/webhooks/typing", webhook_healthcheck)
+    app.router.add_head("/webhook/typing-indicator", webhook_healthcheck)
     app.router.add_head("/", webhook_healthcheck)
 
     runner = web.AppRunner(app)
@@ -769,16 +1098,26 @@ async def start_sendblue_webhook_server(handler: AgentHandler, port: int):
 
 async def start_sendblue_bot(handler: AgentHandler):
     """Start Sendblue bot either via webhook or polling based on env config."""
-    monitor_task = None
-    if os.environ.get("SENDBLUE_RECEIVE_WEBHOOK_URL"):
-        monitor_task = asyncio.create_task(monitor_sendblue_receive_webhook())
+    monitor_tasks: list[asyncio.Task] = []
+    receive_webhook_url = os.environ.get("SENDBLUE_RECEIVE_WEBHOOK_URL", "").strip()
+    typing_webhook_url = os.environ.get("SENDBLUE_TYPING_WEBHOOK_URL", "").strip()
+
+    if receive_webhook_url:
+        monitor_tasks.append(asyncio.create_task(monitor_sendblue_receive_webhook()))
+
+    # If a dedicated typing webhook URL is not provided, reuse receive webhook URL.
+    typing_target = typing_webhook_url or receive_webhook_url
+    if typing_target:
+        monitor_tasks.append(
+            asyncio.create_task(monitor_sendblue_typing_webhook(typing_target))
+        )
 
     webhook_port = os.environ.get("SENDBLUE_WEBHOOK_PORT")
     if webhook_port:
         try:
             await start_sendblue_webhook_server(handler, int(webhook_port))
         finally:
-            if monitor_task:
+            for monitor_task in monitor_tasks:
                 monitor_task.cancel()
         return
 
