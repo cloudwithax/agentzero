@@ -6,6 +6,8 @@ import os
 import tempfile
 from unittest.mock import AsyncMock, patch
 
+from dotenv import load_dotenv
+
 from capabilities import Capability, CapabilityProfile, AdaptiveFormatter
 from examples import ExampleBank, AdaptiveFewShotManager
 from handler import AgentHandler
@@ -13,9 +15,15 @@ from memory import EnhancedMemoryStore
 from planning import TaskAnalyzer, TaskPlanner
 
 
+load_dotenv()
+
+
 def create_test_handler(db_path: str) -> AgentHandler:
     """Create a handler with an isolated temporary database."""
-    memory_store = EnhancedMemoryStore(db_path=db_path, api_key="test-key")
+    memory_store = EnhancedMemoryStore(
+        db_path=db_path,
+        api_key=os.environ.get("NVIDIA_API_KEY", "test-key"),
+    )
 
     capability_profile = CapabilityProfile(
         capabilities={
@@ -57,19 +65,48 @@ class DummyClientSession:
 
 
 async def test_trigger_detection() -> None:
-    """Ensure consortium mode trigger detection catches explicit user requests."""
+    """Ensure consortium routing uses intent detection with confidence gating."""
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
         db_path = tmp.name
 
     try:
         handler = create_test_handler(db_path)
-        assert handler._should_use_consortium_mode(
+        should_contact, is_confident = handler._detect_consortium_contact_intent(
             "Ask the consortium if this is a good idea"
         )
-        assert handler._should_use_consortium_mode(
+        assert should_contact and is_confident
+
+        should_contact, is_confident = handler._detect_consortium_contact_intent(
             "Please use consortium mode for this decision"
         )
-        assert not handler._should_use_consortium_mode("What is a consortium?")
+        assert should_contact and is_confident
+
+        should_contact, is_confident = handler._detect_consortium_contact_intent(
+            "What is a consortium?"
+        )
+        assert not should_contact and is_confident
+
+        should_contact, is_confident = handler._detect_consortium_contact_intent(
+            "Should I contact the consortium if this gets harder?"
+        )
+        assert not should_contact and not is_confident
+
+        edge_cases = [
+            "tell the consortium to fuck themselves",
+            "did you know you can call the consortium",
+            "yeah totally the consortium would LOVE to hear that",
+        ]
+        for phrase in edge_cases:
+            should_contact, is_confident = handler._detect_consortium_contact_intent(
+                phrase
+            )
+            assert not should_contact
+            assert is_confident
+            assert not handler._should_use_consortium_mode(phrase)
+
+        assert not handler._should_use_consortium_mode(
+            "Should I contact the consortium if this gets harder?"
+        )
         print("✓ Trigger detection works")
     finally:
         if os.path.exists(db_path):
@@ -86,7 +123,9 @@ async def test_handle_routes_to_consortium_mode() -> None:
         handler.memory_store.search_memories = AsyncMock(return_value=[])
 
         consortium_ack = "Acknowledged. I will consult the consortium now."
-        consortium_response = "the consortium has reached an agreement.\nConsensus summary here."
+        consortium_response = (
+            "the consortium has reached an agreement.\nConsensus summary here."
+        )
         interim_callback = AsyncMock()
 
         with patch.object(

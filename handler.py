@@ -5,6 +5,7 @@ import datetime
 import json
 import logging
 import os
+import re
 from typing import Any, Awaitable, Callable, Optional
 
 from memory import EnhancedMemoryStore
@@ -474,26 +475,88 @@ class AgentHandler:
         self.task_analyzer = task_analyzer
         self.adaptive_formatter = adaptive_formatter
 
-    def _should_use_consortium_mode(self, user_query: str) -> bool:
-        """Detect whether the user explicitly requested consortium mode."""
+    def _detect_consortium_contact_intent(self, user_query: str) -> tuple[bool, bool]:
+        """Return (should_contact_consortium, is_confident) for routing decisions."""
         if not user_query:
-            return False
+            return False, False
 
-        query = user_query.lower()
-        explicit_triggers = [
-            "the consortium",
-            "consortium mode",
-            "ask the consortium",
-            "consult the consortium",
-            "contact the consortium",
-            "use consortium",
-            "run consortium",
+        query = re.sub(r"\s+", " ", user_query.strip().lower())
+        if not query:
+            return False, False
+
+        hard_no_contact_patterns = [
+            r"\btell\b[^.?!]*\bconsortium\b[^.?!]*\b(?:fuck|screw|shove|damn)\b",
+            r"\bconsortium\b[^.?!]*\b(?:fuck|screw|shove|damn)\b",
         ]
-        if any(trigger in query for trigger in explicit_triggers):
-            return True
+        if any(re.search(pattern, query) for pattern in hard_no_contact_patterns):
+            return False, True
 
-        action_verbs = ["ask", "consult", "use", "run", "contact", "invoke"]
-        return "consortium" in query and any(verb in query for verb in action_verbs)
+        intent_score = 0
+        ambiguity_score = 0
+
+        direct_request_patterns = [
+            r"^\s*(?:please\s+)?(?:ask|consult|contact|call|use|run|invoke|loop in|bring in)\b[^.?!]*\b(?:the\s+)?consortium\b",
+            r"\b(?:can|could|would|will)\s+you\b[^.?!]*\b(?:ask|consult|contact|call|use|run|invoke)\b[^.?!]*\b(?:the\s+)?consortium\b",
+            r"\b(?:please|i want you to|let's|let us)\b[^.?!]*\b(?:ask|consult|contact|call|use|run|invoke)\b[^.?!]*\b(?:the\s+)?consortium\b",
+        ]
+        if any(re.search(pattern, query) for pattern in direct_request_patterns):
+            intent_score += 4
+
+        mode_activation_patterns = [
+            r"\b(?:use|enable|activate|switch to|turn on|run)\b[^.?!]*\bconsortium mode\b",
+            r"\bconsortium mode\b[^.?!]*\b(?:please|now|for this|for this decision)\b",
+        ]
+        if any(re.search(pattern, query) for pattern in mode_activation_patterns):
+            intent_score += 3
+
+        if "consortium" in query and re.search(
+            r"\b(ask|consult|contact|call|use|run|invoke|loop in|bring in)\b", query
+        ):
+            intent_score += 1
+
+        informational_patterns = [
+            r"^\s*(?:what|who|why|how|when|where)\b[^.?!]*\bconsortium\b\??$",
+            r"\b(?:what is|define|definition of|meaning of|explain|describe|history of|example of)\b[^.?!]*\bconsortium\b",
+            r"\b(?:the word|the term|the phrase)\b[^.?!]*\bconsortium\b",
+            r"\b(?:did you know|fyi|for your information)\b[^.?!]*\b(?:contact|call|ask|consult|invoke|use)\b[^.?!]*\bconsortium\b",
+            r"\b(?:you can|one can|people can)\b[^.?!]*\b(?:contact|call|ask|consult|invoke|use)\b[^.?!]*\bconsortium\b",
+        ]
+        if any(re.search(pattern, query) for pattern in informational_patterns):
+            ambiguity_score += 4
+
+        sarcastic_patterns = [
+            r"\b(?:yeah|sure|right)\b[^.?!]*\b(?:totally|obviously)\b[^.?!]*\bconsortium\b",
+            r"\bconsortium\b[^.?!]*\bwould\b[^.?!]*\blove to hear that\b",
+            r"\b(?:lol|lmao|as if)\b[^.?!]*\bconsortium\b",
+        ]
+        if any(re.search(pattern, query) for pattern in sarcastic_patterns):
+            ambiguity_score += 5
+
+        hypothetical_patterns = [
+            r"\b(?:should i|when should i|would it make sense to|if needed)\b[^.?!]*\b(?:contact|ask|consult|use|invoke)\b[^.?!]*\bconsortium\b",
+            r"\b(?:should we|would we)\b[^.?!]*\b(?:contact|ask|consult|use|invoke)\b[^.?!]*\bconsortium\b",
+        ]
+        if any(re.search(pattern, query) for pattern in hypothetical_patterns):
+            ambiguity_score += 2
+
+        negative_intent_patterns = [
+            r"\b(?:do not|don't|dont|without|no need to|avoid)\b[^.?!]*\bconsortium\b",
+        ]
+        if any(re.search(pattern, query) for pattern in negative_intent_patterns):
+            ambiguity_score += 5
+
+        should_contact = intent_score >= 3 and intent_score > ambiguity_score
+        is_confident = abs(intent_score - ambiguity_score) >= 2 and (
+            intent_score >= 3 or ambiguity_score >= 3
+        )
+        return should_contact, is_confident
+
+    def _should_use_consortium_mode(self, user_query: str) -> bool:
+        """Backward-compatible consortium router gate."""
+        should_contact, is_confident = self._detect_consortium_contact_intent(
+            user_query
+        )
+        return should_contact and is_confident
 
     def _extract_consortium_vote(
         self, messages: list[dict[str, Any]]
@@ -711,7 +774,9 @@ class AgentHandler:
         ]
 
         # Member-specific temperature differentiates reasoning style while using one model.
-        member_temperature = member.get("temperature", BASE_PAYLOAD.get("temperature", 0.6))
+        member_temperature = member.get(
+            "temperature", BASE_PAYLOAD.get("temperature", 0.6)
+        )
         try:
             member_temperature = float(member_temperature)
         except (TypeError, ValueError):
@@ -724,9 +789,7 @@ class AgentHandler:
             system_parts.append(memory_context.strip())
 
         if round_number == 1:
-            panel_context = (
-                "Blind round: produce an independent first-pass analysis using only the user request."
-            )
+            panel_context = "Blind round: produce an independent first-pass analysis using only the user request."
         else:
             panel_context = (
                 "Anonymized panel notes (identity redacted):\n"
@@ -990,7 +1053,15 @@ class AgentHandler:
             example_context=example_context,
         )
 
-        if user_query and self._should_use_consortium_mode(user_query):
+        should_contact_consortium = False
+        confident_consortium_intent = False
+        if user_query:
+            (
+                should_contact_consortium,
+                confident_consortium_intent,
+            ) = self._detect_consortium_contact_intent(user_query)
+
+        if should_contact_consortium and confident_consortium_intent:
             acknowledgement = ""
             acknowledgement_delivered = False
 
@@ -1006,7 +1077,9 @@ class AgentHandler:
                         await interim_response_callback(acknowledgement)
                         acknowledgement_delivered = True
                     except Exception:
-                        logger.exception("Failed to deliver interim consortium acknowledgement")
+                        logger.exception(
+                            "Failed to deliver interim consortium acknowledgement"
+                        )
 
                 content = await self._run_consortium_mode(
                     user_query=user_query,
