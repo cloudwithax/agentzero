@@ -35,6 +35,17 @@ except ImportError:
 # iMessage (Sendblue) Integration
 
 
+def _to_bool(value) -> bool:
+    """Parse common webhook boolean encodings safely."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return False
+
+
 async def send_imessage(
     phone_number: str, message: str, session: Optional[aiohttp.ClientSession] = None
 ) -> dict:
@@ -248,7 +259,7 @@ async def start_sendblue_webhook_server(handler: AgentHandler, port: int):
             )
             content = data.get("content") or data.get("message") or data.get("text", "")
             direction = str(data.get("direction", "")).lower()
-            is_outbound = bool(data.get("is_outbound"))
+            is_outbound = _to_bool(data.get("is_outbound"))
             message_handle = data.get("message_handle")
 
             if message_handle:
@@ -300,12 +311,23 @@ async def start_sendblue_webhook_server(handler: AgentHandler, port: int):
 
             return web.Response(status=200, text="OK")
         except Exception as e:
+            # Never return non-2xx to provider webhooks or they may disable callbacks.
             logger.error(f"Webhook error: {e}")
-            return web.Response(status=500, text="Error")
+            return web.Response(status=200, text="OK")
+
+    async def webhook_healthcheck(_request):
+        """Allow provider verification probes that may use GET/HEAD."""
+        return web.Response(status=200, text="OK")
 
     app.router.add_post("/webhook", webhook_endpoint)
     app.router.add_post("/webhook/receive", webhook_endpoint)
     app.router.add_post("/", webhook_endpoint)
+    app.router.add_get("/webhook", webhook_healthcheck)
+    app.router.add_get("/webhook/receive", webhook_healthcheck)
+    app.router.add_get("/", webhook_healthcheck)
+    app.router.add_head("/webhook", webhook_healthcheck)
+    app.router.add_head("/webhook/receive", webhook_healthcheck)
+    app.router.add_head("/", webhook_healthcheck)
 
     runner = web.AppRunner(app)
     await runner.setup()
