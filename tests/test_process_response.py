@@ -374,13 +374,194 @@ async def test_message_history_preservation():
 
     # Messages should be extended with assistant tool_calls + tool result
     # Original: 2 messages, after: 2 + 1 (assistant) + 1 (tool) = 4
-    assert len(messages) == original_len + 2, (
-        f"Messages not extended properly: {len(messages)}"
-    )
+    assert (
+        len(messages) == original_len + 2
+    ), f"Messages not extended properly: {len(messages)}"
     assert messages[2].get("tool_calls") is not None, "Missing tool_calls"
     assert messages[3]["role"] == "tool", "Missing tool result"
 
     print(f"  History length: {len(messages)} (was {original_len})")
+    print("  ✓ Passed")
+
+
+async def test_tool_leak_retry():
+    """Recover and execute bash tool call from leaked bash code block."""
+    print("Test 9: Tool-leak recovery to tool call")
+
+    first_response = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "```bash\ncurl -X POST https://example.com\n```",
+                }
+            }
+        ]
+    }
+
+    second_response = {
+        "choices": [
+            {"message": {"role": "assistant", "content": "All set, I fixed it."}}
+        ]
+    }
+
+    class MockResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        async def json(self):
+            return self.payload
+
+    class MockPostCM:
+        def __init__(self, payload):
+            self.payload = payload
+
+        async def __aenter__(self):
+            return MockResponse(self.payload)
+
+        async def __aexit__(self, *args):
+            return False
+
+    class MockSession:
+        def __init__(self):
+            self.calls = 0
+
+        def post(self, *args, **kwargs):
+            self.calls += 1
+            return MockPostCM(second_response)
+
+    mock_session = MockSession()
+    messages = [{"role": "user", "content": "please fix"}]
+
+    content = await process_response(
+        first_response, messages, mock_session, BASE_URL, API_KEY, BASE_PAYLOAD.copy()
+    )
+
+    assert content == "All set, I fixed it.", f"Unexpected content: {content}"
+    assert (
+        mock_session.calls == 1
+    ), f"Expected one follow-up call, got {mock_session.calls}"
+    tool_results = [m for m in messages if m.get("role") == "tool"]
+    assert len(tool_results) == 1, "Expected inferred bash tool result in history"
+    print("  ✓ Passed")
+
+
+async def test_tool_leak_fallback():
+    """Return fallback text for non-recoverable leaked tool-call content."""
+    print("Test 10: Tool-leak fallback")
+
+    leaked_response = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "<|tool_call|>not-valid-json",
+                }
+            }
+        ]
+    }
+
+    class MockResponse:
+        async def json(self):
+            return leaked_response
+
+    class MockPostCM:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return MockResponse()
+
+        async def __aexit__(self, *args):
+            return False
+
+    mock_session = AsyncMock()
+    mock_session.post = MockPostCM
+
+    messages = [{"role": "user", "content": "please fix"}]
+
+    content = await process_response(
+        leaked_response,
+        messages,
+        mock_session,
+        BASE_URL,
+        API_KEY,
+        BASE_PAYLOAD.copy(),
+        max_tool_leak_retries=1,
+    )
+
+    assert (
+        "internal formatting issue" in content.lower()
+    ), f"Unexpected content: {content}"
+    print("  ✓ Passed")
+
+
+async def test_json_tool_call_recovery():
+    """Recover and execute tool call from tool_call tag JSON payload."""
+    print("Test 11: JSON tool-call recovery")
+
+    first_response = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": '<|tool_call|>{"name":"bash","arguments":{"command":"echo recovered"}}',
+                }
+            }
+        ]
+    }
+
+    second_response = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "Recovered and executed successfully.",
+                }
+            }
+        ]
+    }
+
+    class MockResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        async def json(self):
+            return self.payload
+
+    class MockPostCM:
+        def __init__(self, payload):
+            self.payload = payload
+
+        async def __aenter__(self):
+            return MockResponse(self.payload)
+
+        async def __aexit__(self, *args):
+            return False
+
+    class MockSession:
+        def __init__(self):
+            self.calls = 0
+
+        def post(self, *args, **kwargs):
+            self.calls += 1
+            return MockPostCM(second_response)
+
+    mock_session = MockSession()
+    messages = [{"role": "user", "content": "run this please"}]
+
+    content = await process_response(
+        first_response, messages, mock_session, BASE_URL, API_KEY, BASE_PAYLOAD.copy()
+    )
+
+    assert (
+        content == "Recovered and executed successfully."
+    ), f"Unexpected content: {content}"
+    assert (
+        mock_session.calls == 1
+    ), f"Expected one follow-up call, got {mock_session.calls}"
+    tool_results = [m for m in messages if m.get("role") == "tool"]
+    assert len(tool_results) == 1, "Expected recovered tool result in history"
     print("  ✓ Passed")
 
 
@@ -398,6 +579,9 @@ async def main():
     await test_unknown_tool()
     await test_tool_result_format()
     await test_message_history_preservation()
+    await test_tool_leak_retry()
+    await test_tool_leak_fallback()
+    await test_json_tool_call_recovery()
 
     print()
     print("=" * 60)
