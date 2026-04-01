@@ -74,6 +74,80 @@ async def send_imessage(
             await session.close()
 
 
+async def send_typing_indicator(
+    phone_number: str, session: Optional[aiohttp.ClientSession] = None
+) -> dict:
+    """Send a typing indicator via Sendblue API."""
+    api_key = os.environ.get("SENDBLUE_API_KEY")
+    api_secret = os.environ.get("SENDBLUE_API_SECRET")
+    from_number = os.environ.get("SENDBLUE_NUMBER")
+    if not api_key or not api_secret:
+        return {"success": False, "error": "Credentials missing"}
+
+    headers = {
+        "Content-Type": "application/json",
+        "sb-api-key-id": api_key,
+        "sb-api-secret-key": api_secret,
+    }
+    payload = {"number": phone_number}
+    if from_number:
+        payload["from_number"] = from_number
+
+    close_session = False
+    if session is None:
+        session = aiohttp.ClientSession()
+        close_session = True
+    try:
+        async with session.post(
+            "https://api.sendblue.co/api/send-typing-indicator",
+            json=payload,
+            headers=headers,
+        ) as resp:
+            data = await resp.json()
+            return {"success": resp.status == 200, "data": data}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+    finally:
+        if close_session:
+            await session.close()
+
+
+async def send_read_receipt(
+    phone_number: str, session: Optional[aiohttp.ClientSession] = None
+) -> dict:
+    """Send a read receipt via Sendblue API."""
+    api_key = os.environ.get("SENDBLUE_API_KEY")
+    api_secret = os.environ.get("SENDBLUE_API_SECRET")
+    from_number = os.environ.get("SENDBLUE_NUMBER")
+    if not api_key or not api_secret:
+        return {"success": False, "error": "Credentials missing"}
+
+    headers = {
+        "Content-Type": "application/json",
+        "sb-api-key-id": api_key,
+        "sb-api-secret-key": api_secret,
+    }
+    payload = {"number": phone_number}
+    if from_number:
+        payload["from_number"] = from_number
+
+    close_session = False
+    if session is None:
+        session = aiohttp.ClientSession()
+        close_session = True
+    try:
+        async with session.post(
+            "https://api.sendblue.co/api/mark-read", json=payload, headers=headers
+        ) as resp:
+            data = await resp.json()
+            return {"success": resp.status == 200, "data": data}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+    finally:
+        if close_session:
+            await session.close()
+
+
 async def get_imessages(
     phone_number: Optional[str] = None, last_check: Optional[datetime] = None
 ) -> dict:
@@ -117,6 +191,38 @@ async def handle_imessage(handler: AgentHandler, phone_number: str, text: str) -
     except Exception as e:
         logger.error(f"Error: {e}")
         return "Sorry, an error occurred."
+
+
+async def process_imessage_and_reply(
+    handler: AgentHandler, phone_number: str, content: str
+) -> None:
+    """Send read receipt/typing signals, run agent, then send response."""
+
+    async with aiohttp.ClientSession() as session:
+        read_res = await send_read_receipt(phone_number, session=session)
+        if not read_res.get("success"):
+            logger.warning("Failed to send read receipt: %s", read_res)
+
+        async def _typing_loop():
+            while True:
+                typing_res = await send_typing_indicator(phone_number, session=session)
+                if not typing_res.get("success"):
+                    logger.debug("Typing indicator failed: %s", typing_res)
+                await asyncio.sleep(4)
+
+        typing_task = asyncio.create_task(_typing_loop())
+        try:
+            resp = await handle_imessage(handler, phone_number, content)
+        finally:
+            typing_task.cancel()
+            try:
+                await typing_task
+            except asyncio.CancelledError:
+                pass
+
+        send_res = await send_imessage(phone_number, resp, session=session)
+        if not send_res.get("success"):
+            logger.error("Failed to send Sendblue reply: %s", send_res)
 
 
 async def start_sendblue_webhook_server(handler: AgentHandler, port: int):
@@ -173,10 +279,9 @@ async def start_sendblue_webhook_server(handler: AgentHandler, port: int):
 
                 async def _process_and_reply():
                     try:
-                        resp = await handle_imessage(handler, sender_number, content)
-                        send_res = await send_imessage(sender_number, resp)
-                        if not send_res.get("success"):
-                            logger.error("Failed to send Sendblue reply: %s", send_res)
+                        await process_imessage_and_reply(
+                            handler, sender_number, content
+                        )
                     except Exception as e:
                         logger.error(f"Error processing webhook message: {e}")
 
@@ -239,14 +344,18 @@ async def start_sendblue_bot(handler: AgentHandler):
                     else res["data"].get("messages", [])
                 )
                 for msg in messages:
-                    if msg.get("direction") == "outgoing":
+                    if msg.get("direction") == "outgoing" or msg.get("is_outbound"):
                         continue
                     num = msg.get("from_number") or msg.get("number")
                     if not num:
                         logger.warning(f"Skipping message with no sender number: {msg}")
                         continue
-                    resp = await handle_imessage(handler, num, msg.get("content", ""))
-                    await send_imessage(num, resp)
+                    content = (
+                        msg.get("content") or msg.get("message") or msg.get("text", "")
+                    )
+                    if not content.strip():
+                        continue
+                    await process_imessage_and_reply(handler, num, content)
             # Move checkpoint to poll start time to avoid gaps where messages
             # arrive while the previous batch is being processed.
             last_check = poll_started_at
