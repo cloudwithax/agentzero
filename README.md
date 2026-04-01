@@ -4,8 +4,7 @@ An AI assistant with persistent memory and bulletproof tool calling. Tested agai
 
 ## Setup
 
-
-AgentZero is designed to be used completely for free using the NVIDIA API, which offers a generous free tier. You can also use OpenAI's API if you prefer, but be mindful of potential costs.
+AgentZero is designed to be used completely for free using the NVIDIA API, which offers a generous free tier.
 
 1. Install dependencies:
 ```bash
@@ -23,15 +22,12 @@ cp .env.example .env
 
 ## Usage
 
-### Run the CLI version:
+### Run the agent:
 ```bash
 python main.py
 ```
 
-### Run the Telegram bot:
-```bash
-python telegram_bot.py
-```
+This will run the agent with both Telegram and iMessage (using SendBlue) channels enabled. You can interact with the agent through either platform. The bot will refuse to start if the required API keys are not set.
 
 ## Features
 
@@ -41,3 +37,8 @@ python telegram_bot.py
 - PDF reading
 - Date/time utilities
 - Telegram bot integration
+
+
+## License
+
+This project is licensed under the [MIT License.](LICENSE)
