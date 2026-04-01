@@ -308,9 +308,7 @@ async def monitor_sendblue_receive_webhook() -> None:
     interval = int(os.environ.get("SENDBLUE_WEBHOOK_CHECK_INTERVAL", "60"))
     interval = max(interval, 10)
 
-    logger.info(
-        "Sendblue receive webhook monitor enabled (interval: %ss)", interval
-    )
+    logger.info("Sendblue receive webhook monitor enabled (interval: %ss)", interval)
     while True:
         try:
             result = await ensure_sendblue_receive_webhook(webhook_url)
