@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Optional, Dict
 
 import aiohttp
+from aiohttp import web
 
 from handler import AgentHandler
 
@@ -40,15 +41,21 @@ async def send_imessage(
     """Send an iMessage via Sendblue API."""
     api_key = os.environ.get("SENDBLUE_API_KEY")
     api_secret = os.environ.get("SENDBLUE_API_SECRET")
-    if not api_key or not api_secret:
-        return {"success": False, "error": "Credentials missing"}
+    from_number = os.environ.get("SENDBLUE_NUMBER")
+    if not api_key or not api_secret or not from_number:
+        return {"success": False, "error": "Credentials or SENDBLUE_NUMBER missing"}
 
     headers = {
         "Content-Type": "application/json",
         "sb-api-key-id": api_key,
         "sb-api-secret-key": api_secret,
     }
-    payload = {"number": phone_number, "content": message, "send_style": "regular"}
+    payload = {
+        "number": phone_number,
+        "from_number": from_number,
+        "content": message,
+        "send_style": "regular",
+    }
 
     close_session = False
     if session is None:
@@ -84,7 +91,7 @@ async def get_imessages(
 
     async with aiohttp.ClientSession() as session:
         async with session.get(
-            "https://api.sendblue.co/api/get-messages", params=params, headers=headers
+            "https://api.sendblue.co/api/v2/messages", params=params, headers=headers
         ) as resp:
             data = await resp.json()
             return {"success": resp.status == 200, "data": data}
@@ -112,8 +119,57 @@ async def handle_imessage(handler: AgentHandler, phone_number: str, text: str) -
         return "Sorry, an error occurred."
 
 
+async def start_sendblue_webhook_server(handler: AgentHandler, port: int):
+    """Start a webhook server for Sendblue."""
+    app = web.Application()
+
+    async def webhook_endpoint(request):
+        try:
+            data = await request.json()
+            from_number = data.get("from_number")
+            content = data.get("content", "")
+
+            # Process asynchronously so we can quickly return 200 OK
+            if from_number:
+                if data.get("direction") == "outgoing":
+                    return web.Response(status=200, text="OK")
+
+                async def _process_and_reply():
+                    try:
+                        resp = await handle_imessage(handler, from_number, content)
+                        await send_imessage(from_number, resp)
+                    except Exception as e:
+                        logger.error(f"Error processing webhook message: {e}")
+
+                asyncio.create_task(_process_and_reply())
+
+            return web.Response(status=200, text="OK")
+        except Exception as e:
+            logger.error(f"Webhook error: {e}")
+            return web.Response(status=500, text="Error")
+
+    app.router.add_post("/webhook", webhook_endpoint)
+    app.router.add_post("/", webhook_endpoint)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"iMessage webhook server started on port {port}")
+
+    # Keep the task alive
+    while True:
+        await asyncio.sleep(3600)
+
+
 async def start_sendblue_bot(handler: AgentHandler):
-    """Start polling for iMessages."""
+    """Start Sendblue bot either via webhook or polling based on env config."""
+    webhook_port = os.environ.get("SENDBLUE_WEBHOOK_PORT")
+    if webhook_port:
+        await start_sendblue_webhook_server(handler, int(webhook_port))
+        return
+
+    # Polling fallback
     interval = int(os.environ.get("SENDBLUE_POLL_INTERVAL", "10"))
     last_check = datetime.utcnow()
     logger.info(f"iMessage bot started (interval: {interval}s)")
@@ -124,8 +180,13 @@ async def start_sendblue_bot(handler: AgentHandler):
                 logger.error(
                     f"Failed to get messages: {res.get('error', 'Unknown error')}"
                 )
-            elif isinstance(res["data"], list):
-                for msg in res["data"]:
+            else:
+                messages = (
+                    res["data"]
+                    if isinstance(res["data"], list)
+                    else res["data"].get("messages", [])
+                )
+                for msg in messages:
                     if msg.get("direction") == "outgoing":
                         continue
                     num = msg.get("from_number") or msg.get("number")
