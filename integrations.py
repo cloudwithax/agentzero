@@ -182,6 +182,148 @@ async def get_imessages(
             return {"success": resp.status == 200, "data": data}
 
 
+async def list_sendblue_webhooks(
+    session: Optional[aiohttp.ClientSession] = None,
+) -> dict:
+    """List webhook configuration from Sendblue account settings."""
+    api_key = os.environ.get("SENDBLUE_API_KEY")
+    api_secret = os.environ.get("SENDBLUE_API_SECRET")
+    if not api_key or not api_secret:
+        return {"success": False, "error": "Credentials missing"}
+
+    headers = {
+        "Content-Type": "application/json",
+        "sb-api-key-id": api_key,
+        "sb-api-secret-key": api_secret,
+    }
+
+    close_session = False
+    if session is None:
+        session = aiohttp.ClientSession()
+        close_session = True
+
+    try:
+        async with session.get(
+            "https://api.sendblue.co/api/account/webhooks", headers=headers
+        ) as resp:
+            data = await resp.json()
+            return {"success": resp.status == 200, "data": data, "status": resp.status}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+    finally:
+        if close_session:
+            await session.close()
+
+
+async def add_sendblue_receive_webhook(
+    webhook_url: str, session: Optional[aiohttp.ClientSession] = None
+) -> dict:
+    """Append a receive webhook using Sendblue POST /account/webhooks."""
+    api_key = os.environ.get("SENDBLUE_API_KEY")
+    api_secret = os.environ.get("SENDBLUE_API_SECRET")
+    if not api_key or not api_secret:
+        return {"success": False, "error": "Credentials missing"}
+
+    headers = {
+        "Content-Type": "application/json",
+        "sb-api-key-id": api_key,
+        "sb-api-secret-key": api_secret,
+    }
+    payload = {"webhooks": [webhook_url], "type": "receive"}
+
+    close_session = False
+    if session is None:
+        session = aiohttp.ClientSession()
+        close_session = True
+
+    try:
+        async with session.post(
+            "https://api.sendblue.co/api/account/webhooks",
+            json=payload,
+            headers=headers,
+        ) as resp:
+            data = await resp.json()
+            return {"success": resp.status == 200, "data": data, "status": resp.status}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+    finally:
+        if close_session:
+            await session.close()
+
+
+def _extract_webhook_urls(values) -> set:
+    """Extract URL strings from mixed webhook entries (string/object)."""
+    urls = set()
+    if not isinstance(values, list):
+        return urls
+    for entry in values:
+        if isinstance(entry, str):
+            urls.add(entry.strip())
+        elif isinstance(entry, dict):
+            url = entry.get("url")
+            if isinstance(url, str):
+                urls.add(url.strip())
+    return urls
+
+
+async def ensure_sendblue_receive_webhook(
+    webhook_url: str, session: Optional[aiohttp.ClientSession] = None
+) -> dict:
+    """Ensure the receive webhook exists; add it via POST if missing."""
+    target = webhook_url.strip()
+    if not target:
+        return {"success": False, "error": "Empty webhook URL"}
+
+    close_session = False
+    if session is None:
+        session = aiohttp.ClientSession()
+        close_session = True
+
+    try:
+        listed = await list_sendblue_webhooks(session=session)
+        if not listed.get("success"):
+            return listed
+
+        data = listed.get("data", {})
+        hooks = data.get("webhooks", {}) if isinstance(data, dict) else {}
+        receive_urls = _extract_webhook_urls(hooks.get("receive", []))
+        if target in receive_urls:
+            return {"success": True, "already_present": True}
+
+        added = await add_sendblue_receive_webhook(target, session=session)
+        if added.get("success"):
+            logger.warning("Re-added missing Sendblue receive webhook: %s", target)
+        return added
+    finally:
+        if close_session:
+            await session.close()
+
+
+async def monitor_sendblue_receive_webhook() -> None:
+    """Periodically re-add missing receive webhook using append-only API."""
+    webhook_url = os.environ.get("SENDBLUE_RECEIVE_WEBHOOK_URL", "").strip()
+    if not webhook_url:
+        return
+
+    interval = int(os.environ.get("SENDBLUE_WEBHOOK_CHECK_INTERVAL", "60"))
+    interval = max(interval, 10)
+
+    logger.info(
+        "Sendblue receive webhook monitor enabled (interval: %ss)", interval
+    )
+    while True:
+        try:
+            result = await ensure_sendblue_receive_webhook(webhook_url)
+            if not result.get("success"):
+                logger.error(
+                    "Sendblue receive webhook check failed: %s",
+                    result.get("error") or result,
+                )
+        except Exception as e:
+            logger.error("Sendblue receive webhook monitor error: %s", e)
+        await asyncio.sleep(interval)
+
+
 async def handle_imessage(handler: AgentHandler, phone_number: str, text: str) -> str:
     """Process an incoming iMessage."""
     session_id = f"imessage_{phone_number}"
@@ -342,9 +484,17 @@ async def start_sendblue_webhook_server(handler: AgentHandler, port: int):
 
 async def start_sendblue_bot(handler: AgentHandler):
     """Start Sendblue bot either via webhook or polling based on env config."""
+    monitor_task = None
+    if os.environ.get("SENDBLUE_RECEIVE_WEBHOOK_URL"):
+        monitor_task = asyncio.create_task(monitor_sendblue_receive_webhook())
+
     webhook_port = os.environ.get("SENDBLUE_WEBHOOK_PORT")
     if webhook_port:
-        await start_sendblue_webhook_server(handler, int(webhook_port))
+        try:
+            await start_sendblue_webhook_server(handler, int(webhook_port))
+        finally:
+            if monitor_task:
+                monitor_task.cancel()
         return
 
     # Polling fallback

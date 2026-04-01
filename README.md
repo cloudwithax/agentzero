@@ -20,6 +20,11 @@ cp .env.example .env
    - `NVIDIA_API_KEY` - Your NVIDIA API key
    - `TELEGRAM_BOT_TOKEN` - Your Telegram bot token (from @BotFather)
 
+Optional Sendblue reliability settings:
+- `SENDBLUE_WEBHOOK_PORT` - Run local webhook server instead of polling.
+- `SENDBLUE_RECEIVE_WEBHOOK_URL` - If set, periodically verifies your Sendblue `receive` webhook and re-adds it if missing using append-only `POST /api/account/webhooks`.
+- `SENDBLUE_WEBHOOK_CHECK_INTERVAL` - Seconds between webhook checks (default: `60`, min enforced: `10`).
+
 ## Usage
 
 ### Run the agent:
