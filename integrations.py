@@ -123,6 +123,8 @@ async def start_sendblue_webhook_server(handler: AgentHandler, port: int):
     """Start a webhook server for Sendblue."""
     app = web.Application()
     own_number = os.environ.get("SENDBLUE_NUMBER")
+    processed_handles = set()
+    dedup_ttl_seconds = 60
 
     async def webhook_endpoint(request):
         try:
@@ -134,18 +136,34 @@ async def start_sendblue_webhook_server(handler: AgentHandler, port: int):
                 data = dict(form_data)
 
             sender_number = (
-                data.get("number")
-                or data.get("from_number")
+                data.get("from_number")
+                or data.get("number")
                 or data.get("phone_number")
             )
             content = data.get("content") or data.get("message") or data.get("text", "")
             direction = str(data.get("direction", "")).lower()
+            is_outbound = bool(data.get("is_outbound"))
+            message_handle = data.get("message_handle")
+
+            if message_handle:
+                if message_handle in processed_handles:
+                    logger.info(
+                        "Ignoring duplicate Sendblue webhook: %s", message_handle
+                    )
+                    return web.Response(status=200, text="OK")
+                processed_handles.add(message_handle)
+                asyncio.get_running_loop().call_later(
+                    dedup_ttl_seconds,
+                    lambda: processed_handles.discard(message_handle),
+                )
 
             # Process asynchronously so we can quickly return 200 OK
             if sender_number:
                 # Ignore outbound webhook events and self-originated messages.
-                if direction == "outgoing" or (
-                    own_number and sender_number == own_number
+                if (
+                    direction == "outgoing"
+                    or is_outbound
+                    or (own_number and sender_number == own_number)
                 ):
                     return web.Response(status=200, text="OK")
 
@@ -181,6 +199,7 @@ async def start_sendblue_webhook_server(handler: AgentHandler, port: int):
             return web.Response(status=500, text="Error")
 
     app.router.add_post("/webhook", webhook_endpoint)
+    app.router.add_post("/webhook/receive", webhook_endpoint)
     app.router.add_post("/", webhook_endpoint)
 
     runner = web.AppRunner(app)
