@@ -1,6 +1,7 @@
 """Main handler and chat loop for the agent."""
 
 import aiohttp
+import datetime
 import logging
 import os
 from typing import Any, Optional
@@ -451,11 +452,14 @@ class AgentHandler:
                 example_context += f"Input: {ex['input']}\n"
                 example_context += f"Output: {ex['output']}\n\n"
 
+        current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         universal_instructions = (
+            f"\n\n[Current Date and Time]: {current_time}\n"
             "\n\n[System Instructions & Tools]:\n"
             "You have access to tools via tool_calls. Use the remember() tool to store important facts about the user or session.\n"
             "If the user asks you to remember or store something, you MUST use the remember() tool.\n"
-            "Use recall() to retrieve past memories. You can also search the web for up-to-date information when needed.\n"
+            "Use recall() to retrieve past memories.\n"
+            "If you need access to current information not available to you, use the web_search() tool.\n"
             "IMPORTANT: Do not use markdown formatting, code blocks, or emojis in your responses. Respond in plain text only.\n"
         )
 
