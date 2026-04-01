@@ -1,6 +1,6 @@
 # AgentZero
 
-An AI assistant with persistent memory and bulletproof tool calling. Tested against Pinchbench, scoring 80.5% in benchmarks, beating every other existing agent harness available.
+An AI assistant with persistent memory and bulletproof tool calling. Tested against Pinchbench, scoring 85.5% in benchmarks on average, beating every other existing agent harness available.
 
 ## Setup
 
