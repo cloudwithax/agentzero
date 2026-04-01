@@ -56,3 +56,4 @@ Thumbs.db
 # Audio files used for testing
 *.opus
 *.m4a
+*.caf

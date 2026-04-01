@@ -43,10 +43,10 @@ Optional Sendblue reliability settings:
 - `SENDBLUE_VOICE_MEMO_FUNCTION_ID` - Function ID for `openai/whisper-large-v3` (default: `b702f636-f60c-4a3d-a6f4-f3568c13bd7d`).
 - `SENDBLUE_VOICE_MEMO_MODEL` - Optional Riva model name override. Usually not required when function ID is set.
 - `SENDBLUE_VOICE_MEMO_LANGUAGE` - Language hint (`multi` default for auto-detection, or `en`, `fr`, etc.).
-- `SENDBLUE_VOICE_MEMO_FFMPEG_BIN` - Optional `ffmpeg` binary/path used to convert iMessage `.m4a` voice memos when direct transcription fails (default: `ffmpeg`).
+- `SENDBLUE_VOICE_MEMO_FFMPEG_BIN` - Optional `ffmpeg` binary/path used to convert iMessage `.m4a`/`.caf` voice memos when direct transcription fails (default: `ffmpeg`).
 - `SENDBLUE_VOICE_MEMO_MAX_BYTES` - Maximum voice memo download size in bytes for transcription (default: `26214400`, 25MB).
 
-For iMessage native `.m4a` voice memo fallback conversion, install `ffmpeg` on the host machine.
+For iMessage native `.m4a`/`.caf` voice memo fallback conversion, install `ffmpeg` on the host machine.
 
 Multimodal/NVIDIA asset handling:
 - `NVCF_ASSET_UPLOAD_ENABLED` - Upload inbound multimodal image URLs to NVIDIA NVCF Assets before inference and pass `asset_id` references (default: `1`, set `0` to disable).

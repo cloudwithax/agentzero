@@ -245,14 +245,19 @@ def _voice_memo_filename_from_url(source_url: str, index: int) -> str:
 
 
 def _is_native_imessage_m4a(filename: str, content_type: str | None) -> bool:
-    """Detect iMessage-native m4a memo inputs that may require ffmpeg conversion."""
+    """Detect iMessage-native m4a/caf memo inputs for ffmpeg retry."""
     extension = os.path.splitext((filename or "").strip().lower())[1]
     normalized_type = (content_type or "").split(";", 1)[0].strip().lower()
 
-    if extension == ".m4a":
+    if extension in {".m4a", ".caf"}:
         return True
 
-    if normalized_type in {"audio/m4a", "audio/x-m4a"}:
+    if normalized_type in {
+        "audio/m4a",
+        "audio/x-m4a",
+        "audio/caf",
+        "audio/x-caf",
+    }:
         return True
 
     return normalized_type == "audio/mp4" and extension in {"", ".m4a", ".mp4"}
@@ -262,7 +267,7 @@ def _convert_m4a_audio_with_ffmpeg_sync(
     audio_bytes: bytes,
     filename: str,
 ) -> tuple[bytes, str, str] | None:
-    """Convert m4a voice memo bytes to WAV using ffmpeg for ASR compatibility."""
+    """Convert m4a/caf voice memo bytes to WAV using ffmpeg for ASR compatibility."""
     ffmpeg_bin = (
         os.environ.get(
             "SENDBLUE_VOICE_MEMO_FFMPEG_BIN", VOICE_MEMO_FFMPEG_BIN_DEFAULT
@@ -315,7 +320,7 @@ def _convert_m4a_audio_with_ffmpeg_sync(
             )
     except FileNotFoundError:
         logger.warning(
-            "ffmpeg is required to convert iMessage m4a voice memos but was not found"
+            "ffmpeg is required to convert iMessage m4a/caf voice memos but was not found"
         )
         return None
     except subprocess.CalledProcessError as e:
@@ -471,7 +476,7 @@ async def _transcribe_audio_bytes_with_whisper(
         return None
 
     converted_bytes, _, _ = converted_payload
-    logger.info("Retrying voice memo transcription after ffmpeg m4a conversion")
+    logger.info("Retrying voice memo transcription after ffmpeg voice memo conversion")
     return await loop.run_in_executor(
         None,
         _transcribe_audio_bytes_with_whisper_sync,

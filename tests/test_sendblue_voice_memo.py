@@ -49,9 +49,11 @@ def test_append_voice_memo_transcripts_with_failures() -> None:
 
 
 def test_is_native_imessage_m4a_detects_common_signatures() -> None:
-    """Treat iMessage m4a signals as conversion candidates."""
+    """Treat iMessage m4a/caf signals as conversion candidates."""
     assert _is_native_imessage_m4a("voice.m4a", None)
+    assert _is_native_imessage_m4a("voice.caf", None)
     assert _is_native_imessage_m4a("voice", "audio/x-m4a")
+    assert _is_native_imessage_m4a("voice", "audio/x-caf")
     assert _is_native_imessage_m4a("voice.mp4", "audio/mp4")
     assert not _is_native_imessage_m4a("voice.opus", "audio/ogg")
 
@@ -152,6 +154,41 @@ async def test_transcribe_audio_bytes_retries_m4a_with_ffmpeg() -> None:
     assert convert_mock.call_count == 1
 
 
+async def test_transcribe_audio_bytes_retries_caf_with_ffmpeg() -> None:
+    """Retry caf voice memos with ffmpeg-converted bytes when first pass fails."""
+    previous_api_key = os.environ.get("NVIDIA_API_KEY")
+    os.environ["NVIDIA_API_KEY"] = "test-key"
+
+    transcribe_mock = Mock(side_effect=[None, "caf converted transcript"])
+    convert_mock = Mock(
+        return_value=(b"wav-bytes", "voice-memo-converted.wav", "audio/wav")
+    )
+
+    try:
+        with patch(
+            "integrations._transcribe_audio_bytes_with_whisper_sync",
+            new=transcribe_mock,
+        ), patch(
+            "integrations._convert_m4a_audio_with_ffmpeg_sync",
+            new=convert_mock,
+        ):
+            transcript = await _transcribe_audio_bytes_with_whisper(
+                cast(Any, None),
+                b"caf-bytes",
+                "voice.caf",
+                "audio/x-caf",
+            )
+    finally:
+        if previous_api_key is None:
+            os.environ.pop("NVIDIA_API_KEY", None)
+        else:
+            os.environ["NVIDIA_API_KEY"] = previous_api_key
+
+    assert transcript == "caf converted transcript"
+    assert transcribe_mock.call_count == 2
+    assert convert_mock.call_count == 1
+
+
 async def main() -> int:
     test_split_voice_memo_attachments_detects_audio_urls()
     test_append_voice_memo_transcripts_with_failures()
@@ -159,6 +196,7 @@ async def main() -> int:
     await test_transcribe_sendblue_voice_memos_merges_and_filters()
     await test_transcribe_sendblue_voice_memos_respects_disable_flag()
     await test_transcribe_audio_bytes_retries_m4a_with_ffmpeg()
+    await test_transcribe_audio_bytes_retries_caf_with_ffmpeg()
     print("All Sendblue voice memo tests passed")
     return 0
 
