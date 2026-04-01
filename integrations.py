@@ -5,6 +5,8 @@ import mimetypes
 import json
 import logging
 import os
+import subprocess
+import tempfile
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Dict, Optional
 from urllib.parse import urlparse
@@ -41,6 +43,9 @@ NVIDIA_WHISPER_GRPC_SERVER = "grpc.nvcf.nvidia.com:443"
 NVIDIA_WHISPER_FUNCTION_ID = "b702f636-f60c-4a3d-a6f4-f3568c13bd7d"
 VOICE_MEMO_MAX_BYTES_DEFAULT = 25 * 1024 * 1024
 VOICE_MEMO_FALLBACK_EXTENSION = ".opus"
+VOICE_MEMO_FFMPEG_BIN_DEFAULT = "ffmpeg"
+VOICE_MEMO_CONVERTED_FILENAME = "voice-memo-converted.wav"
+VOICE_MEMO_CONVERTED_CONTENT_TYPE = "audio/wav"
 VOICE_MEMO_AUDIO_EXTENSIONS = {
     ".aac",
     ".amr",
@@ -239,6 +244,93 @@ def _voice_memo_filename_from_url(source_url: str, index: int) -> str:
     return filename
 
 
+def _is_native_imessage_m4a(filename: str, content_type: str | None) -> bool:
+    """Detect iMessage-native m4a memo inputs that may require ffmpeg conversion."""
+    extension = os.path.splitext((filename or "").strip().lower())[1]
+    normalized_type = (content_type or "").split(";", 1)[0].strip().lower()
+
+    if extension == ".m4a":
+        return True
+
+    if normalized_type in {"audio/m4a", "audio/x-m4a"}:
+        return True
+
+    return normalized_type == "audio/mp4" and extension in {"", ".m4a", ".mp4"}
+
+
+def _convert_m4a_audio_with_ffmpeg_sync(
+    audio_bytes: bytes,
+    filename: str,
+) -> tuple[bytes, str, str] | None:
+    """Convert m4a voice memo bytes to WAV using ffmpeg for ASR compatibility."""
+    ffmpeg_bin = (
+        os.environ.get(
+            "SENDBLUE_VOICE_MEMO_FFMPEG_BIN", VOICE_MEMO_FFMPEG_BIN_DEFAULT
+        ).strip()
+        or VOICE_MEMO_FFMPEG_BIN_DEFAULT
+    )
+
+    extension = os.path.splitext((filename or "").strip())[1] or ".m4a"
+    try:
+        with tempfile.TemporaryDirectory(prefix="agentzero-voice-memo-") as tmp_dir:
+            source_path = os.path.join(tmp_dir, f"input{extension}")
+            converted_path = os.path.join(tmp_dir, VOICE_MEMO_CONVERTED_FILENAME)
+
+            with open(source_path, "wb") as source_file:
+                source_file.write(audio_bytes)
+
+            command = [
+                ffmpeg_bin,
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                source_path,
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-f",
+                "wav",
+                converted_path,
+            ]
+            subprocess.run(command, check=True, capture_output=True)
+
+            with open(converted_path, "rb") as converted_file:
+                converted_audio = converted_file.read()
+
+            if not converted_audio:
+                logger.warning(
+                    "ffmpeg conversion produced empty audio output for voice memo: %s",
+                    filename,
+                )
+                return None
+
+            return (
+                converted_audio,
+                VOICE_MEMO_CONVERTED_FILENAME,
+                VOICE_MEMO_CONVERTED_CONTENT_TYPE,
+            )
+    except FileNotFoundError:
+        logger.warning(
+            "ffmpeg is required to convert iMessage m4a voice memos but was not found"
+        )
+        return None
+    except subprocess.CalledProcessError as e:
+        error_output = (e.stderr or b"").decode("utf-8", errors="replace").strip()
+        logger.warning(
+            "ffmpeg failed to convert voice memo %s: %s",
+            filename,
+            error_output or e,
+        )
+        return None
+    except Exception as e:
+        logger.warning("Unexpected ffmpeg conversion error for %s: %s", filename, e)
+        return None
+
+
 def _extract_riva_transcript(response: Any) -> str | None:
     """Extract combined transcript text from a Riva offline ASR response."""
     if response is None:
@@ -322,8 +414,8 @@ def _transcribe_audio_bytes_with_whisper_sync(
 async def _transcribe_audio_bytes_with_whisper(
     _session: aiohttp.ClientSession,
     audio_bytes: bytes,
-    _filename: str,
-    _content_type: str | None,
+    filename: str,
+    content_type: str | None,
 ) -> str | None:
     """Transcribe audio bytes through NVIDIA's hosted Whisper Riva endpoint."""
     api_key = os.environ.get("NVIDIA_API_KEY", "").strip()
@@ -353,10 +445,37 @@ async def _transcribe_audio_bytes_with_whisper(
     model_name = os.environ.get("SENDBLUE_VOICE_MEMO_MODEL", "").strip()
 
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
+    transcript = await loop.run_in_executor(
         None,
         _transcribe_audio_bytes_with_whisper_sync,
         audio_bytes,
+        api_key,
+        grpc_server,
+        function_id,
+        language_code,
+        model_name,
+    )
+    if transcript:
+        return transcript
+
+    if not _is_native_imessage_m4a(filename, content_type):
+        return None
+
+    converted_payload = await loop.run_in_executor(
+        None,
+        _convert_m4a_audio_with_ffmpeg_sync,
+        audio_bytes,
+        filename,
+    )
+    if not converted_payload:
+        return None
+
+    converted_bytes, _, _ = converted_payload
+    logger.info("Retrying voice memo transcription after ffmpeg m4a conversion")
+    return await loop.run_in_executor(
+        None,
+        _transcribe_audio_bytes_with_whisper_sync,
+        converted_bytes,
         api_key,
         grpc_server,
         function_id,

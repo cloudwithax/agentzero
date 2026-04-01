@@ -3,11 +3,14 @@
 
 import asyncio
 import os
-from unittest.mock import AsyncMock, patch
+from typing import Any, cast
+from unittest.mock import AsyncMock, Mock, patch
 
 from integrations import (
     _append_voice_memo_transcripts,
+    _is_native_imessage_m4a,
     _split_voice_memo_attachments,
+    _transcribe_audio_bytes_with_whisper,
     _transcribe_sendblue_voice_memos,
 )
 
@@ -43,6 +46,14 @@ def test_append_voice_memo_transcripts_with_failures() -> None:
     assert "2. hello from memo two" in merged
     assert "[Voice memo attachments not transcribed]" in merged
     assert "https://cdn.example/voice-3.opus" in merged
+
+
+def test_is_native_imessage_m4a_detects_common_signatures() -> None:
+    """Treat iMessage m4a signals as conversion candidates."""
+    assert _is_native_imessage_m4a("voice.m4a", None)
+    assert _is_native_imessage_m4a("voice", "audio/x-m4a")
+    assert _is_native_imessage_m4a("voice.mp4", "audio/mp4")
+    assert not _is_native_imessage_m4a("voice.opus", "audio/ogg")
 
 
 async def test_transcribe_sendblue_voice_memos_merges_and_filters() -> None:
@@ -106,11 +117,48 @@ async def test_transcribe_sendblue_voice_memos_respects_disable_flag() -> None:
     ]
 
 
+async def test_transcribe_audio_bytes_retries_m4a_with_ffmpeg() -> None:
+    """Retry m4a voice memos with ffmpeg-converted bytes when first pass fails."""
+    previous_api_key = os.environ.get("NVIDIA_API_KEY")
+    os.environ["NVIDIA_API_KEY"] = "test-key"
+
+    transcribe_mock = Mock(side_effect=[None, "converted transcript"])
+    convert_mock = Mock(
+        return_value=(b"wav-bytes", "voice-memo-converted.wav", "audio/wav")
+    )
+
+    try:
+        with patch(
+            "integrations._transcribe_audio_bytes_with_whisper_sync",
+            new=transcribe_mock,
+        ), patch(
+            "integrations._convert_m4a_audio_with_ffmpeg_sync",
+            new=convert_mock,
+        ):
+            transcript = await _transcribe_audio_bytes_with_whisper(
+                cast(Any, None),
+                b"m4a-bytes",
+                "voice.m4a",
+                "audio/mp4",
+            )
+    finally:
+        if previous_api_key is None:
+            os.environ.pop("NVIDIA_API_KEY", None)
+        else:
+            os.environ["NVIDIA_API_KEY"] = previous_api_key
+
+    assert transcript == "converted transcript"
+    assert transcribe_mock.call_count == 2
+    assert convert_mock.call_count == 1
+
+
 async def main() -> int:
     test_split_voice_memo_attachments_detects_audio_urls()
     test_append_voice_memo_transcripts_with_failures()
+    test_is_native_imessage_m4a_detects_common_signatures()
     await test_transcribe_sendblue_voice_memos_merges_and_filters()
     await test_transcribe_sendblue_voice_memos_respects_disable_flag()
+    await test_transcribe_audio_bytes_retries_m4a_with_ffmpeg()
     print("All Sendblue voice memo tests passed")
     return 0
 
