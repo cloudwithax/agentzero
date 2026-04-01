@@ -122,26 +122,58 @@ async def handle_imessage(handler: AgentHandler, phone_number: str, text: str) -
 async def start_sendblue_webhook_server(handler: AgentHandler, port: int):
     """Start a webhook server for Sendblue."""
     app = web.Application()
+    own_number = os.environ.get("SENDBLUE_NUMBER")
 
     async def webhook_endpoint(request):
         try:
-            data = await request.json()
-            from_number = data.get("from_number")
-            content = data.get("content", "")
+            try:
+                data = await request.json()
+            except Exception:
+                # Some webhook providers may send form-encoded payloads.
+                form_data = await request.post()
+                data = dict(form_data)
+
+            sender_number = (
+                data.get("number")
+                or data.get("from_number")
+                or data.get("phone_number")
+            )
+            content = data.get("content") or data.get("message") or data.get("text", "")
+            direction = str(data.get("direction", "")).lower()
 
             # Process asynchronously so we can quickly return 200 OK
-            if from_number:
-                if data.get("direction") == "outgoing":
+            if sender_number:
+                # Ignore outbound webhook events and self-originated messages.
+                if direction == "outgoing" or (
+                    own_number and sender_number == own_number
+                ):
+                    return web.Response(status=200, text="OK")
+
+                if not content.strip():
+                    logger.info("Ignoring webhook event with empty content: %s", data)
                     return web.Response(status=200, text="OK")
 
                 async def _process_and_reply():
                     try:
-                        resp = await handle_imessage(handler, from_number, content)
-                        await send_imessage(from_number, resp)
+                        resp = await handle_imessage(handler, sender_number, content)
+                        send_res = await send_imessage(sender_number, resp)
+                        if not send_res.get("success"):
+                            logger.error("Failed to send Sendblue reply: %s", send_res)
                     except Exception as e:
                         logger.error(f"Error processing webhook message: {e}")
 
-                asyncio.create_task(_process_and_reply())
+                task = asyncio.create_task(_process_and_reply())
+
+                def _log_task_error(done_task: asyncio.Task):
+                    if done_task.cancelled():
+                        return
+                    exc = done_task.exception()
+                    if exc:
+                        logger.error(f"Webhook background task failed: {exc}")
+
+                task.add_done_callback(_log_task_error)
+            else:
+                logger.info("Ignoring webhook event with no sender number: %s", data)
 
             return web.Response(status=200, text="OK")
         except Exception as e:
@@ -175,6 +207,7 @@ async def start_sendblue_bot(handler: AgentHandler):
     logger.info(f"iMessage bot started (interval: {interval}s)")
     while True:
         try:
+            poll_started_at = datetime.utcnow()
             res = await get_imessages(last_check=last_check)
             if not res["success"]:
                 logger.error(
@@ -195,7 +228,9 @@ async def start_sendblue_bot(handler: AgentHandler):
                         continue
                     resp = await handle_imessage(handler, num, msg.get("content", ""))
                     await send_imessage(num, resp)
-            last_check = datetime.utcnow()
+            # Move checkpoint to poll start time to avoid gaps where messages
+            # arrive while the previous batch is being processed.
+            last_check = poll_started_at
         except Exception as e:
             logger.error(f"Polling error: {e}")
         await asyncio.sleep(interval)
