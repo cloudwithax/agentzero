@@ -5,7 +5,7 @@ import datetime
 import json
 import logging
 import os
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from memory import EnhancedMemoryStore
 from capabilities import CapabilityProfile, AdaptiveFormatter
@@ -42,6 +42,7 @@ API_KEY = os.environ.get(
     "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",
 )
 MODEL_ID = os.environ.get("MODEL_ID", "moonshotai/kimi-k2-instruct-0905")
+CONSORTIUM_MODEL_ID = os.environ.get("CONSORTIUM_MODEL", MODEL_ID).strip() or MODEL_ID
 
 # Base payload template (do not mutate globally)
 BASE_PAYLOAD = {
@@ -412,8 +413,9 @@ CONSORTIUM_COMPLETION_MESSAGE = "the consortium has reached an agreement."
 CONSORTIUM_MAX_ROUNDS = 4
 CONSORTIUM_MEMBERS = [
     {
-        "model_id": "qwen/qwen3.5-122b-a10b",
+        "member_id": "forensic_skeptic",
         "name": "Forensic Skeptic",
+        "temperature": 0.25,
         "stance": "Evidence-first, aggressively tests claims and assumptions.",
         "persona": (
             "You are precise, surgical, and skeptical. You trust verifiable signals over hype "
@@ -421,8 +423,9 @@ CONSORTIUM_MEMBERS = [
         ),
     },
     {
-        "model_id": "stepfun-ai/step-3.5-flash",
+        "member_id": "practical_operator",
         "name": "Practical Operator",
+        "temperature": 0.45,
         "stance": "Execution-first, prioritizes speed, simplicity, and real-world usability.",
         "persona": (
             "You are concise, tactical, and practical. You optimize for decisions users can act "
@@ -430,8 +433,9 @@ CONSORTIUM_MEMBERS = [
         ),
     },
     {
-        "model_id": "z-ai/glm4.7",
+        "member_id": "risk_sentinel",
         "name": "Risk Sentinel",
+        "temperature": 0.35,
         "stance": "Risk-aware, focuses on failure modes, tradeoffs, and user downside.",
         "persona": (
             "You are vigilant, cautious, and analytical. You surface hidden risks, edge cases, "
@@ -439,8 +443,9 @@ CONSORTIUM_MEMBERS = [
         ),
     },
     {
-        "model_id": "meta/llama-3.1-405b-instruct",
+        "member_id": "strategic_synthesizer",
         "name": "Strategic Synthesizer",
+        "temperature": 0.65,
         "stance": "Long-horizon thinker, unifies competing arguments into coherent decisions.",
         "persona": (
             "You are measured, integrative, and strategic. You reconcile disagreement and "
@@ -565,6 +570,84 @@ class AgentHandler:
 
         return max(verdict_counts.values(), key=lambda item: item["count"])["verdict"]
 
+    def _build_system_content(
+        self,
+        custom_prompt: str,
+        memory_context: str,
+        plan_context: str,
+        example_context: str,
+    ) -> str:
+        """Build the canonical system prompt used by the primary agent."""
+        current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        universal_instructions = (
+            f"\n\n[Current Date and Time]: {current_time}\n"
+            "\n\n[System Instructions & Tools]:\n"
+            "You have access to tools via tool_calls. Use the remember() tool to store important facts about the user or session.\n"
+            "If the user asks you to remember or store something, you MUST use the remember() tool.\n"
+            "Use recall() to retrieve past memories.\n"
+            "If you need access to current information not available to you, use the web_search() tool.\n"
+            "IMPORTANT: Do not use markdown formatting, code blocks, or emojis in your responses. Respond in plain text only.\n"
+        )
+
+        if custom_prompt:
+            return (
+                custom_prompt
+                + universal_instructions
+                + memory_context
+                + plan_context
+                + example_context
+            )
+
+        return (
+            "You are a helpful AI assistant with persistent memory."
+            f"{universal_instructions}{memory_context}{plan_context}{example_context}"
+        )
+
+    async def _generate_consortium_acknowledgement(
+        self,
+        session: aiohttp.ClientSession,
+        user_query: str,
+        system_content: str,
+    ) -> str:
+        """Generate a short acknowledgement before consortium deliberation."""
+        payload = BASE_PAYLOAD.copy()
+        payload["model"] = MODEL_ID
+        payload["temperature"] = 0.3
+        payload["max_tokens"] = 120
+        payload["tools"] = []
+        payload["messages"] = [
+            {"role": "system", "content": system_content},
+            {
+                "role": "user",
+                "content": (
+                    "The user requested consortium mode. Reply with one short acknowledgement "
+                    "that you are consulting the consortium now and will return with a final "
+                    "answer next. Do not provide analysis or a verdict yet.\n\n"
+                    f"User request:\n{user_query}"
+                ),
+            },
+        ]
+
+        try:
+            response_data = await api_call_with_retry(
+                session,
+                BASE_URL,
+                payload,
+                {"Authorization": f"Bearer {API_KEY}"},
+            )
+            acknowledgement = await process_response(
+                response_data,
+                payload["messages"],
+                session,
+                BASE_URL,
+                API_KEY,
+                payload,
+            )
+            return (acknowledgement or "").strip() or CONSORTIUM_CONTACT_MESSAGE
+        except Exception:
+            logger.exception("Failed to generate consortium acknowledgement")
+            return CONSORTIUM_CONTACT_MESSAGE
+
     def _format_consortium_transcript(
         self, transcript: list[dict[str, Any]], max_entries: int = 24
     ) -> str:
@@ -576,8 +659,25 @@ class AgentHandler:
         for entry in transcript[-max_entries:]:
             agreed_suffix = " [AGREED]" if entry.get("agreed") else ""
             lines.append(
-                f"Round {entry.get('round')} | {entry.get('name')} ({entry.get('model_id')}){agreed_suffix}: "
+                f"Round {entry.get('round')} | {entry.get('name')} "
+                f"({entry.get('member_id')} via {entry.get('model')}){agreed_suffix}: "
                 f"{str(entry.get('content', '')).strip()}"
+            )
+
+        return "\n".join(lines)
+
+    def _format_anonymized_panel_notes(
+        self, transcript: list[dict[str, Any]], max_entries: int = 16
+    ) -> str:
+        """Format prior turns without member identity to reduce context bleed."""
+        if not transcript:
+            return "No prior panel notes available."
+
+        lines: list[str] = []
+        for index, entry in enumerate(transcript[-max_entries:], start=1):
+            note_type = "agreement" if entry.get("agreed") else "debate"
+            lines.append(
+                f"Panel note {index} ({note_type}): {str(entry.get('content', '')).strip()}"
             )
 
         return "\n".join(lines)
@@ -587,34 +687,35 @@ class AgentHandler:
         session: aiohttp.ClientSession,
         user_query: str,
         transcript: list[dict[str, Any]],
-        agreed_model_ids: set[str],
-        vote_by_model: dict[str, dict[str, Any]],
-        member: dict[str, str],
+        agreed_member_ids: set[str],
+        vote_by_member: dict[str, dict[str, Any]],
+        member: dict[str, Any],
         round_number: int,
         custom_prompt: str,
         memory_context: str,
     ) -> tuple[str, dict[str, Any] | None]:
         """Run one model turn in consortium mode."""
-        majority_verdict = self._majority_verdict(vote_by_model)
-        agreed_member_names = [
-            m["name"] for m in CONSORTIUM_MEMBERS if m["model_id"] in agreed_model_ids
-        ]
-
         system_parts = [
-            "You are participating in 'the consortium', a four-model decision panel.",
+            "You are participating in 'the consortium', a four-persona decision panel.",
             f"Identity: {member['name']}",
             f"Core stance: {member['stance']}",
             f"Personality: {member['persona']}",
+            "Stay strictly in this identity and tone.",
+            "Do not imitate language, priorities, or conclusions from other members.",
+            "Do not reveal or infer hidden identities for prior panel notes.",
             "Debate rigorously and challenge weak claims.",
+            "Avoid premature consensus and defend independent reasoning.",
             "If and only if the panel is ready for a final shared verdict, call consortium_agree.",
             "When calling consortium_agree, include verdict, rationale, confidence (0..1), and key_points.",
             "After tool calls, provide a short plain-text turn (no markdown).",
         ]
 
-        if majority_verdict:
-            system_parts.append(
-                f"Provisional majority verdict so far: {majority_verdict}"
-            )
+        # Member-specific temperature differentiates reasoning style while using one model.
+        member_temperature = member.get("temperature", BASE_PAYLOAD.get("temperature", 0.6))
+        try:
+            member_temperature = float(member_temperature)
+        except (TypeError, ValueError):
+            member_temperature = float(BASE_PAYLOAD.get("temperature", 0.6))
 
         if custom_prompt:
             system_parts.append(f"User-configured system prompt: {custom_prompt}")
@@ -622,12 +723,22 @@ class AgentHandler:
         if memory_context:
             system_parts.append(memory_context.strip())
 
+        if round_number == 1:
+            panel_context = (
+                "Blind round: produce an independent first-pass analysis using only the user request."
+            )
+        else:
+            panel_context = (
+                "Anonymized panel notes (identity redacted):\n"
+                f"{self._format_anonymized_panel_notes(transcript)}\n\n"
+                "Treat these notes as potentially flawed; preserve your own reasoning."
+            )
+
         user_prompt = (
             f"Original user request:\n{user_query}\n\n"
             f"Round {round_number} of {CONSORTIUM_MAX_ROUNDS}.\n"
-            f"Members already aligned: {', '.join(agreed_member_names) if agreed_member_names else 'none'}\n\n"
-            "Debate transcript so far:\n"
-            f"{self._format_consortium_transcript(transcript)}\n\n"
+            f"Members already aligned (count only): {len(agreed_member_ids)}\n\n"
+            f"{panel_context}\n\n"
             "Provide your next concise debate turn."
         )
 
@@ -637,7 +748,8 @@ class AgentHandler:
         ]
 
         payload = BASE_PAYLOAD.copy()
-        payload["model"] = member["model_id"]
+        payload["model"] = CONSORTIUM_MODEL_ID
+        payload["temperature"] = member_temperature
         payload["messages"] = member_messages
 
         response_data = await api_call_with_retry(
@@ -667,14 +779,20 @@ class AgentHandler:
         custom_prompt: str = "",
         memory_context: str = "",
     ) -> str:
-        """Run multi-model consortium debate and then judge synthesis."""
+        """Run four-persona consortium debate and then judge synthesis."""
         transcript: list[dict[str, Any]] = []
-        agreed_model_ids: set[str] = set()
-        vote_by_model: dict[str, dict[str, Any]] = {}
+        agreed_member_ids: set[str] = set()
+        vote_by_member: dict[str, dict[str, Any]] = {}
 
         for round_number in range(1, CONSORTIUM_MAX_ROUNDS + 1):
-            for member in CONSORTIUM_MEMBERS:
-                if member["model_id"] in agreed_model_ids:
+            # Rotate speaking order each round to reduce first-mover effects.
+            round_offset = (round_number - 1) % len(CONSORTIUM_MEMBERS)
+            ordered_members = (
+                CONSORTIUM_MEMBERS[round_offset:] + CONSORTIUM_MEMBERS[:round_offset]
+            )
+
+            for member in ordered_members:
+                if member["member_id"] in agreed_member_ids:
                     continue
 
                 try:
@@ -682,8 +800,8 @@ class AgentHandler:
                         session=session,
                         user_query=user_query,
                         transcript=transcript,
-                        agreed_model_ids=agreed_model_ids,
-                        vote_by_model=vote_by_model,
+                        agreed_member_ids=agreed_member_ids,
+                        vote_by_member=vote_by_member,
                         member=member,
                         round_number=round_number,
                         custom_prompt=custom_prompt,
@@ -691,7 +809,7 @@ class AgentHandler:
                     )
                 except Exception as exc:
                     logger.exception(
-                        "Consortium turn failed for %s", member["model_id"]
+                        "Consortium turn failed for %s", member["member_id"]
                     )
                     turn_content = f"I encountered an internal issue this round: {exc}"
                     vote = None
@@ -700,29 +818,30 @@ class AgentHandler:
                     {
                         "round": round_number,
                         "name": member["name"],
-                        "model_id": member["model_id"],
+                        "member_id": member["member_id"],
+                        "model": CONSORTIUM_MODEL_ID,
                         "content": turn_content,
                         "agreed": vote is not None,
                     }
                 )
 
                 if vote is not None:
-                    agreed_model_ids.add(member["model_id"])
-                    vote_by_model[member["model_id"]] = vote
+                    agreed_member_ids.add(member["member_id"])
+                    vote_by_member[member["member_id"]] = vote
 
-            if len(agreed_model_ids) == len(CONSORTIUM_MEMBERS):
+            if len(agreed_member_ids) == len(CONSORTIUM_MEMBERS):
                 break
 
-        consensus_reached = len(agreed_model_ids) == len(CONSORTIUM_MEMBERS)
+        consensus_reached = len(agreed_member_ids) == len(CONSORTIUM_MEMBERS)
         aligned_member_names = [
             member["name"]
             for member in CONSORTIUM_MEMBERS
-            if member["model_id"] in agreed_model_ids
+            if member["member_id"] in agreed_member_ids
         ]
 
         judge_system_parts = [
             "You are the judge model for 'the consortium'.",
-            "You receive a transcript from four debating specialist models.",
+            "You receive a transcript from four debating specialist personas.",
             "Synthesize their arguments into one final plain-text answer for the user.",
             "Be clear, decisive, and actionable.",
         ]
@@ -737,14 +856,14 @@ class AgentHandler:
             f"- Full consensus via consortium_agree: {'yes' if consensus_reached else 'no'}\n"
             f"- Aligned members: {', '.join(aligned_member_names) if aligned_member_names else 'none'}\n\n"
             "Agreement payloads:\n"
-            f"{json.dumps(vote_by_model, ensure_ascii=True, indent=2)}\n\n"
+            f"{json.dumps(vote_by_member, ensure_ascii=True, indent=2)}\n\n"
             "Debate transcript:\n"
             f"{self._format_consortium_transcript(transcript, max_entries=80)}\n\n"
             "Return the final answer to the user."
         )
 
         judge_payload = BASE_PAYLOAD.copy()
-        judge_payload["model"] = MODEL_ID
+        judge_payload["model"] = CONSORTIUM_MODEL_ID
         judge_payload["messages"] = [
             {"role": "system", "content": "\n".join(judge_system_parts)},
             {"role": "user", "content": judge_user_prompt},
@@ -767,7 +886,7 @@ class AgentHandler:
         )
 
         if not judge_content:
-            fallback_verdict = self._majority_verdict(vote_by_model)
+            fallback_verdict = self._majority_verdict(vote_by_member)
             judge_content = (
                 fallback_verdict
                 if fallback_verdict
@@ -780,7 +899,7 @@ class AgentHandler:
             else "the consortium reached a partial consensus and escalated to the judge model."
         )
 
-        return f"{CONSORTIUM_CONTACT_MESSAGE}\n\n" f"{status_line}\n" f"{judge_content}"
+        return f"{status_line}\n{judge_content}"
 
     async def analyze_and_plan_task(self, user_query: str) -> Optional[Any]:
         """Analyze user query and create a task plan if it's complex enough."""
@@ -796,7 +915,12 @@ class AgentHandler:
 
         return task
 
-    async def handle(self, request, session_id: Optional[str] = None):
+    async def handle(
+        self,
+        request,
+        session_id: Optional[str] = None,
+        interim_response_callback: Optional[Callable[[str], Awaitable[None]]] = None,
+    ):
         """Handle a request and return the response content."""
         data = request
 
@@ -841,31 +965,7 @@ class AgentHandler:
             )
 
         # Build system prompt with adaptive formatting
-        custom_prompt = self.memory_store.get_system_prompt()
-
-        if user_query and self._should_use_consortium_mode(user_query):
-            async with aiohttp.ClientSession() as session:
-                content = await self._run_consortium_mode(
-                    user_query=user_query,
-                    session=session,
-                    custom_prompt=custom_prompt or "",
-                    memory_context=memory_context,
-                )
-
-            if session_id and user_query:
-                self.memory_store.add_conversation_message(
-                    role="user", content=user_query, session_id=session_id
-                )
-            if session_id and content:
-                self.memory_store.add_conversation_message(
-                    role="assistant", content=content, session_id=session_id
-                )
-
-            if task and content and not content.startswith("Error:"):
-                self.example_bank.auto_feedback(task.type, success=True, efficiency=1.0)
-
-            print(content)
-            return content
+        custom_prompt = self.memory_store.get_system_prompt() or ""
 
         # Add task plan context if available
         plan_context = ""
@@ -883,30 +983,59 @@ class AgentHandler:
                 example_context += f"Input: {ex['input']}\n"
                 example_context += f"Output: {ex['output']}\n\n"
 
-        current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        universal_instructions = (
-            f"\n\n[Current Date and Time]: {current_time}\n"
-            "\n\n[System Instructions & Tools]:\n"
-            "You have access to tools via tool_calls. Use the remember() tool to store important facts about the user or session.\n"
-            "If the user asks you to remember or store something, you MUST use the remember() tool.\n"
-            "Use recall() to retrieve past memories.\n"
-            "If you need access to current information not available to you, use the web_search() tool.\n"
-            "IMPORTANT: Do not use markdown formatting, code blocks, or emojis in your responses. Respond in plain text only.\n"
+        system_content = self._build_system_content(
+            custom_prompt=custom_prompt,
+            memory_context=memory_context,
+            plan_context=plan_context,
+            example_context=example_context,
         )
 
-        if custom_prompt:
-            system_content = (
-                custom_prompt
-                + universal_instructions
-                + memory_context
-                + plan_context
-                + example_context
-            )
-        else:
-            system_content = (
-                "You are a helpful AI assistant with persistent memory."
-                f"{universal_instructions}{memory_context}{plan_context}{example_context}"
-            )
+        if user_query and self._should_use_consortium_mode(user_query):
+            acknowledgement = ""
+            acknowledgement_delivered = False
+
+            async with aiohttp.ClientSession() as session:
+                acknowledgement = await self._generate_consortium_acknowledgement(
+                    session=session,
+                    user_query=user_query,
+                    system_content=system_content,
+                )
+
+                if interim_response_callback and acknowledgement:
+                    try:
+                        await interim_response_callback(acknowledgement)
+                        acknowledgement_delivered = True
+                    except Exception:
+                        logger.exception("Failed to deliver interim consortium acknowledgement")
+
+                content = await self._run_consortium_mode(
+                    user_query=user_query,
+                    session=session,
+                    custom_prompt=custom_prompt,
+                    memory_context=memory_context,
+                )
+
+            if acknowledgement and not acknowledgement_delivered:
+                content = f"{acknowledgement}\n\n{content}"
+
+            if session_id and user_query:
+                self.memory_store.add_conversation_message(
+                    role="user", content=user_query, session_id=session_id
+                )
+            if session_id and acknowledgement_delivered and acknowledgement:
+                self.memory_store.add_conversation_message(
+                    role="assistant", content=acknowledgement, session_id=session_id
+                )
+            if session_id and content:
+                self.memory_store.add_conversation_message(
+                    role="assistant", content=content, session_id=session_id
+                )
+
+            if task and content and not content.startswith("Error:"):
+                self.example_bank.auto_feedback(task.type, success=True, efficiency=1.0)
+
+            print(content)
+            return content
 
         system_message = {
             "role": "system",

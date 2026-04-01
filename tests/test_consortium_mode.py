@@ -85,13 +85,15 @@ async def test_handle_routes_to_consortium_mode() -> None:
         handler = create_test_handler(db_path)
         handler.memory_store.search_memories = AsyncMock(return_value=[])
 
-        consortium_response = (
-            "contacting the consortium to decide your verdict\n\n"
-            "the consortium has reached an agreement.\n"
-            "Consensus summary here."
-        )
+        consortium_ack = "Acknowledged. I will consult the consortium now."
+        consortium_response = "the consortium has reached an agreement.\nConsensus summary here."
+        interim_callback = AsyncMock()
 
         with patch.object(
+            handler,
+            "_generate_consortium_acknowledgement",
+            new=AsyncMock(return_value=consortium_ack),
+        ) as ack_mock, patch.object(
             handler,
             "_run_consortium_mode",
             new=AsyncMock(return_value=consortium_response),
@@ -108,14 +110,21 @@ async def test_handle_routes_to_consortium_mode() -> None:
                     ]
                 },
                 session_id="consortium_session",
+                interim_response_callback=interim_callback,
             )
 
+        ack_mock.assert_awaited_once()
         consortium_mock.assert_awaited_once()
+        interim_callback.assert_awaited_once_with(consortium_ack)
         assert response == consortium_response
-        assert "contacting the consortium to decide your verdict" in response
+        assert "the consortium has reached an agreement" in response
 
         history = handler.memory_store.get_conversation_history(
             session_id="consortium_session", limit=10
+        )
+        assert any(
+            msg["role"] == "assistant" and consortium_ack in msg["content"]
+            for msg in history
         )
         assert any(
             msg["role"] == "assistant" and consortium_response in msg["content"]

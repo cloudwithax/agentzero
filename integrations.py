@@ -564,7 +564,7 @@ async def _send_telegram_response(
 
 
 async def _process_telegram_message(
-    handler: AgentHandler,
+    handler: Any,
     user_id: int,
     chat_id: int,
     text: str,
@@ -573,9 +573,19 @@ async def _process_telegram_message(
 ) -> None:
     """Process a Telegram user message and send text/media reply."""
     user_content = await _build_user_message_content_async(text, attachment_urls)
+
+    async def _send_interim_response(interim_response: str) -> None:
+        interim_text, interim_attachments = _extract_agent_response_payload(
+            interim_response
+        )
+        if not (interim_text or "").strip() and not interim_attachments:
+            return
+        await _send_telegram_response(bot, chat_id, interim_text, interim_attachments)
+
     response = await handler.handle(
         {"messages": [{"role": "user", "content": user_content}]},
         session_id=f"tg_{user_id}",
+        interim_response_callback=_send_interim_response,
     )
     response_text, response_attachments = _extract_agent_response_payload(response)
     await _send_telegram_response(bot, chat_id, response_text, response_attachments)
@@ -1043,7 +1053,10 @@ async def monitor_sendblue_typing_webhook(webhook_url: Optional[str] = None) -> 
 
 
 async def handle_imessage(
-    handler: AgentHandler, phone_number: str, user_content: str | list[dict[str, Any]]
+    handler: Any,
+    phone_number: str,
+    user_content: str | list[dict[str, Any]],
+    interim_response_callback: Optional[Callable[[str], Awaitable[None]]] = None,
 ) -> str:
     """Process an incoming iMessage."""
     session_id = f"imessage_{phone_number}"
@@ -1062,6 +1075,7 @@ async def handle_imessage(
         return await handler.handle(
             {"messages": [{"role": "user", "content": user_content}]},
             session_id=session_id,
+            interim_response_callback=interim_response_callback,
         )
     except Exception as e:
         logger.error(f"Error: {e}")
@@ -1069,7 +1083,7 @@ async def handle_imessage(
 
 
 async def process_imessage_and_reply(
-    handler: AgentHandler,
+    handler: Any,
     phone_number: str,
     user_content: str | list[dict[str, Any]],
 ) -> None:
@@ -1080,22 +1094,78 @@ async def process_imessage_and_reply(
         if not read_res.get("success"):
             logger.warning("Failed to send read receipt: %s", read_res)
 
+        stop_typing = asyncio.Event()
+
         async def _typing_loop():
-            while True:
-                typing_res = await send_typing_indicator(phone_number, session=session)
-                if not typing_res.get("success"):
-                    logger.debug("Typing indicator failed: %s", typing_res)
-                await asyncio.sleep(4)
+            try:
+                while not stop_typing.is_set():
+                    typing_res = await send_typing_indicator(
+                        phone_number, session=session
+                    )
+                    if stop_typing.is_set():
+                        break
+                    if not typing_res.get("success"):
+                        logger.debug("Typing indicator failed: %s", typing_res)
+                    try:
+                        await asyncio.wait_for(stop_typing.wait(), timeout=4)
+                    except asyncio.TimeoutError:
+                        continue
+            except asyncio.CancelledError:
+                return
 
         typing_task = asyncio.create_task(_typing_loop())
-        try:
-            resp = await handle_imessage(handler, phone_number, user_content)
-        finally:
+
+        async def _stop_typing_loop(reason: str) -> None:
+            stop_typing.set()
+            if typing_task.done():
+                try:
+                    await typing_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    logger.debug(
+                        "Typing indicator loop exited with error (%s) for %s: %s",
+                        reason,
+                        phone_number,
+                        e,
+                    )
+                return
             typing_task.cancel()
             try:
-                await typing_task
+                await asyncio.wait_for(typing_task, timeout=1.0)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Typing indicator loop did not stop promptly (%s) for %s",
+                    reason,
+                    phone_number,
+                )
             except asyncio.CancelledError:
                 pass
+
+        async def _send_interim_response(interim_response: str) -> None:
+            interim_text, interim_attachments = _extract_agent_response_payload(
+                interim_response
+            )
+            if not (interim_text or "").strip() and not interim_attachments:
+                return
+            send_res = await send_imessage(
+                phone_number,
+                interim_text,
+                media_urls=interim_attachments,
+                session=session,
+            )
+            if not send_res.get("success"):
+                logger.error("Failed to send interim Sendblue reply: %s", send_res)
+
+        try:
+            resp = await handle_imessage(
+                handler,
+                phone_number,
+                user_content,
+                interim_response_callback=_send_interim_response,
+            )
+        finally:
+            await _stop_typing_loop("response_ready")
 
         reply_text, reply_attachments = _extract_agent_response_payload(resp)
         send_res = await send_imessage(
@@ -1104,6 +1174,13 @@ async def process_imessage_and_reply(
             media_urls=reply_attachments,
             session=session,
         )
+        if not typing_task.done():
+            logger.warning(
+                "Detected active typing indicator loop after reply send for %s; forcing stop",
+                phone_number,
+            )
+            await _stop_typing_loop("post_send_guard")
+
         if not send_res.get("success"):
             logger.error("Failed to send Sendblue reply: %s", send_res)
 

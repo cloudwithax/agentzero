@@ -2,10 +2,11 @@
 """Tests for Sendblue inbound debounce behavior."""
 
 import asyncio
+from unittest.mock import patch
 
 from integrations import _extract_sendblue_typing_state, _queue_sendblue_pending_message
 from integrations import _extract_sendblue_sender_number
-from integrations import _extract_webhook_type_urls
+from integrations import _extract_webhook_type_urls, process_imessage_and_reply
 
 
 def test_documented_typing_payload_parsing() -> None:
@@ -167,6 +168,65 @@ async def test_typing_event_without_pending_message_is_ignored() -> None:
     assert queued is False
 
 
+async def test_typing_indicator_stops_as_soon_as_reply_is_sent() -> None:
+    """No typing events should be sent after the final reply dispatch starts."""
+
+    class _FakeClientSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, _exc_type, _exc, _tb):
+            return False
+
+    loop = asyncio.get_running_loop()
+    typing_call_times: list[float] = []
+    reply_send_times: list[float] = []
+
+    async def _fake_send_read_receipt(_phone: str, session=None) -> dict:
+        return {"success": True}
+
+    async def _fake_send_typing_indicator(_phone: str, session=None) -> dict:
+        typing_call_times.append(loop.time())
+        await asyncio.sleep(0.01)
+        return {"success": True}
+
+    async def _fake_handle_imessage(
+        _handler,
+        _phone: str,
+        _content,
+        interim_response_callback=None,
+    ) -> str:
+        if interim_response_callback is not None:
+            await interim_response_callback("Working on it.")
+        await asyncio.sleep(0.08)
+        return "Ready"
+
+    async def _fake_send_imessage(
+        _phone: str,
+        _message: str,
+        media_urls=None,
+        session=None,
+    ) -> dict:
+        reply_send_times.append(loop.time())
+        return {"success": True}
+
+    with (
+        patch("integrations.aiohttp.ClientSession", return_value=_FakeClientSession()),
+        patch("integrations.send_read_receipt", new=_fake_send_read_receipt),
+        patch("integrations.send_typing_indicator", new=_fake_send_typing_indicator),
+        patch("integrations.handle_imessage", new=_fake_handle_imessage),
+        patch("integrations.send_imessage", new=_fake_send_imessage),
+    ):
+        await process_imessage_and_reply(object(), "+15550123456", "Hello")
+
+    assert len(reply_send_times) == 2
+    assert reply_send_times[0] <= reply_send_times[1]
+    assert len(typing_call_times) >= 1
+
+    reply_sent_at = reply_send_times[-1]
+    assert all(call_time <= reply_sent_at for call_time in typing_call_times)
+
+
 async def main() -> int:
     test_documented_typing_payload_parsing()
     test_typing_event_fallback_parsing()
@@ -176,6 +236,7 @@ async def main() -> int:
     await test_attachment_then_text_are_coalesced()
     await test_typing_event_extends_existing_debounce()
     await test_typing_event_without_pending_message_is_ignored()
+    await test_typing_indicator_stops_as_soon_as_reply_is_sent()
     print("All Sendblue debounce tests passed")
     return 0
 
