@@ -37,6 +37,23 @@ MULTIMODAL_MODEL_IDS = {
 
 NVCF_CREATE_ASSET_URL = "https://api.nvcf.nvidia.com/v2/nvcf/assets"
 NVCF_ASSET_DESCRIPTION = "AgentZero inbound image attachment"
+NVIDIA_WHISPER_GRPC_SERVER = "grpc.nvcf.nvidia.com:443"
+NVIDIA_WHISPER_FUNCTION_ID = "b702f636-f60c-4a3d-a6f4-f3568c13bd7d"
+VOICE_MEMO_MAX_BYTES_DEFAULT = 25 * 1024 * 1024
+VOICE_MEMO_FALLBACK_EXTENSION = ".opus"
+VOICE_MEMO_AUDIO_EXTENSIONS = {
+    ".aac",
+    ".amr",
+    ".caf",
+    ".flac",
+    ".m4a",
+    ".mp3",
+    ".mp4",
+    ".ogg",
+    ".opus",
+    ".wav",
+    ".webm",
+}
 
 # Optional telegram imports
 try:
@@ -93,6 +110,353 @@ def _normalize_attachment_urls(value: Any) -> list[str]:
         urls.append(candidate)
 
     return urls
+
+
+def _voice_memo_transcription_enabled() -> bool:
+    """Allow disabling Sendblue voice memo transcription for troubleshooting."""
+    return _to_bool(os.environ.get("SENDBLUE_VOICE_MEMO_TRANSCRIPTION_ENABLED", "1"))
+
+
+def _voice_memo_max_bytes() -> int:
+    """Resolve max accepted voice memo size from env with sane defaults."""
+    raw_value = os.environ.get(
+        "SENDBLUE_VOICE_MEMO_MAX_BYTES", str(VOICE_MEMO_MAX_BYTES_DEFAULT)
+    )
+    try:
+        parsed = int(raw_value)
+        if parsed <= 0:
+            raise ValueError("must be positive")
+        return parsed
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid SENDBLUE_VOICE_MEMO_MAX_BYTES=%r, defaulting to %s",
+            raw_value,
+            VOICE_MEMO_MAX_BYTES_DEFAULT,
+        )
+        return VOICE_MEMO_MAX_BYTES_DEFAULT
+
+
+def _is_probable_audio_attachment_url(url: str) -> bool:
+    """Classify whether an attachment URL likely points to an audio file."""
+    parsed = urlparse(url)
+    path = parsed.path or ""
+    extension = os.path.splitext(path)[1].lower()
+    if extension in VOICE_MEMO_AUDIO_EXTENSIONS:
+        return True
+
+    guessed_type, _ = mimetypes.guess_type(path)
+    return isinstance(guessed_type, str) and guessed_type.startswith("audio/")
+
+
+def _normalize_audio_content_type(
+    content_type: str | None, source_url: str
+) -> str | None:
+    """Resolve audio content type from response headers with URL fallback."""
+    normalized = (content_type or "").split(";", 1)[0].strip().lower()
+    if normalized == "audio/mp3":
+        normalized = "audio/mpeg"
+    elif normalized == "audio/x-m4a":
+        normalized = "audio/mp4"
+
+    if normalized.startswith("audio/"):
+        return normalized
+
+    guessed_type, _ = mimetypes.guess_type(urlparse(source_url).path)
+    if isinstance(guessed_type, str):
+        guessed = guessed_type.strip().lower()
+        if guessed == "audio/mp3":
+            guessed = "audio/mpeg"
+        elif guessed == "audio/x-m4a":
+            guessed = "audio/mp4"
+        if guessed.startswith("audio/"):
+            return guessed
+
+    return None
+
+
+def _split_voice_memo_attachments(
+    attachment_urls: list[str],
+) -> tuple[list[str], list[str]]:
+    """Split attachment URLs into audio and non-audio URL lists."""
+    voice_memo_urls: list[str] = []
+    passthrough_urls: list[str] = []
+
+    for url in _normalize_attachment_urls(attachment_urls):
+        if _is_probable_audio_attachment_url(url):
+            voice_memo_urls.append(url)
+        else:
+            passthrough_urls.append(url)
+
+    return voice_memo_urls, passthrough_urls
+
+
+def _append_voice_memo_transcripts(
+    text: str,
+    transcripts: list[str],
+    failed_voice_memo_urls: list[str],
+) -> str:
+    """Append transcribed voice memo text and failure notes to user text."""
+    content_blocks: list[str] = []
+    normalized_text = (text or "").strip()
+    if normalized_text:
+        content_blocks.append(normalized_text)
+
+    cleaned_transcripts = [
+        item.strip() for item in transcripts if isinstance(item, str)
+    ]
+    cleaned_transcripts = [item for item in cleaned_transcripts if item]
+
+    if cleaned_transcripts:
+        if len(cleaned_transcripts) == 1:
+            transcript_header = "[Voice memo transcript]"
+            transcript_body = cleaned_transcripts[0]
+        else:
+            transcript_header = "[Voice memo transcripts]"
+            transcript_body = "\n".join(
+                f"{index}. {value}"
+                for index, value in enumerate(cleaned_transcripts, start=1)
+            )
+        content_blocks.append(f"{transcript_header}\n{transcript_body}")
+
+    failed_urls = _normalize_attachment_urls(failed_voice_memo_urls)
+    if failed_urls:
+        failed_lines = "\n".join(f"- {url}" for url in failed_urls)
+        content_blocks.append(
+            "[Voice memo attachments not transcribed]\n" f"{failed_lines}"
+        )
+
+    return "\n\n".join(content_blocks).strip()
+
+
+def _voice_memo_filename_from_url(source_url: str, index: int) -> str:
+    """Build a deterministic filename for downloaded voice memo content."""
+    path = urlparse(source_url).path or ""
+    filename = os.path.basename(path).strip()
+    if not filename:
+        return f"voice-memo-{index}{VOICE_MEMO_FALLBACK_EXTENSION}"
+    if "." not in filename:
+        return f"{filename}{VOICE_MEMO_FALLBACK_EXTENSION}"
+    return filename
+
+
+def _extract_riva_transcript(response: Any) -> str | None:
+    """Extract combined transcript text from a Riva offline ASR response."""
+    if response is None:
+        return None
+
+    results = getattr(response, "results", None)
+    if not results:
+        return None
+
+    transcript_parts: list[str] = []
+    for result in results:
+        alternatives = getattr(result, "alternatives", None)
+        if not alternatives:
+            continue
+
+        transcript = getattr(alternatives[0], "transcript", "")
+        if isinstance(transcript, str) and transcript.strip():
+            transcript_parts.append(transcript.strip())
+
+    combined = " ".join(transcript_parts).strip()
+    return combined or None
+
+
+def _transcribe_audio_bytes_with_whisper_sync(
+    audio_bytes: bytes,
+    api_key: str,
+    grpc_server: str,
+    function_id: str,
+    language_code: str,
+    model_name: str,
+) -> str | None:
+    """Run blocking Riva gRPC transcription for a single audio payload."""
+    try:
+        import riva.client  # type: ignore[import-not-found]
+    except Exception as e:
+        logger.warning(
+            "Voice memo transcription requires nvidia-riva-client: %s",
+            e,
+        )
+        return None
+
+    metadata = [
+        ("function-id", function_id),
+        ("authorization", f"Bearer {api_key}"),
+    ]
+    options = [
+        ("grpc.max_receive_message_length", 100 * 1024 * 1024),
+        ("grpc.max_send_message_length", 100 * 1024 * 1024),
+    ]
+
+    config_kwargs: dict[str, Any] = {
+        "language_code": language_code,
+        "max_alternatives": 1,
+        "enable_automatic_punctuation": True,
+        "verbatim_transcripts": False,
+    }
+    if model_name:
+        config_kwargs["model"] = model_name
+
+    try:
+        auth = riva.client.Auth(
+            use_ssl=True,
+            uri=grpc_server,
+            metadata_args=metadata,
+            options=options,
+        )
+        asr_service = riva.client.ASRService(auth)
+        config = riva.client.RecognitionConfig(**config_kwargs)
+        response = asr_service.offline_recognize(audio_bytes, config=config)
+        transcript = _extract_riva_transcript(response)
+        if transcript:
+            return transcript
+
+        logger.warning("Voice memo transcription returned no transcript alternatives")
+        return None
+    except Exception as e:
+        logger.warning("Voice memo Riva transcription request failed: %s", e)
+        return None
+
+
+async def _transcribe_audio_bytes_with_whisper(
+    _session: aiohttp.ClientSession,
+    audio_bytes: bytes,
+    _filename: str,
+    _content_type: str | None,
+) -> str | None:
+    """Transcribe audio bytes through NVIDIA's hosted Whisper Riva endpoint."""
+    api_key = os.environ.get("NVIDIA_API_KEY", "").strip()
+    if not api_key:
+        logger.warning(
+            "Skipping voice memo transcription; NVIDIA_API_KEY is not configured"
+        )
+        return None
+
+    grpc_server = os.environ.get(
+        "SENDBLUE_VOICE_MEMO_GRPC_SERVER", NVIDIA_WHISPER_GRPC_SERVER
+    ).strip()
+    if not grpc_server:
+        grpc_server = NVIDIA_WHISPER_GRPC_SERVER
+
+    function_id = os.environ.get(
+        "SENDBLUE_VOICE_MEMO_FUNCTION_ID", NVIDIA_WHISPER_FUNCTION_ID
+    ).strip()
+    if not function_id:
+        function_id = NVIDIA_WHISPER_FUNCTION_ID
+
+    language_code = os.environ.get("SENDBLUE_VOICE_MEMO_LANGUAGE", "multi").strip()
+    if not language_code:
+        language_code = "multi"
+
+    # Optional model-name override. Most hosted calls route by function-id metadata.
+    model_name = os.environ.get("SENDBLUE_VOICE_MEMO_MODEL", "").strip()
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        _transcribe_audio_bytes_with_whisper_sync,
+        audio_bytes,
+        api_key,
+        grpc_server,
+        function_id,
+        language_code,
+        model_name,
+    )
+
+
+async def _transcribe_voice_memo_attachment_url(
+    session: aiohttp.ClientSession,
+    source_url: str,
+    index: int,
+) -> str | None:
+    """Download an audio attachment URL and transcribe it with Whisper."""
+    max_bytes = _voice_memo_max_bytes()
+
+    try:
+        async with session.get(source_url) as source_response:
+            if source_response.status != 200:
+                logger.warning(
+                    "Voice memo download failed (status=%s): %s",
+                    source_response.status,
+                    source_url,
+                )
+                return None
+
+            audio_bytes = await source_response.read()
+            if not audio_bytes:
+                logger.warning(
+                    "Voice memo download returned empty body: %s", source_url
+                )
+                return None
+
+            if len(audio_bytes) > max_bytes:
+                logger.warning(
+                    "Voice memo exceeds size limit (%s bytes > %s bytes): %s",
+                    len(audio_bytes),
+                    max_bytes,
+                    source_url,
+                )
+                return None
+
+            content_type = _normalize_audio_content_type(
+                source_response.headers.get("Content-Type"),
+                source_url,
+            )
+
+        if not content_type and not _is_probable_audio_attachment_url(source_url):
+            logger.debug("Skipping non-audio attachment URL: %s", source_url)
+            return None
+
+        filename = _voice_memo_filename_from_url(source_url, index)
+        return await _transcribe_audio_bytes_with_whisper(
+            session,
+            audio_bytes,
+            filename,
+            content_type,
+        )
+    except Exception as e:
+        logger.warning("Failed to transcribe voice memo URL %s: %s", source_url, e)
+        return None
+
+
+async def _transcribe_sendblue_voice_memos(
+    text: str,
+    attachment_urls: list[str],
+) -> tuple[str, list[str]]:
+    """Transcribe audio attachments and remove them from image attachment flow."""
+    normalized_text = (text or "").strip()
+    normalized_attachments = _normalize_attachment_urls(attachment_urls)
+
+    if not normalized_attachments or not _voice_memo_transcription_enabled():
+        return normalized_text, normalized_attachments
+
+    voice_memo_urls, passthrough_urls = _split_voice_memo_attachments(
+        normalized_attachments
+    )
+    if not voice_memo_urls:
+        return normalized_text, normalized_attachments
+
+    transcripts: list[str] = []
+    failed_voice_memo_urls: list[str] = []
+    async with aiohttp.ClientSession() as session:
+        for index, voice_memo_url in enumerate(voice_memo_urls, start=1):
+            transcript = await _transcribe_voice_memo_attachment_url(
+                session,
+                voice_memo_url,
+                index,
+            )
+            if transcript:
+                transcripts.append(transcript)
+            else:
+                failed_voice_memo_urls.append(voice_memo_url)
+
+    merged_text = _append_voice_memo_transcripts(
+        normalized_text,
+        transcripts,
+        failed_voice_memo_urls,
+    )
+    return merged_text, passthrough_urls
 
 
 def _extract_sendblue_attachment_urls(payload: dict[str, Any]) -> list[str]:
@@ -469,6 +833,18 @@ async def _build_user_message_content_async(
                 converted_attachments[index] = asset_reference
 
     return _build_user_message_content(text, converted_attachments)
+
+
+async def _build_imessage_user_content(
+    text: str,
+    attachment_urls: list[str],
+) -> str | list[dict[str, Any]]:
+    """Build iMessage user content, including optional voice memo transcription."""
+    merged_text, filtered_attachments = await _transcribe_sendblue_voice_memos(
+        text,
+        attachment_urls,
+    )
+    return await _build_user_message_content_async(merged_text, filtered_attachments)
 
 
 def _extract_agent_response_payload(response: str) -> tuple[str, list[str]]:
@@ -1226,7 +1602,7 @@ async def start_sendblue_webhook_server(handler: AgentHandler, port: int):
     async def _process_queued_sender_payload(
         sender_number: str, text: str, attachments: list[str]
     ) -> None:
-        user_content = await _build_user_message_content_async(text, attachments)
+        user_content = await _build_imessage_user_content(text, attachments)
         await process_imessage_and_reply(handler, sender_number, user_content)
 
     async def webhook_endpoint(request):
@@ -1315,9 +1691,7 @@ async def start_sendblue_webhook_server(handler: AgentHandler, port: int):
                     )
                     return web.Response(status=200, text="OK")
 
-                user_content = await _build_user_message_content_async(
-                    content, attachments
-                )
+                user_content = await _build_imessage_user_content(content, attachments)
 
                 async def _process_and_reply():
                     try:
@@ -1436,8 +1810,9 @@ async def start_sendblue_bot(handler: AgentHandler):
                     attachments = _extract_sendblue_attachment_urls(msg)
                     if not content.strip() and not attachments:
                         continue
-                    user_content = await _build_user_message_content_async(
-                        content, attachments
+                    user_content = await _build_imessage_user_content(
+                        content,
+                        attachments,
                     )
                     await process_imessage_and_reply(handler, num, user_content)
             # Move checkpoint to poll start time to avoid gaps where messages
