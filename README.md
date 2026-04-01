@@ -19,6 +19,17 @@ cp .env.example .env
 3. Edit `.env` with your actual API keys:
    - `NVIDIA_API_KEY` - Your NVIDIA API key
    - `TELEGRAM_BOT_TOKEN` - Your Telegram bot token (from @BotFather)
+   - `MODEL_ID` - Your model ID. Image attachments are passed as native multimodal input only for these models:
+     - `black-forest-labs/flux.1-kontext-dev`
+     - `google/paligemma`
+     - `meta/llama-3.2-11b-vision-instruct`
+     - `meta/llama-3.2-90b-vision-instruct`
+     - `meta/llama-4-maverick-17b-128e-instruct`
+     - `meta/llama-4-scout-17b-16e-instruct`
+     - `microsoft/phi-3.5-vision-instruct`
+     - `moonshotai/kimi-k2-5`
+     - `nvidia/llama-3.1-nemotron-nano-vl-8b-v1`
+     - `qwen/qwen3.5-397b-a17b`
 
 Optional Sendblue reliability settings:
 - `SENDBLUE_WEBHOOK_PORT` - Run local webhook server instead of polling.
@@ -57,6 +68,8 @@ This will run the agent with both Telegram and iMessage (using SendBlue) channel
 - PDF reading
 - Date/time utilities
 - Telegram bot integration
+- Telegram image uploads (single + media group)
+- Sendblue image attachments (single + multiple)
 
 
 ## License

@@ -1,10 +1,11 @@
 """Bot integrations for iMessage and Telegram."""
 
 import asyncio
+import json
 import logging
 import os
 from datetime import datetime
-from typing import Optional, Dict
+from typing import Any, Dict, Optional
 
 import aiohttp
 from aiohttp import web
@@ -15,6 +16,22 @@ logger = logging.getLogger(__name__)
 
 # Track users who are in the process of setting a system prompt
 pending_prompt_users: Dict[int, bool] = {}
+pending_telegram_media_groups: Dict[str, dict[str, Any]] = {}
+telegram_media_group_lock = asyncio.Lock()
+
+# Valid multimodal models for image inputs.
+MULTIMODAL_MODEL_IDS = {
+    "black-forest-labs/flux.1-kontext-dev",
+    "google/paligemma",
+    "meta/llama-3.2-11b-vision-instruct",
+    "meta/llama-3.2-90b-vision-instruct",
+    "meta/llama-4-maverick-17b-128e-instruct",
+    "meta/llama-4-scout-17b-16e-instruct",
+    "microsoft/phi-3.5-vision-instruct",
+    "moonshotai/kimi-k2.5",
+    "nvidia/llama-3.1-nemotron-nano-vl-8b-v1",
+    "qwen/qwen3.5-397b-a17b",
+}
 
 # Optional telegram imports
 try:
@@ -46,8 +63,252 @@ def _to_bool(value) -> bool:
     return False
 
 
+def _normalize_attachment_urls(value: Any) -> list[str]:
+    """Normalize mixed attachment payloads into a de-duplicated URL list."""
+    if value is None:
+        return []
+
+    raw_values = value if isinstance(value, list) else [value]
+    urls: list[str] = []
+    seen = set()
+
+    for item in raw_values:
+        candidate = ""
+        if isinstance(item, str):
+            candidate = item.strip()
+        elif isinstance(item, dict):
+            for key in ("url", "media_url", "image_url", "src"):
+                if isinstance(item.get(key), str):
+                    candidate = item[key].strip()
+                    break
+
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        urls.append(candidate)
+
+    return urls
+
+
+def _extract_sendblue_attachment_urls(payload: dict[str, Any]) -> list[str]:
+    """Extract Sendblue attachment URLs from known payload fields."""
+    attachments: list[str] = []
+    for key in ("media_url", "media_urls", "attachments"):
+        attachments.extend(_normalize_attachment_urls(payload.get(key)))
+    return _normalize_attachment_urls(attachments)
+
+
+def _model_supports_multimodal() -> bool:
+    model_id = os.environ.get("MODEL_ID", "").strip().lower()
+    return model_id in MULTIMODAL_MODEL_IDS
+
+
+def _build_user_message_content(
+    text: str, attachment_urls: list[str]
+) -> str | list[dict[str, Any]]:
+    """Build model input content, using image blocks for multimodal models."""
+    normalized_text = (text or "").strip()
+    normalized_attachments = _normalize_attachment_urls(attachment_urls)
+
+    if not normalized_attachments:
+        return normalized_text
+
+    if _model_supports_multimodal():
+        content: list[dict[str, Any]] = [
+            {"type": "text", "text": normalized_text or "Analyze these images."}
+        ]
+        for url in normalized_attachments:
+            content.append({"type": "image_url", "image_url": {"url": url}})
+        return content
+
+    attachment_lines = "\n".join(f"- {url}" for url in normalized_attachments)
+    if normalized_text:
+        return f"{normalized_text}\n\n[Image attachments]\n{attachment_lines}"
+    return f"[Image attachments]\n{attachment_lines}"
+
+
+def _extract_agent_response_payload(response: str) -> tuple[str, list[str]]:
+    """Parse optional structured attachment payload from assistant text output."""
+    if not response:
+        return "", []
+
+    try:
+        parsed = json.loads(response)
+    except Exception:
+        return response, []
+
+    if not isinstance(parsed, dict):
+        return response, []
+
+    attachments = []
+    for key in ("attachments", "images", "media_urls", "media_url"):
+        attachments.extend(_normalize_attachment_urls(parsed.get(key)))
+
+    text = ""
+    for key in ("text", "message", "content", "reply"):
+        value = parsed.get(key)
+        if isinstance(value, str):
+            text = value
+            break
+
+    if text or attachments:
+        return text, _normalize_attachment_urls(attachments)
+    return response, []
+
+
+async def _telegram_file_url(bot: Any, file_id: str) -> str | None:
+    """Build direct Telegram file download URL for a file_id."""
+    if not file_id:
+        return None
+    try:
+        tg_file = await bot.get_file(file_id)
+        if not tg_file or not tg_file.file_path:
+            return None
+        return f"https://api.telegram.org/file/bot{bot.token}/{tg_file.file_path}"
+    except Exception as e:
+        logger.warning("Failed to resolve Telegram file URL: %s", e)
+        return None
+
+
+async def _extract_telegram_attachment_urls(message: Any, bot: Any) -> list[str]:
+    """Extract image attachment URLs from a Telegram message."""
+    urls: list[str] = []
+
+    if message.photo:
+        photo_url = await _telegram_file_url(bot, message.photo[-1].file_id)
+        if photo_url:
+            urls.append(photo_url)
+
+    if (
+        message.document
+        and isinstance(message.document.mime_type, str)
+        and message.document.mime_type.startswith("image/")
+    ):
+        doc_url = await _telegram_file_url(bot, message.document.file_id)
+        if doc_url:
+            urls.append(doc_url)
+
+    return _normalize_attachment_urls(urls)
+
+
+async def _send_telegram_response(
+    bot: Any, chat_id: int, text: str, attachment_urls: list[str]
+) -> None:
+    """Send text and attachments to Telegram, batching images when possible."""
+    normalized_text = (text or "").strip()
+    attachments = _normalize_attachment_urls(attachment_urls)
+
+    if normalized_text:
+        await bot.send_message(chat_id=chat_id, text=normalized_text)
+
+    if not attachments:
+        if not normalized_text:
+            await bot.send_message(chat_id=chat_id, text="No response.")
+        return
+
+    if len(attachments) == 1:
+        await bot.send_photo(chat_id=chat_id, photo=attachments[0])
+        return
+
+    # Import lazily so optional telegram dependency stays type-safe.
+    from telegram import InputMediaPhoto as _InputMediaPhoto
+
+    for i in range(0, len(attachments), 10):
+        chunk = attachments[i : i + 10]
+        media_group = [_InputMediaPhoto(media=url) for url in chunk]
+        await bot.send_media_group(chat_id=chat_id, media=media_group)
+
+
+async def _process_telegram_message(
+    handler: AgentHandler,
+    user_id: int,
+    chat_id: int,
+    text: str,
+    attachment_urls: list[str],
+    bot: Any,
+) -> None:
+    """Process a Telegram user message and send text/media reply."""
+    user_content = _build_user_message_content(text, attachment_urls)
+    response = await handler.handle(
+        {"messages": [{"role": "user", "content": user_content}]},
+        session_id=f"tg_{user_id}",
+    )
+    response_text, response_attachments = _extract_agent_response_payload(response)
+    await _send_telegram_response(bot, chat_id, response_text, response_attachments)
+
+
+async def _queue_telegram_media_group(
+    handler: AgentHandler, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
+) -> None:
+    """Collect media-group updates briefly, then process them as one request."""
+    if (
+        update.message is None
+        or update.effective_user is None
+        or update.effective_chat is None
+    ):
+        return
+
+    media_group_id = update.message.media_group_id
+    if not media_group_id:
+        return
+
+    group_key = f"{update.effective_chat.id}:{media_group_id}"
+
+    async with telegram_media_group_lock:
+        group = pending_telegram_media_groups.get(group_key)
+        if group is None:
+            group = {
+                "messages": [],
+                "user_id": update.effective_user.id,
+                "chat_id": update.effective_chat.id,
+                "task": None,
+            }
+            pending_telegram_media_groups[group_key] = group
+
+        group["messages"].append(update.message)
+
+        if group["task"] is None:
+
+            async def _flush_group() -> None:
+                await asyncio.sleep(1.0)
+                async with telegram_media_group_lock:
+                    payload = pending_telegram_media_groups.pop(group_key, None)
+
+                if not payload:
+                    return
+
+                text = ""
+                attachments: list[str] = []
+                for msg in payload["messages"]:
+                    if not text:
+                        text = (msg.caption or msg.text or "").strip()
+                    attachments.extend(
+                        await _extract_telegram_attachment_urls(msg, context.bot)
+                    )
+
+                if not text and not attachments:
+                    return
+
+                await context.bot.send_chat_action(
+                    chat_id=payload["chat_id"], action="typing"
+                )
+                await _process_telegram_message(
+                    handler,
+                    user_id=payload["user_id"],
+                    chat_id=payload["chat_id"],
+                    text=text,
+                    attachment_urls=attachments,
+                    bot=context.bot,
+                )
+
+            group["task"] = asyncio.create_task(_flush_group())
+
+
 async def send_imessage(
-    phone_number: str, message: str, session: Optional[aiohttp.ClientSession] = None
+    phone_number: str,
+    message: str,
+    media_urls: Optional[list[str]] = None,
+    session: Optional[aiohttp.ClientSession] = None,
 ) -> dict:
     """Send an iMessage via Sendblue API."""
     api_key = os.environ.get("SENDBLUE_API_KEY")
@@ -67,6 +328,14 @@ async def send_imessage(
         "content": message,
         "send_style": "regular",
     }
+    payload: dict[str, Any] = payload
+    normalized_media_urls = _normalize_attachment_urls(media_urls)
+    if normalized_media_urls:
+        payload["media_url"] = (
+            normalized_media_urls
+            if len(normalized_media_urls) > 1
+            else normalized_media_urls[0]
+        )
 
     close_session = False
     if session is None:
@@ -322,9 +591,12 @@ async def monitor_sendblue_receive_webhook() -> None:
         await asyncio.sleep(interval)
 
 
-async def handle_imessage(handler: AgentHandler, phone_number: str, text: str) -> str:
+async def handle_imessage(
+    handler: AgentHandler, phone_number: str, user_content: str | list[dict[str, Any]]
+) -> str:
     """Process an incoming iMessage."""
     session_id = f"imessage_{phone_number}"
+    text = user_content if isinstance(user_content, str) else ""
 
     # Check for /clear command
     if text.strip().lower() == "/clear":
@@ -337,7 +609,8 @@ async def handle_imessage(handler: AgentHandler, phone_number: str, text: str) -
 
     try:
         return await handler.handle(
-            {"messages": [{"role": "user", "content": text}]}, session_id=session_id
+            {"messages": [{"role": "user", "content": user_content}]},
+            session_id=session_id,
         )
     except Exception as e:
         logger.error(f"Error: {e}")
@@ -345,7 +618,9 @@ async def handle_imessage(handler: AgentHandler, phone_number: str, text: str) -
 
 
 async def process_imessage_and_reply(
-    handler: AgentHandler, phone_number: str, content: str
+    handler: AgentHandler,
+    phone_number: str,
+    user_content: str | list[dict[str, Any]],
 ) -> None:
     """Send read receipt/typing signals, run agent, then send response."""
 
@@ -363,7 +638,7 @@ async def process_imessage_and_reply(
 
         typing_task = asyncio.create_task(_typing_loop())
         try:
-            resp = await handle_imessage(handler, phone_number, content)
+            resp = await handle_imessage(handler, phone_number, user_content)
         finally:
             typing_task.cancel()
             try:
@@ -371,7 +646,13 @@ async def process_imessage_and_reply(
             except asyncio.CancelledError:
                 pass
 
-        send_res = await send_imessage(phone_number, resp, session=session)
+        reply_text, reply_attachments = _extract_agent_response_payload(resp)
+        send_res = await send_imessage(
+            phone_number,
+            reply_text,
+            media_urls=reply_attachments,
+            session=session,
+        )
         if not send_res.get("success"):
             logger.error("Failed to send Sendblue reply: %s", send_res)
 
@@ -398,6 +679,7 @@ async def start_sendblue_webhook_server(handler: AgentHandler, port: int):
                 or data.get("phone_number")
             )
             content = data.get("content") or data.get("message") or data.get("text", "")
+            attachments = _extract_sendblue_attachment_urls(data)
             direction = str(data.get("direction", "")).lower()
             is_outbound = _to_bool(data.get("is_outbound"))
             message_handle = data.get("message_handle")
@@ -424,14 +706,19 @@ async def start_sendblue_webhook_server(handler: AgentHandler, port: int):
                 ):
                     return web.Response(status=200, text="OK")
 
-                if not content.strip():
-                    logger.info("Ignoring webhook event with empty content: %s", data)
+                if not content.strip() and not attachments:
+                    logger.info(
+                        "Ignoring webhook event with empty content and no attachments: %s",
+                        data,
+                    )
                     return web.Response(status=200, text="OK")
+
+                user_content = _build_user_message_content(content, attachments)
 
                 async def _process_and_reply():
                     try:
                         await process_imessage_and_reply(
-                            handler, sender_number, content
+                            handler, sender_number, user_content
                         )
                     except Exception as e:
                         logger.error(f"Error processing webhook message: {e}")
@@ -523,9 +810,11 @@ async def start_sendblue_bot(handler: AgentHandler):
                     content = (
                         msg.get("content") or msg.get("message") or msg.get("text", "")
                     )
-                    if not content.strip():
+                    attachments = _extract_sendblue_attachment_urls(msg)
+                    if not content.strip() and not attachments:
                         continue
-                    await process_imessage_and_reply(handler, num, content)
+                    user_content = _build_user_message_content(content, attachments)
+                    await process_imessage_and_reply(handler, num, user_content)
             # Move checkpoint to poll start time to avoid gaps where messages
             # arrive while the previous batch is being processed.
             last_check = poll_started_at
@@ -539,7 +828,11 @@ async def start_sendblue_bot(handler: AgentHandler):
 
 async def telegram_start(update: "Update", context: "ContextTypes.DEFAULT_TYPE"):
     """Handle /start command."""
-    if update.message is None or update.effective_user is None:
+    if (
+        update.message is None
+        or update.effective_user is None
+        or update.effective_chat is None
+    ):
         return
     await update.message.reply_text(
         f"Hello {update.effective_user.first_name}! I'm AgentZero."
@@ -584,10 +877,11 @@ async def telegram_handle_msg(
     if (
         update.message is None
         or update.effective_user is None
-        or update.message.text is None
+        or update.effective_chat is None
     ):
         return
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
 
     # Check if user is in prompt-setting mode
     if user_id in pending_prompt_users:
@@ -595,7 +889,7 @@ async def telegram_handle_msg(
         del pending_prompt_users[user_id]
 
         # Get the new prompt from the message
-        new_prompt = update.message.text.strip()
+        new_prompt = (update.message.text or "").strip()
 
         if not new_prompt:
             await update.message.reply_text("Prompt cannot be empty. Cancelled.")
@@ -614,13 +908,25 @@ async def telegram_handle_msg(
             )
         return
 
+    if update.message.media_group_id:
+        await _queue_telegram_media_group(handler, update, context)
+        return
+
+    text = (update.message.text or update.message.caption or "").strip()
+    attachments = await _extract_telegram_attachment_urls(update.message, context.bot)
+    if not text and not attachments:
+        return
+
     # Normal message handling
     await update.message.chat.send_action(action="typing")
-    resp = await handler.handle(
-        {"messages": [{"role": "user", "content": update.message.text}]},
-        session_id=f"tg_{update.effective_user.id}",
+    await _process_telegram_message(
+        handler,
+        user_id=user_id,
+        chat_id=chat_id,
+        text=text,
+        attachment_urls=attachments,
+        bot=context.bot,
     )
-    await update.message.reply_text(resp or "No response.")
 
 
 async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -659,7 +965,7 @@ def run_telegram_bot(handler: AgentHandler):
     )
     app.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
+            (filters.TEXT | filters.PHOTO | filters.Document.IMAGE) & ~filters.COMMAND,
             lambda update, context: telegram_handle_msg(handler, update, context),
         )
     )
@@ -694,7 +1000,7 @@ async def run_telegram_bot_async(handler: AgentHandler):
     )
     app.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
+            (filters.TEXT | filters.PHOTO | filters.Document.IMAGE) & ~filters.COMMAND,
             lambda update, context: telegram_handle_msg(handler, update, context),
         )
     )

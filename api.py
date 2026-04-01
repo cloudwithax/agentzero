@@ -13,6 +13,25 @@ from tools import TOOLS, validate_tool_args
 logger = logging.getLogger(__name__)
 
 
+def _message_content_to_text(content: Any) -> str:
+    """Extract plain text from content that may include multimodal blocks."""
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text" and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+            elif isinstance(item.get("content"), str):
+                parts.append(item["content"])
+        return "\n".join(part for part in parts if part).strip()
+
+    return "" if content is None else str(content)
+
+
 # Common refusal patterns to detect
 REFUSAL_PATTERNS = [
     "stay in my lane",
@@ -314,7 +333,7 @@ async def process_response(
         # Fallback: recover tool calls when model emits raw bash code fences.
         if not message.get("tool_calls"):
             inferred_tool_calls = infer_tool_calls_from_content(
-                message.get("content", "")
+                _message_content_to_text(message.get("content", ""))
             )
             if inferred_tool_calls:
                 message["tool_calls"] = inferred_tool_calls
@@ -354,8 +373,8 @@ async def process_response(
             message = response_data["choices"][0]["message"]
 
         # Check for refusal patterns
-        content = message.get("content", "")
-        if detect_tool_leak(content):
+        content_text = _message_content_to_text(message.get("content", ""))
+        if detect_tool_leak(content_text):
             if tool_leak_retry_count < max_tool_leak_retries:
                 tool_leak_retry_count += 1
                 logger.warning(
@@ -390,7 +409,7 @@ async def process_response(
                 "Sorry, there was an internal formatting issue. Please send that again."
             )
 
-        if detect_refusal(content):
+        if detect_refusal(content_text):
             if refusal_retry_count < max_refusal_retries:
                 refusal_retry_count += 1
                 logger.warning(
@@ -422,4 +441,4 @@ async def process_response(
                 )
 
         # No refusal detected or max retries reached, return content
-        return content or ""
+        return content_text or ""

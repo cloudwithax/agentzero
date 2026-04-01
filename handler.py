@@ -15,6 +15,25 @@ from api import api_call_with_retry, process_response
 logger = logging.getLogger(__name__)
 
 
+def _content_to_text(content: Any) -> str:
+    """Extract plain text from message content that may include multimodal blocks."""
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text" and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+            elif isinstance(item.get("content"), str):
+                parts.append(item["content"])
+        return "\n".join(part for part in parts if part).strip()
+
+    return "" if content is None else str(content)
+
+
 # Configuration
 BASE_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 API_KEY = os.environ.get(
@@ -398,7 +417,9 @@ class AgentHandler:
 
         # Get the user's message for memory retrieval
         user_messages = [m for m in data["messages"] if m.get("role") == "user"]
-        user_query = user_messages[-1]["content"] if user_messages else ""
+        user_query = (
+            _content_to_text(user_messages[-1].get("content")) if user_messages else ""
+        )
 
         # Analyze task and create plan for complex queries
         task_plan = None
@@ -440,7 +461,8 @@ class AgentHandler:
         # Add task plan context if available
         plan_context = ""
         if task_plan and len(task_plan.steps) > 1:
-            plan_context = f"\n\n[Task Plan - {task.type}]:\n"
+            task_type_label = task.type if task else "generic"
+            plan_context = f"\n\n[Task Plan - {task_type_label}]:\n"
             for i, step in enumerate(task_plan.steps, 1):
                 plan_context += f"{i}. {step.description}\n"
 
@@ -553,7 +575,9 @@ class AgentHandler:
         # Calculate tokens for current user input
         current_input_tokens = 0
         for msg in current_messages:
-            current_input_tokens += estimate_tokens(msg.get("content", ""))
+            current_input_tokens += estimate_tokens(
+                _content_to_text(msg.get("content", ""))
+            )
 
         # Calculate available tokens for history
         available_tokens = (
@@ -583,7 +607,7 @@ class AgentHandler:
         current_tokens = 0
 
         for msg in history:
-            msg_tokens = estimate_tokens(msg.get("content", ""))
+            msg_tokens = estimate_tokens(_content_to_text(msg.get("content", "")))
             if current_tokens + msg_tokens > available_tokens:
                 break
 
