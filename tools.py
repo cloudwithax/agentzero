@@ -380,6 +380,28 @@ async def memory_stats_tool():
         return {"success": False, "error": str(e)}
 
 
+async def consortium_agree_tool(
+    verdict: str = "",
+    rationale: str = "",
+    confidence: float = 1.0,
+    key_points: Optional[list] = None,
+):
+    """Signal that a consortium member agrees on a final verdict."""
+    try:
+        normalized_confidence = float(confidence)
+    except (TypeError, ValueError):
+        normalized_confidence = 1.0
+
+    return {
+        "success": True,
+        "agreed": True,
+        "verdict": verdict.strip() if isinstance(verdict, str) else "",
+        "rationale": rationale.strip() if isinstance(rationale, str) else "",
+        "confidence": max(0.0, min(1.0, normalized_confidence)),
+        "key_points": key_points if isinstance(key_points, list) else [],
+    }
+
+
 async def parse_mcp_response(resp):
     """Parse MCP response handling both JSON and SSE formats."""
     content_type = resp.headers.get("Content-Type", "")
@@ -558,6 +580,7 @@ TOOLS = {
     "forget": forget_tool,
     "memory_stats": memory_stats_tool,
     "web_search": web_search_tool,
+    "consortium_agree": consortium_agree_tool,
 }
 
 
@@ -585,6 +608,7 @@ def validate_tool_args(func_name: str, func_args: dict) -> tuple:
         "recall": ["query"],
         "forget": ["memory_id"],
         "web_search": ["query"],
+        "consortium_agree": [],
     }
 
     if func_name in required_params:

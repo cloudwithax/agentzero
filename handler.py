@@ -2,6 +2,7 @@
 
 import aiohttp
 import datetime
+import json
 import logging
 import os
 from typing import Any, Optional
@@ -374,8 +375,79 @@ BASE_PAYLOAD = {
                 },
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "consortium_agree",
+                "description": "Signal that a consortium member agrees on the final verdict",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "verdict": {
+                            "type": "string",
+                            "description": "Final verdict proposed by this member",
+                        },
+                        "rationale": {
+                            "type": "string",
+                            "description": "Short reasoning for the verdict",
+                        },
+                        "confidence": {
+                            "type": "number",
+                            "description": "Confidence from 0 to 1",
+                        },
+                        "key_points": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional bullet points supporting agreement",
+                        },
+                    },
+                },
+            },
+        },
     ],
 }
+
+CONSORTIUM_CONTACT_MESSAGE = "contacting the consortium to decide your verdict"
+CONSORTIUM_COMPLETION_MESSAGE = "the consortium has reached an agreement."
+CONSORTIUM_MAX_ROUNDS = 4
+CONSORTIUM_MEMBERS = [
+    {
+        "model_id": "qwen/qwen3.5-122b-a10b",
+        "name": "Forensic Skeptic",
+        "stance": "Evidence-first, aggressively tests claims and assumptions.",
+        "persona": (
+            "You are precise, surgical, and skeptical. You trust verifiable signals over hype "
+            "and always pressure-test weak claims."
+        ),
+    },
+    {
+        "model_id": "stepfun-ai/step-3.5-flash",
+        "name": "Practical Operator",
+        "stance": "Execution-first, prioritizes speed, simplicity, and real-world usability.",
+        "persona": (
+            "You are concise, tactical, and practical. You optimize for decisions users can act "
+            "on today with low complexity."
+        ),
+    },
+    {
+        "model_id": "z-ai/glm4.7",
+        "name": "Risk Sentinel",
+        "stance": "Risk-aware, focuses on failure modes, tradeoffs, and user downside.",
+        "persona": (
+            "You are vigilant, cautious, and analytical. You surface hidden risks, edge cases, "
+            "and second-order consequences."
+        ),
+    },
+    {
+        "model_id": "meta/llama-3.1-405b-instruct",
+        "name": "Strategic Synthesizer",
+        "stance": "Long-horizon thinker, unifies competing arguments into coherent decisions.",
+        "persona": (
+            "You are measured, integrative, and strategic. You reconcile disagreement and "
+            "seek robust consensus under uncertainty."
+        ),
+    },
+]
 
 
 class AgentHandler:
@@ -396,6 +468,319 @@ class AgentHandler:
         self.task_planner = task_planner
         self.task_analyzer = task_analyzer
         self.adaptive_formatter = adaptive_formatter
+
+    def _should_use_consortium_mode(self, user_query: str) -> bool:
+        """Detect whether the user explicitly requested consortium mode."""
+        if not user_query:
+            return False
+
+        query = user_query.lower()
+        explicit_triggers = [
+            "the consortium",
+            "consortium mode",
+            "ask the consortium",
+            "consult the consortium",
+            "contact the consortium",
+            "use consortium",
+            "run consortium",
+        ]
+        if any(trigger in query for trigger in explicit_triggers):
+            return True
+
+        action_verbs = ["ask", "consult", "use", "run", "contact", "invoke"]
+        return "consortium" in query and any(verb in query for verb in action_verbs)
+
+    def _extract_consortium_vote(
+        self, messages: list[dict[str, Any]]
+    ) -> dict[str, Any] | None:
+        """Extract the latest consortium_agree tool arguments from a model turn."""
+        for message in reversed(messages):
+            if not isinstance(message, dict):
+                continue
+
+            tool_calls = message.get("tool_calls")
+            if not isinstance(tool_calls, list):
+                continue
+
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    continue
+                function_obj = tool_call.get("function", {})
+                if not isinstance(function_obj, dict):
+                    continue
+                if function_obj.get("name") != "consortium_agree":
+                    continue
+
+                arguments = function_obj.get("arguments", {})
+                if isinstance(arguments, str):
+                    try:
+                        arguments = json.loads(arguments)
+                    except Exception:
+                        arguments = {}
+
+                if not isinstance(arguments, dict):
+                    arguments = {}
+
+                return arguments
+
+        return None
+
+    def _normalize_consortium_vote(self, raw_vote: dict[str, Any]) -> dict[str, Any]:
+        """Normalize vote payload returned via consortium_agree."""
+        confidence = raw_vote.get("confidence", 1.0)
+        try:
+            confidence_value = float(confidence)
+        except (TypeError, ValueError):
+            confidence_value = 1.0
+
+        key_points = raw_vote.get("key_points", [])
+        if not isinstance(key_points, list):
+            key_points = [str(key_points)]
+
+        return {
+            "verdict": str(raw_vote.get("verdict", "")).strip(),
+            "rationale": str(raw_vote.get("rationale", "")).strip(),
+            "confidence": max(0.0, min(1.0, confidence_value)),
+            "key_points": [
+                str(point).strip() for point in key_points if str(point).strip()
+            ],
+        }
+
+    def _majority_verdict(self, votes: dict[str, dict[str, Any]]) -> str:
+        """Return the most common non-empty verdict from current consortium votes."""
+        verdict_counts: dict[str, dict[str, Any]] = {}
+
+        for vote in votes.values():
+            verdict = str(vote.get("verdict", "")).strip()
+            if not verdict:
+                continue
+
+            normalized = verdict.lower()
+            if normalized not in verdict_counts:
+                verdict_counts[normalized] = {"verdict": verdict, "count": 0}
+            verdict_counts[normalized]["count"] += 1
+
+        if not verdict_counts:
+            return ""
+
+        return max(verdict_counts.values(), key=lambda item: item["count"])["verdict"]
+
+    def _format_consortium_transcript(
+        self, transcript: list[dict[str, Any]], max_entries: int = 24
+    ) -> str:
+        """Format consortium transcript for model consumption."""
+        if not transcript:
+            return "No debate turns yet."
+
+        lines: list[str] = []
+        for entry in transcript[-max_entries:]:
+            agreed_suffix = " [AGREED]" if entry.get("agreed") else ""
+            lines.append(
+                f"Round {entry.get('round')} | {entry.get('name')} ({entry.get('model_id')}){agreed_suffix}: "
+                f"{str(entry.get('content', '')).strip()}"
+            )
+
+        return "\n".join(lines)
+
+    async def _run_consortium_turn(
+        self,
+        session: aiohttp.ClientSession,
+        user_query: str,
+        transcript: list[dict[str, Any]],
+        agreed_model_ids: set[str],
+        vote_by_model: dict[str, dict[str, Any]],
+        member: dict[str, str],
+        round_number: int,
+        custom_prompt: str,
+        memory_context: str,
+    ) -> tuple[str, dict[str, Any] | None]:
+        """Run one model turn in consortium mode."""
+        majority_verdict = self._majority_verdict(vote_by_model)
+        agreed_member_names = [
+            m["name"] for m in CONSORTIUM_MEMBERS if m["model_id"] in agreed_model_ids
+        ]
+
+        system_parts = [
+            "You are participating in 'the consortium', a four-model decision panel.",
+            f"Identity: {member['name']}",
+            f"Core stance: {member['stance']}",
+            f"Personality: {member['persona']}",
+            "Debate rigorously and challenge weak claims.",
+            "If and only if the panel is ready for a final shared verdict, call consortium_agree.",
+            "When calling consortium_agree, include verdict, rationale, confidence (0..1), and key_points.",
+            "After tool calls, provide a short plain-text turn (no markdown).",
+        ]
+
+        if majority_verdict:
+            system_parts.append(
+                f"Provisional majority verdict so far: {majority_verdict}"
+            )
+
+        if custom_prompt:
+            system_parts.append(f"User-configured system prompt: {custom_prompt}")
+
+        if memory_context:
+            system_parts.append(memory_context.strip())
+
+        user_prompt = (
+            f"Original user request:\n{user_query}\n\n"
+            f"Round {round_number} of {CONSORTIUM_MAX_ROUNDS}.\n"
+            f"Members already aligned: {', '.join(agreed_member_names) if agreed_member_names else 'none'}\n\n"
+            "Debate transcript so far:\n"
+            f"{self._format_consortium_transcript(transcript)}\n\n"
+            "Provide your next concise debate turn."
+        )
+
+        member_messages = [
+            {"role": "system", "content": "\n".join(system_parts)},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        payload = BASE_PAYLOAD.copy()
+        payload["model"] = member["model_id"]
+        payload["messages"] = member_messages
+
+        response_data = await api_call_with_retry(
+            session,
+            BASE_URL,
+            payload,
+            {"Authorization": f"Bearer {API_KEY}"},
+        )
+
+        turn_content = await process_response(
+            response_data,
+            payload["messages"],
+            session,
+            BASE_URL,
+            API_KEY,
+            payload,
+        )
+
+        raw_vote = self._extract_consortium_vote(payload["messages"])
+        vote = self._normalize_consortium_vote(raw_vote) if raw_vote else None
+        return turn_content, vote
+
+    async def _run_consortium_mode(
+        self,
+        user_query: str,
+        session: aiohttp.ClientSession,
+        custom_prompt: str = "",
+        memory_context: str = "",
+    ) -> str:
+        """Run multi-model consortium debate and then judge synthesis."""
+        transcript: list[dict[str, Any]] = []
+        agreed_model_ids: set[str] = set()
+        vote_by_model: dict[str, dict[str, Any]] = {}
+
+        for round_number in range(1, CONSORTIUM_MAX_ROUNDS + 1):
+            for member in CONSORTIUM_MEMBERS:
+                if member["model_id"] in agreed_model_ids:
+                    continue
+
+                try:
+                    turn_content, vote = await self._run_consortium_turn(
+                        session=session,
+                        user_query=user_query,
+                        transcript=transcript,
+                        agreed_model_ids=agreed_model_ids,
+                        vote_by_model=vote_by_model,
+                        member=member,
+                        round_number=round_number,
+                        custom_prompt=custom_prompt,
+                        memory_context=memory_context,
+                    )
+                except Exception as exc:
+                    logger.exception(
+                        "Consortium turn failed for %s", member["model_id"]
+                    )
+                    turn_content = f"I encountered an internal issue this round: {exc}"
+                    vote = None
+
+                transcript.append(
+                    {
+                        "round": round_number,
+                        "name": member["name"],
+                        "model_id": member["model_id"],
+                        "content": turn_content,
+                        "agreed": vote is not None,
+                    }
+                )
+
+                if vote is not None:
+                    agreed_model_ids.add(member["model_id"])
+                    vote_by_model[member["model_id"]] = vote
+
+            if len(agreed_model_ids) == len(CONSORTIUM_MEMBERS):
+                break
+
+        consensus_reached = len(agreed_model_ids) == len(CONSORTIUM_MEMBERS)
+        aligned_member_names = [
+            member["name"]
+            for member in CONSORTIUM_MEMBERS
+            if member["model_id"] in agreed_model_ids
+        ]
+
+        judge_system_parts = [
+            "You are the judge model for 'the consortium'.",
+            "You receive a transcript from four debating specialist models.",
+            "Synthesize their arguments into one final plain-text answer for the user.",
+            "Be clear, decisive, and actionable.",
+        ]
+        if custom_prompt:
+            judge_system_parts.append(f"User-configured system prompt: {custom_prompt}")
+        if memory_context:
+            judge_system_parts.append(memory_context.strip())
+
+        judge_user_prompt = (
+            f"Original user request:\n{user_query}\n\n"
+            "Consortium status:\n"
+            f"- Full consensus via consortium_agree: {'yes' if consensus_reached else 'no'}\n"
+            f"- Aligned members: {', '.join(aligned_member_names) if aligned_member_names else 'none'}\n\n"
+            "Agreement payloads:\n"
+            f"{json.dumps(vote_by_model, ensure_ascii=True, indent=2)}\n\n"
+            "Debate transcript:\n"
+            f"{self._format_consortium_transcript(transcript, max_entries=80)}\n\n"
+            "Return the final answer to the user."
+        )
+
+        judge_payload = BASE_PAYLOAD.copy()
+        judge_payload["model"] = MODEL_ID
+        judge_payload["messages"] = [
+            {"role": "system", "content": "\n".join(judge_system_parts)},
+            {"role": "user", "content": judge_user_prompt},
+        ]
+
+        judge_response_data = await api_call_with_retry(
+            session,
+            BASE_URL,
+            judge_payload,
+            {"Authorization": f"Bearer {API_KEY}"},
+        )
+
+        judge_content = await process_response(
+            judge_response_data,
+            judge_payload["messages"],
+            session,
+            BASE_URL,
+            API_KEY,
+            judge_payload,
+        )
+
+        if not judge_content:
+            fallback_verdict = self._majority_verdict(vote_by_model)
+            judge_content = (
+                fallback_verdict
+                if fallback_verdict
+                else "The consortium debated the request but could not finalize a clear verdict."
+            )
+
+        status_line = (
+            CONSORTIUM_COMPLETION_MESSAGE
+            if consensus_reached
+            else "the consortium reached a partial consensus and escalated to the judge model."
+        )
+
+        return f"{CONSORTIUM_CONTACT_MESSAGE}\n\n" f"{status_line}\n" f"{judge_content}"
 
     async def analyze_and_plan_task(self, user_query: str) -> Optional[Any]:
         """Analyze user query and create a task plan if it's complex enough."""
@@ -457,6 +842,30 @@ class AgentHandler:
 
         # Build system prompt with adaptive formatting
         custom_prompt = self.memory_store.get_system_prompt()
+
+        if user_query and self._should_use_consortium_mode(user_query):
+            async with aiohttp.ClientSession() as session:
+                content = await self._run_consortium_mode(
+                    user_query=user_query,
+                    session=session,
+                    custom_prompt=custom_prompt or "",
+                    memory_context=memory_context,
+                )
+
+            if session_id and user_query:
+                self.memory_store.add_conversation_message(
+                    role="user", content=user_query, session_id=session_id
+                )
+            if session_id and content:
+                self.memory_store.add_conversation_message(
+                    role="assistant", content=content, session_id=session_id
+                )
+
+            if task and content and not content.startswith("Error:"):
+                self.example_bank.auto_feedback(task.type, success=True, efficiency=1.0)
+
+            print(content)
+            return content
 
         # Add task plan context if available
         plan_context = ""

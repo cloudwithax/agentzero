@@ -34,6 +34,18 @@ async def test_tools_work():
     assert "test" in result["stdout"]
     print(f"✓ bash works, stdout: {result['stdout'].strip()}")
 
+    # Test consortium_agree
+    result = await TOOLS["consortium_agree"](
+        verdict="Buy the Casper",
+        rationale="Best balance of comfort and support",
+        confidence=0.9,
+        key_points=["good warranty", "consistent support"],
+    )
+    assert result["success"]
+    assert result["agreed"] is True
+    assert result["verdict"] == "Buy the Casper"
+    print("✓ consortium_agree works")
+
     print("All tools functional!\n")
 
 
@@ -43,6 +55,10 @@ async def test_payload_isolation():
 
     original_keys = set(BASE_PAYLOAD.keys())
     original_messages = BASE_PAYLOAD.get("messages", [])
+    tool_names = {
+        tool.get("function", {}).get("name") for tool in BASE_PAYLOAD.get("tools", [])
+    }
+    assert "consortium_agree" in tool_names, "consortium_agree missing from payload"
 
     # Simulate what handle() does
     test_payload = BASE_PAYLOAD.copy()
