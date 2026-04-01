@@ -39,6 +39,10 @@ Optional Sendblue reliability settings:
 - `SENDBLUE_ATTACHMENT_DEBOUNCE_SECONDS` - Debounce window for attachment-first inbound webhook sequences before sending to the agent (default: `2.0`).
 - `SENDBLUE_TYPING_DEBOUNCE_SECONDS` - Optional debounce extension window for typing webhook events when a sender already has pending queued content (default: attachment debounce value).
 
+Multimodal/NVIDIA asset handling:
+- `NVCF_ASSET_UPLOAD_ENABLED` - Upload inbound multimodal image URLs to NVIDIA NVCF Assets before inference and pass `asset_id` references (default: `1`, set `0` to disable).
+- This is enabled by default for supported multimodal models and helps with large/private channel attachment URLs that cannot be fetched reliably by the model endpoint.
+
 ## Usage
 
 ### Run the agent:

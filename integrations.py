@@ -1,11 +1,13 @@
 """Bot integrations for iMessage and Telegram."""
 
 import asyncio
+import mimetypes
 import json
 import logging
 import os
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Dict, Optional
+from urllib.parse import urlparse
 
 import aiohttp
 from aiohttp import web
@@ -32,6 +34,9 @@ MULTIMODAL_MODEL_IDS = {
     "nvidia/llama-3.1-nemotron-nano-vl-8b-v1",
     "qwen/qwen3.5-397b-a17b",
 }
+
+NVCF_CREATE_ASSET_URL = "https://api.nvcf.nvidia.com/v2/nvcf/assets"
+NVCF_ASSET_DESCRIPTION = "AgentZero inbound image attachment"
 
 # Optional telegram imports
 try:
@@ -242,6 +247,177 @@ def _model_supports_multimodal() -> bool:
     return model_id in MULTIMODAL_MODEL_IDS
 
 
+def _nvcf_asset_upload_enabled() -> bool:
+    """Allow disabling NVCF asset uploads via env for troubleshooting."""
+    return _to_bool(os.environ.get("NVCF_ASSET_UPLOAD_ENABLED", "1"))
+
+
+def _is_nvcf_asset_reference(url: str) -> bool:
+    return ";asset_id," in (url or "")
+
+
+def _normalize_image_content_type(
+    content_type: str | None, source_url: str
+) -> str | None:
+    """Resolve image content type from response headers with URL fallback."""
+    normalized = (content_type or "").split(";", 1)[0].strip().lower()
+    if normalized == "image/jpg":
+        normalized = "image/jpeg"
+    if normalized.startswith("image/"):
+        return normalized
+
+    guessed_type, _ = mimetypes.guess_type(urlparse(source_url).path)
+    if isinstance(guessed_type, str):
+        guessed = guessed_type.strip().lower()
+        if guessed == "image/jpg":
+            guessed = "image/jpeg"
+        if guessed.startswith("image/"):
+            return guessed
+
+    return None
+
+
+def _find_string_field(data: Any, keys: tuple[str, ...]) -> str | None:
+    """Find the first non-empty string field recursively for known keys."""
+    if isinstance(data, dict):
+        for key in keys:
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for value in data.values():
+            found = _find_string_field(value, keys)
+            if found:
+                return found
+        return None
+
+    if isinstance(data, list):
+        for item in data:
+            found = _find_string_field(item, keys)
+            if found:
+                return found
+
+    return None
+
+
+def _extract_nvcf_asset_fields(payload: Any) -> tuple[str | None, str | None]:
+    """Extract asset ID and pre-signed upload URL from create-asset response."""
+    if not isinstance(payload, (dict, list)):
+        return None, None
+
+    asset_id = _find_string_field(payload, ("assetId", "asset_id"))
+    upload_url = _find_string_field(
+        payload,
+        (
+            "uploadUrl",
+            "upload_url",
+            "uploadURI",
+            "upload_uri",
+        ),
+    )
+
+    # Some schemas nest the pre-signed URL under a generic `url` field.
+    if not upload_url:
+        candidate_url = _find_string_field(payload, ("url",))
+        if candidate_url and candidate_url.startswith("http"):
+            upload_url = candidate_url
+
+    return asset_id, upload_url
+
+
+async def _create_nvcf_asset(
+    session: aiohttp.ClientSession, api_key: str, content_type: str
+) -> tuple[str | None, str | None]:
+    """Create an NVCF asset and return (asset_id, upload_url)."""
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    payload = {"contentType": content_type, "description": NVCF_ASSET_DESCRIPTION}
+
+    try:
+        async with session.post(
+            NVCF_CREATE_ASSET_URL, json=payload, headers=headers
+        ) as response:
+            status = response.status
+            try:
+                body = await response.json(content_type=None)
+            except Exception:
+                body = {"raw": await response.text()}
+
+            if status not in {200, 201}:
+                logger.warning("NVCF create-asset failed (status=%s): %s", status, body)
+                return None, None
+
+            asset_id, upload_url = _extract_nvcf_asset_fields(body)
+            if not asset_id or not upload_url:
+                logger.warning("NVCF create-asset response missing fields: %s", body)
+                return None, None
+
+            return asset_id, upload_url
+    except Exception as e:
+        logger.warning("NVCF create-asset request failed: %s", e)
+        return None, None
+
+
+async def _upload_attachment_to_nvcf_asset(
+    session: aiohttp.ClientSession,
+    api_key: str,
+    source_url: str,
+) -> str | None:
+    """Upload a remote image URL into NVCF assets and return asset data URI."""
+    if _is_nvcf_asset_reference(source_url):
+        return source_url
+
+    try:
+        async with session.get(source_url) as source_response:
+            if source_response.status != 200:
+                logger.warning(
+                    "Attachment download failed (status=%s): %s",
+                    source_response.status,
+                    source_url,
+                )
+                return None
+
+            image_bytes = await source_response.read()
+            if not image_bytes:
+                logger.warning(
+                    "Attachment download returned empty body: %s", source_url
+                )
+                return None
+
+            content_type = _normalize_image_content_type(
+                source_response.headers.get("Content-Type"), source_url
+            )
+
+        if not content_type:
+            logger.warning("Skipping non-image attachment URL: %s", source_url)
+            return None
+
+        asset_id, upload_url = await _create_nvcf_asset(session, api_key, content_type)
+        if not asset_id or not upload_url:
+            return None
+
+        async with session.put(
+            upload_url,
+            data=image_bytes,
+            headers={"Content-Type": content_type},
+        ) as upload_response:
+            if upload_response.status not in {200, 201, 204}:
+                error_text = await upload_response.text()
+                logger.warning(
+                    "NVCF pre-signed upload failed (status=%s): %s",
+                    upload_response.status,
+                    error_text,
+                )
+                return None
+
+        return f"data:{content_type};asset_id,{asset_id}"
+    except Exception as e:
+        logger.warning("Failed to upload attachment to NVCF asset: %s", e)
+        return None
+
+
 def _build_user_message_content(
     text: str, attachment_urls: list[str]
 ) -> str | list[dict[str, Any]]:
@@ -264,6 +440,35 @@ def _build_user_message_content(
     if normalized_text:
         return f"{normalized_text}\n\n[Image attachments]\n{attachment_lines}"
     return f"[Image attachments]\n{attachment_lines}"
+
+
+async def _build_user_message_content_async(
+    text: str, attachment_urls: list[str]
+) -> str | list[dict[str, Any]]:
+    """Build user message content and upgrade image URLs to NVCF asset refs."""
+    normalized_attachments = _normalize_attachment_urls(attachment_urls)
+    if not normalized_attachments:
+        return _build_user_message_content(text, normalized_attachments)
+
+    if not _model_supports_multimodal() or not _nvcf_asset_upload_enabled():
+        return _build_user_message_content(text, normalized_attachments)
+
+    api_key = os.environ.get("NVIDIA_API_KEY", "").strip()
+    if not api_key:
+        return _build_user_message_content(text, normalized_attachments)
+
+    converted_attachments = normalized_attachments.copy()
+    async with aiohttp.ClientSession() as session:
+        for index, url in enumerate(normalized_attachments):
+            asset_reference = await _upload_attachment_to_nvcf_asset(
+                session,
+                api_key,
+                url,
+            )
+            if asset_reference:
+                converted_attachments[index] = asset_reference
+
+    return _build_user_message_content(text, converted_attachments)
 
 
 def _extract_agent_response_payload(response: str) -> tuple[str, list[str]]:
@@ -367,7 +572,7 @@ async def _process_telegram_message(
     bot: Any,
 ) -> None:
     """Process a Telegram user message and send text/media reply."""
-    user_content = _build_user_message_content(text, attachment_urls)
+    user_content = await _build_user_message_content_async(text, attachment_urls)
     response = await handler.handle(
         {"messages": [{"role": "user", "content": user_content}]},
         session_id=f"tg_{user_id}",
@@ -944,7 +1149,7 @@ async def start_sendblue_webhook_server(handler: AgentHandler, port: int):
     async def _process_queued_sender_payload(
         sender_number: str, text: str, attachments: list[str]
     ) -> None:
-        user_content = _build_user_message_content(text, attachments)
+        user_content = await _build_user_message_content_async(text, attachments)
         await process_imessage_and_reply(handler, sender_number, user_content)
 
     async def webhook_endpoint(request):
@@ -1033,7 +1238,9 @@ async def start_sendblue_webhook_server(handler: AgentHandler, port: int):
                     )
                     return web.Response(status=200, text="OK")
 
-                user_content = _build_user_message_content(content, attachments)
+                user_content = await _build_user_message_content_async(
+                    content, attachments
+                )
 
                 async def _process_and_reply():
                     try:
@@ -1152,7 +1359,9 @@ async def start_sendblue_bot(handler: AgentHandler):
                     attachments = _extract_sendblue_attachment_urls(msg)
                     if not content.strip() and not attachments:
                         continue
-                    user_content = _build_user_message_content(content, attachments)
+                    user_content = await _build_user_message_content_async(
+                        content, attachments
+                    )
                     await process_imessage_and_reply(handler, num, user_content)
             # Move checkpoint to poll start time to avoid gaps where messages
             # arrive while the previous batch is being processed.

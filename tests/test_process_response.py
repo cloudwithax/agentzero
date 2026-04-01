@@ -6,8 +6,46 @@ import sys
 from unittest.mock import AsyncMock
 
 sys.path.insert(0, "/home/clxud/Documents/github/agentzero")
-from api import process_response, execute_tool_calls
+from api import process_response, execute_tool_calls, _extract_nvcf_asset_ids
 from handler import BASE_URL, API_KEY, BASE_PAYLOAD
+
+
+def test_extract_nvcf_asset_ids_from_messages() -> None:
+    """Collect and de-duplicate NVCF asset IDs from text and image blocks."""
+    print("Test 0: NVCF asset ID extraction")
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Analyze this image"},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/png;asset_id,aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+                    },
+                },
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": (
+                'Please inspect <img src="data:image/jpeg;asset_id,ffffffff-1111-2222-3333-444444444444" />'
+            ),
+        },
+        {
+            "role": "user",
+            "content": "repeat data:image/png;asset_id,aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        },
+    ]
+
+    asset_ids = _extract_nvcf_asset_ids(messages)
+
+    assert asset_ids == [
+        "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "ffffffff-1111-2222-3333-444444444444",
+    ], f"Unexpected asset IDs: {asset_ids}"
+    print("  ✓ Passed")
 
 
 async def test_regular_response():
@@ -570,6 +608,8 @@ async def main():
     print("Testing process_response - Edge Cases")
     print("=" * 60)
     print()
+
+    test_extract_nvcf_asset_ids_from_messages()
 
     await test_regular_response()
     await test_empty_content()

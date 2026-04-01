@@ -12,6 +12,8 @@ from tools import TOOLS, validate_tool_args
 
 logger = logging.getLogger(__name__)
 
+ASSET_REFERENCE_PATTERN = re.compile(r"asset_id,([A-Za-z0-9-]+)")
+
 
 def _message_content_to_text(content: Any) -> str:
     """Extract plain text from content that may include multimodal blocks."""
@@ -30,6 +32,59 @@ def _message_content_to_text(content: Any) -> str:
         return "\n".join(part for part in parts if part).strip()
 
     return "" if content is None else str(content)
+
+
+def _append_asset_ids_from_text(
+    text: str,
+    seen: set[str],
+    ordered_asset_ids: list[str],
+) -> None:
+    for match in ASSET_REFERENCE_PATTERN.finditer(text or ""):
+        asset_id = match.group(1).strip()
+        if asset_id and asset_id not in seen:
+            seen.add(asset_id)
+            ordered_asset_ids.append(asset_id)
+
+
+def _extract_nvcf_asset_ids(messages: Any) -> list[str]:
+    """Extract asset IDs from conversation messages for NVCF header wiring."""
+    if not isinstance(messages, list):
+        return []
+
+    seen: set[str] = set()
+    ordered_asset_ids: list[str] = []
+
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+
+        content = message.get("content")
+        if isinstance(content, str):
+            _append_asset_ids_from_text(content, seen, ordered_asset_ids)
+            continue
+
+        if not isinstance(content, list):
+            continue
+
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+
+            text_value = item.get("text")
+            if isinstance(text_value, str):
+                _append_asset_ids_from_text(text_value, seen, ordered_asset_ids)
+
+            content_value = item.get("content")
+            if isinstance(content_value, str):
+                _append_asset_ids_from_text(content_value, seen, ordered_asset_ids)
+
+            image_obj = item.get("image_url")
+            if isinstance(image_obj, dict):
+                image_url = image_obj.get("url")
+                if isinstance(image_url, str):
+                    _append_asset_ids_from_text(image_url, seen, ordered_asset_ids)
+
+    return ordered_asset_ids
 
 
 # Common refusal patterns to detect
@@ -218,9 +273,20 @@ async def api_call_with_retry(
     backoff: float = 2.0,
 ) -> dict[str, Any]:
     """Make an API call with retry logic for transient errors."""
+    request_headers = headers.copy()
+    has_asset_header = any(
+        key.lower() == "nvcf-input-asset-references" for key in request_headers
+    )
+    if not has_asset_header:
+        asset_ids = _extract_nvcf_asset_ids(json_data.get("messages"))
+        if asset_ids:
+            request_headers["NVCF-INPUT-ASSET-REFERENCES"] = ",".join(asset_ids)
+
     for attempt in range(max_retries):
         try:
-            async with session.post(url, json=json_data, headers=headers) as resp:
+            async with session.post(
+                url, json=json_data, headers=request_headers
+            ) as resp:
                 response_data = await resp.json()
 
                 # Check for rate limiting or server errors
