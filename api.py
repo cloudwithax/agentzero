@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 import aiohttp
+import strip_markdown
 
 from tools import TOOLS, validate_tool_args
 
@@ -441,4 +442,4 @@ async def process_response(
                 "Sorry, there was an internal formatting issue. Please send that again."
             )
 
-        return content_text or ""
+        return strip_markdown.strip_markdown(content_text) if content_text else ""
