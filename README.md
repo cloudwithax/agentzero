@@ -39,10 +39,10 @@ Optional Sendblue reliability settings:
 - `SENDBLUE_ATTACHMENT_DEBOUNCE_SECONDS` - Debounce window for attachment-first inbound webhook sequences before sending to the agent (default: `2.0`).
 - `SENDBLUE_TYPING_DEBOUNCE_SECONDS` - Optional debounce extension window for typing webhook events when a sender already has pending queued content (default: attachment debounce value).
 - `SENDBLUE_VOICE_MEMO_TRANSCRIPTION_ENABLED` - Enable/disable voice memo transcription for inbound iMessage audio attachments (default: `1`).
-- `SENDBLUE_VOICE_MEMO_GRPC_SERVER` - NVIDIA Riva gRPC server for hosted Whisper transcription (default: `grpc.nvcf.nvidia.com:443`).
-- `SENDBLUE_VOICE_MEMO_FUNCTION_ID` - Function ID for `openai/whisper-large-v3` (default: `b702f636-f60c-4a3d-a6f4-f3568c13bd7d`).
+- `SENDBLUE_VOICE_MEMO_GRPC_SERVER` - NVIDIA Riva gRPC server for hosted Parakeet transcription (default: `grpc.nvcf.nvidia.com:443`).
+- `SENDBLUE_VOICE_MEMO_FUNCTION_ID` - Function ID for `nvidia/parakeet-ctc-0_6b-asr` (default: `d8dd4e9b-fbf5-4fb0-9dba-8cf436c8d965`).
 - `SENDBLUE_VOICE_MEMO_MODEL` - Optional Riva model name override. Usually not required when function ID is set.
-- `SENDBLUE_VOICE_MEMO_LANGUAGE` - Language hint (`multi` default for auto-detection, or `en`, `fr`, etc.).
+- `SENDBLUE_VOICE_MEMO_LANGUAGE` - Language hint (`en-US` default for Parakeet, override if you route to a different ASR model).
 - `SENDBLUE_VOICE_MEMO_FFMPEG_BIN` - Optional `ffmpeg` binary/path used to convert iMessage `.m4a`/`.caf` voice memos when direct transcription fails (default: `ffmpeg`).
 - `SENDBLUE_VOICE_MEMO_MAX_BYTES` - Maximum voice memo download size in bytes for transcription (default: `26214400`, 25MB).
 
@@ -86,7 +86,7 @@ This will run the agent with both Telegram and iMessage (using SendBlue) channel
 - Telegram bot integration
 - Telegram image uploads (single + media group)
 - Sendblue image attachments (single + multiple)
-- Sendblue voice memo transcription with NVIDIA Whisper Large v3
+- Sendblue voice memo transcription with NVIDIA Parakeet CTC 0.6B ASR
 
 
 ## License

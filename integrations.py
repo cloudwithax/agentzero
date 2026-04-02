@@ -40,7 +40,7 @@ MULTIMODAL_MODEL_IDS = {
 NVCF_CREATE_ASSET_URL = "https://api.nvcf.nvidia.com/v2/nvcf/assets"
 NVCF_ASSET_DESCRIPTION = "AgentZero inbound image attachment"
 NVIDIA_WHISPER_GRPC_SERVER = "grpc.nvcf.nvidia.com:443"
-NVIDIA_WHISPER_FUNCTION_ID = "b702f636-f60c-4a3d-a6f4-f3568c13bd7d"
+NVIDIA_WHISPER_FUNCTION_ID = "d8dd4e9b-fbf5-4fb0-9dba-8cf436c8d965"
 VOICE_MEMO_MAX_BYTES_DEFAULT = 25 * 1024 * 1024
 VOICE_MEMO_FALLBACK_EXTENSION = ".opus"
 VOICE_MEMO_FFMPEG_BIN_DEFAULT = "ffmpeg"
@@ -422,7 +422,7 @@ async def _transcribe_audio_bytes_with_whisper(
     filename: str,
     content_type: str | None,
 ) -> str | None:
-    """Transcribe audio bytes through NVIDIA's hosted Whisper Riva endpoint."""
+    """Transcribe audio bytes through NVIDIA's hosted Riva ASR endpoint."""
     api_key = os.environ.get("NVIDIA_API_KEY", "").strip()
     if not api_key:
         logger.warning(
@@ -442,9 +442,9 @@ async def _transcribe_audio_bytes_with_whisper(
     if not function_id:
         function_id = NVIDIA_WHISPER_FUNCTION_ID
 
-    language_code = os.environ.get("SENDBLUE_VOICE_MEMO_LANGUAGE", "multi").strip()
+    language_code = os.environ.get("SENDBLUE_VOICE_MEMO_LANGUAGE", "en-US").strip()
     if not language_code:
-        language_code = "multi"
+        language_code = "en-US"
 
     # Optional model-name override. Most hosted calls route by function-id metadata.
     model_name = os.environ.get("SENDBLUE_VOICE_MEMO_MODEL", "").strip()

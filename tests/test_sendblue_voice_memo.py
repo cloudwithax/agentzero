@@ -189,6 +189,53 @@ async def test_transcribe_audio_bytes_retries_caf_with_ffmpeg() -> None:
     assert convert_mock.call_count == 1
 
 
+async def test_transcribe_audio_bytes_uses_parakeet_defaults() -> None:
+    """Use NVIDIA Parakeet function routing and English defaults when unset."""
+    previous_api_key = os.environ.get("NVIDIA_API_KEY")
+    previous_function_id = os.environ.pop("SENDBLUE_VOICE_MEMO_FUNCTION_ID", None)
+    previous_language = os.environ.pop("SENDBLUE_VOICE_MEMO_LANGUAGE", None)
+    os.environ["NVIDIA_API_KEY"] = "test-key"
+
+    transcribe_mock = Mock(return_value="transcript")
+
+    try:
+        with patch(
+            "integrations._transcribe_audio_bytes_with_whisper_sync",
+            new=transcribe_mock,
+        ):
+            transcript = await _transcribe_audio_bytes_with_whisper(
+                cast(Any, None),
+                b"audio-bytes",
+                "voice.opus",
+                "audio/ogg",
+            )
+    finally:
+        if previous_api_key is None:
+            os.environ.pop("NVIDIA_API_KEY", None)
+        else:
+            os.environ["NVIDIA_API_KEY"] = previous_api_key
+
+        if previous_function_id is None:
+            os.environ.pop("SENDBLUE_VOICE_MEMO_FUNCTION_ID", None)
+        else:
+            os.environ["SENDBLUE_VOICE_MEMO_FUNCTION_ID"] = previous_function_id
+
+        if previous_language is None:
+            os.environ.pop("SENDBLUE_VOICE_MEMO_LANGUAGE", None)
+        else:
+            os.environ["SENDBLUE_VOICE_MEMO_LANGUAGE"] = previous_language
+
+    assert transcript == "transcript"
+    transcribe_mock.assert_called_once_with(
+        b"audio-bytes",
+        "test-key",
+        "grpc.nvcf.nvidia.com:443",
+        "d8dd4e9b-fbf5-4fb0-9dba-8cf436c8d965",
+        "en-US",
+        "",
+    )
+
+
 async def main() -> int:
     test_split_voice_memo_attachments_detects_audio_urls()
     test_append_voice_memo_transcripts_with_failures()
@@ -197,6 +244,7 @@ async def main() -> int:
     await test_transcribe_sendblue_voice_memos_respects_disable_flag()
     await test_transcribe_audio_bytes_retries_m4a_with_ffmpeg()
     await test_transcribe_audio_bytes_retries_caf_with_ffmpeg()
+    await test_transcribe_audio_bytes_uses_parakeet_defaults()
     print("All Sendblue voice memo tests passed")
     return 0
 
