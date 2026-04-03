@@ -22,8 +22,18 @@ from handler import AgentHandler  # noqa: E402
 from integrations import run_telegram_bot_async, start_sendblue_bot  # noqa: E402
 
 # Setup logging
-logging.basicConfig(level=logging.INFO)
+requested_log_level = os.environ.get("LOG_LEVEL", "INFO").strip().upper()
+resolved_log_level = getattr(logging, requested_log_level, None)
+if not isinstance(resolved_log_level, int):
+    resolved_log_level = logging.INFO
+
+logging.basicConfig(level=resolved_log_level)
 logger = logging.getLogger(__name__)
+
+if requested_log_level and not isinstance(
+    getattr(logging, requested_log_level, None), int
+):
+    logger.warning("Invalid LOG_LEVEL=%r, defaulting to INFO", requested_log_level)
 
 # Configuration - API key and model ID from environment variables with fallbacks
 API_KEY = os.environ.get("NVIDIA_API_KEY", "")

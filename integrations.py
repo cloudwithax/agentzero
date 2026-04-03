@@ -1,10 +1,13 @@
 """Bot integrations for iMessage and Telegram."""
 
 import asyncio
+import base64
+import io
 import mimetypes
 import json
 import logging
 import os
+import shutil
 import subprocess
 import tempfile
 from datetime import datetime
@@ -17,6 +20,25 @@ from aiohttp import web
 from handler import AgentHandler
 
 logger = logging.getLogger(__name__)
+
+PILLOW_AVAILABLE = False
+PILLOW_HEIF_AVAILABLE = False
+
+try:
+    from PIL import Image
+
+    PILLOW_AVAILABLE = True
+except Exception:
+    pass
+
+try:
+    from pillow_heif import register_heif_opener
+
+    if PILLOW_AVAILABLE:
+        register_heif_opener()
+        PILLOW_HEIF_AVAILABLE = True
+except Exception:
+    pass
 
 # Track users who are in the process of setting a system prompt
 pending_prompt_users: Dict[int, bool] = {}
@@ -37,6 +59,11 @@ MULTIMODAL_MODEL_IDS = {
     "qwen/qwen3.5-397b-a17b",
 }
 
+# Models that currently require data:image/...;base64 URLs for image blocks.
+BASE64_DATA_URL_MODEL_IDS = {
+    "moonshotai/kimi-k2.5",
+}
+
 NVCF_CREATE_ASSET_URL = "https://api.nvcf.nvidia.com/v2/nvcf/assets"
 NVCF_ASSET_DESCRIPTION = "AgentZero inbound image attachment"
 NVIDIA_WHISPER_GRPC_SERVER = "grpc.nvcf.nvidia.com:443"
@@ -46,6 +73,8 @@ VOICE_MEMO_FALLBACK_EXTENSION = ".opus"
 VOICE_MEMO_FFMPEG_BIN_DEFAULT = "ffmpeg"
 VOICE_MEMO_CONVERTED_FILENAME = "voice-memo-converted.wav"
 VOICE_MEMO_CONVERTED_CONTENT_TYPE = "audio/wav"
+IMAGE_FFMPEG_BIN_DEFAULT = "ffmpeg"
+IMAGE_MAGICK_BIN_ENV = "SENDBLUE_IMAGE_MAGICK_BIN"
 VOICE_MEMO_AUDIO_EXTENSIONS = {
     ".aac",
     ".amr",
@@ -735,6 +764,11 @@ def _model_supports_multimodal() -> bool:
     return model_id in MULTIMODAL_MODEL_IDS
 
 
+def _model_requires_base64_data_urls() -> bool:
+    model_id = os.environ.get("MODEL_ID", "").strip().lower()
+    return model_id in BASE64_DATA_URL_MODEL_IDS
+
+
 def _nvcf_asset_upload_enabled() -> bool:
     """Allow disabling NVCF asset uploads via env for troubleshooting."""
     return _to_bool(os.environ.get("NVCF_ASSET_UPLOAD_ENABLED", "1"))
@@ -889,7 +923,12 @@ async def _upload_attachment_to_nvcf_asset(
         async with session.put(
             upload_url,
             data=image_bytes,
-            headers={"Content-Type": content_type},
+            headers={
+                "Content-Type": content_type,
+                # NVCF pre-signed URLs include this metadata header in SignedHeaders.
+                # Keep it aligned with the create-asset request payload.
+                "x-amz-meta-nvcf-asset-description": NVCF_ASSET_DESCRIPTION,
+            },
         ) as upload_response:
             if upload_response.status not in {200, 201, 204}:
                 error_text = await upload_response.text()
@@ -906,6 +945,292 @@ async def _upload_attachment_to_nvcf_asset(
         return None
 
 
+def _convert_heic_image_with_ffmpeg_sync(
+    image_bytes: bytes,
+    extension: str = ".heic",
+) -> bytes | None:
+    """Convert HEIC/HEIF bytes to JPEG bytes using ffmpeg."""
+    ffmpeg_bin = (
+        os.environ.get("SENDBLUE_IMAGE_FFMPEG_BIN", IMAGE_FFMPEG_BIN_DEFAULT).strip()
+        or IMAGE_FFMPEG_BIN_DEFAULT
+    )
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="agentzero-image-convert-") as tmp_dir:
+            source_path = os.path.join(tmp_dir, f"input{extension}")
+            converted_path = os.path.join(tmp_dir, "converted.jpg")
+
+            with open(source_path, "wb") as source_file:
+                source_file.write(image_bytes)
+
+            command = [
+                ffmpeg_bin,
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                source_path,
+                "-frames:v",
+                "1",
+                "-f",
+                "image2",
+                converted_path,
+            ]
+            subprocess.run(command, check=True, capture_output=True)
+
+            with open(converted_path, "rb") as converted_file:
+                converted_bytes = converted_file.read()
+
+            if not converted_bytes:
+                logger.warning("ffmpeg HEIC conversion produced empty output")
+                return None
+
+            return converted_bytes
+    except FileNotFoundError:
+        logger.warning("ffmpeg is required for HEIC image conversion but was not found")
+        return None
+    except subprocess.CalledProcessError as e:
+        error_output = (e.stderr or b"").decode("utf-8", errors="replace").strip()
+        logger.warning("ffmpeg failed to convert HEIC image: %s", error_output or e)
+        return None
+    except Exception as e:
+        logger.warning("Unexpected HEIC conversion error: %s", e)
+        return None
+
+
+def _resolve_imagemagick_command() -> str | None:
+    """Resolve ImageMagick executable path from env or common command names."""
+    requested = os.environ.get(IMAGE_MAGICK_BIN_ENV, "").strip()
+    if requested:
+        return requested
+
+    for candidate in ("magick", "convert"):
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+
+    return None
+
+
+def _convert_image_with_imagemagick_sync(
+    image_bytes: bytes,
+    source_extension: str,
+    target_extension: str,
+) -> bytes | None:
+    """Convert image bytes using ImageMagick CLI to a target extension."""
+    magick_cmd = _resolve_imagemagick_command()
+    if not magick_cmd:
+        logger.warning(
+            "ImageMagick command not found; install `magick`/`convert` or set %s",
+            IMAGE_MAGICK_BIN_ENV,
+        )
+        return None
+
+    input_extension = source_extension if source_extension.startswith(".") else ".img"
+    output_extension = target_extension if target_extension.startswith(".") else ".jpg"
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="agentzero-image-magick-") as tmp_dir:
+            input_path = os.path.join(tmp_dir, f"input{input_extension}")
+            output_path = os.path.join(tmp_dir, f"output{output_extension}")
+
+            with open(input_path, "wb") as input_file:
+                input_file.write(image_bytes)
+
+            command = [
+                magick_cmd,
+                input_path,
+                "-auto-orient",
+                "-strip",
+                "-quality",
+                "95",
+                output_path,
+            ]
+            subprocess.run(command, check=True, capture_output=True)
+
+            with open(output_path, "rb") as output_file:
+                converted_bytes = output_file.read()
+
+            if not converted_bytes:
+                logger.warning("ImageMagick conversion produced empty output")
+                return None
+
+            return converted_bytes
+    except FileNotFoundError:
+        logger.warning("ImageMagick command not found: %s", magick_cmd)
+        return None
+    except subprocess.CalledProcessError as e:
+        error_output = (e.stderr or b"").decode("utf-8", errors="replace").strip()
+        logger.warning("ImageMagick conversion failed: %s", error_output or e)
+        return None
+    except Exception as e:
+        logger.warning("Unexpected ImageMagick conversion error: %s", e)
+        return None
+
+
+def _target_content_type_for_non_native_image(content_type: str) -> str | None:
+    """Return target content type when non-JPEG/PNG images should be normalized."""
+    normalized = (content_type or "").strip().lower()
+    if normalized in {"image/jpeg", "image/png"}:
+        return None
+
+    # Preserve transparency-capable formats as PNG.
+    if normalized in {"image/webp", "image/gif"}:
+        return "image/png"
+
+    return "image/jpeg"
+
+
+def _convert_image_with_pillow_sync(
+    image_bytes: bytes,
+    target_format: str,
+) -> bytes | None:
+    """Fallback conversion using Pillow for non-native image formats."""
+    if not PILLOW_AVAILABLE:
+        return None
+
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            normalized_target = target_format.upper()
+            if normalized_target == "PNG":
+                if image.mode in {"RGBA", "LA", "P", "1"}:
+                    converted_image = image.convert("RGBA")
+                else:
+                    converted_image = image.convert("RGB")
+            else:
+                converted_image = image.convert("RGB")
+
+            output = io.BytesIO()
+            save_kwargs: dict[str, Any] = {"format": normalized_target}
+            if normalized_target == "JPEG":
+                save_kwargs.update({"quality": 95, "optimize": True})
+            converted_image.save(output, **save_kwargs)
+            converted = output.getvalue()
+
+        if not converted:
+            logger.warning("Pillow conversion produced empty output")
+            return None
+
+        return converted
+    except Exception as e:
+        logger.warning("Pillow conversion failed: %s", e)
+        return None
+
+
+def _convert_heic_image_with_pillow_sync(
+    image_bytes: bytes,
+) -> bytes | None:
+    """Convert HEIC/HEIF bytes to JPEG bytes using Pillow+libheif primary image decode."""
+    if not PILLOW_HEIF_AVAILABLE:
+        return None
+
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            rgb_image = image.convert("RGB")
+            output = io.BytesIO()
+            rgb_image.save(output, format="JPEG", quality=95, optimize=True)
+            converted = output.getvalue()
+
+        if not converted:
+            logger.warning("Pillow HEIC conversion produced empty output")
+            return None
+
+        return converted
+    except Exception as e:
+        logger.warning("Pillow HEIC conversion failed: %s", e)
+        return None
+
+
+async def _attachment_url_to_base64_data_url(
+    session: aiohttp.ClientSession,
+    source_url: str,
+) -> str | None:
+    """Download image attachment and return a base64 data URL."""
+    if source_url.startswith("data:") and ";base64," in source_url:
+        return source_url
+
+    try:
+        async with session.get(source_url) as source_response:
+            if source_response.status != 200:
+                logger.warning(
+                    "Attachment download failed (status=%s): %s",
+                    source_response.status,
+                    source_url,
+                )
+                return None
+
+            image_bytes = await source_response.read()
+            if not image_bytes:
+                logger.warning(
+                    "Attachment download returned empty body: %s", source_url
+                )
+                return None
+
+            content_type = _normalize_image_content_type(
+                source_response.headers.get("Content-Type"),
+                source_url,
+            )
+
+        if not content_type:
+            logger.warning("Skipping non-image attachment URL: %s", source_url)
+            return None
+
+        target_content_type = _target_content_type_for_non_native_image(content_type)
+
+        if target_content_type:
+            path = urlparse(source_url).path or ""
+            source_extension = os.path.splitext(path)[1].lower()
+            if not source_extension:
+                guessed = mimetypes.guess_extension(content_type) or ".img"
+                source_extension = guessed if guessed.startswith(".") else ".img"
+
+            target_extension = ".png" if target_content_type == "image/png" else ".jpg"
+            target_format = "PNG" if target_content_type == "image/png" else "JPEG"
+            loop = asyncio.get_running_loop()
+
+            converted_bytes = await loop.run_in_executor(
+                None,
+                _convert_image_with_imagemagick_sync,
+                image_bytes,
+                source_extension,
+                target_extension,
+            )
+
+            if converted_bytes is None and content_type in {"image/heic", "image/heif"}:
+                converted_bytes = await loop.run_in_executor(
+                    None,
+                    _convert_heic_image_with_pillow_sync,
+                    image_bytes,
+                )
+                if converted_bytes is None:
+                    converted_bytes = await loop.run_in_executor(
+                        None,
+                        _convert_heic_image_with_ffmpeg_sync,
+                        image_bytes,
+                        source_extension or ".heic",
+                    )
+
+            if converted_bytes is None:
+                converted_bytes = await loop.run_in_executor(
+                    None,
+                    _convert_image_with_pillow_sync,
+                    image_bytes,
+                    target_format,
+                )
+
+            if converted_bytes:
+                image_bytes = converted_bytes
+                content_type = target_content_type
+
+        encoded = base64.b64encode(image_bytes).decode("ascii")
+        return f"data:{content_type};base64,{encoded}"
+    except Exception as e:
+        logger.warning("Failed to convert attachment URL to base64 data URL: %s", e)
+        return None
+
+
 def _build_user_message_content(
     text: str, attachment_urls: list[str]
 ) -> str | list[dict[str, Any]]:
@@ -917,9 +1242,14 @@ def _build_user_message_content(
         return normalized_text
 
     if _model_supports_multimodal():
-        content: list[dict[str, Any]] = [
-            {"type": "text", "text": normalized_text or "Analyze these images."}
-        ]
+        text_block = normalized_text or "Analyze these images."
+        if normalized_text:
+            text_block = (
+                "IMPORTANT: You can view and analyze the attached images in this "
+                "message. Do not claim you cannot view images.\n\n"
+                f"User message: {normalized_text}"
+            )
+        content: list[dict[str, Any]] = [{"type": "text", "text": text_block}]
         for url in normalized_attachments:
             content.append({"type": "image_url", "image_url": {"url": url}})
         return content
@@ -937,6 +1267,15 @@ async def _build_user_message_content_async(
     normalized_attachments = _normalize_attachment_urls(attachment_urls)
     if not normalized_attachments:
         return _build_user_message_content(text, normalized_attachments)
+
+    if _model_requires_base64_data_urls():
+        converted_attachments = normalized_attachments.copy()
+        async with aiohttp.ClientSession() as session:
+            for index, url in enumerate(normalized_attachments):
+                data_url = await _attachment_url_to_base64_data_url(session, url)
+                if data_url:
+                    converted_attachments[index] = data_url
+        return _build_user_message_content(text, converted_attachments)
 
     if not _model_supports_multimodal() or not _nvcf_asset_upload_enabled():
         return _build_user_message_content(text, normalized_attachments)
@@ -1200,7 +1539,12 @@ async def send_imessage(
             "https://api.sendblue.co/api/send-message", json=payload, headers=headers
         ) as resp:
             data = await resp.json()
-            return {"success": resp.status == 200, "data": data}
+            success = 200 <= resp.status < 300
+            if isinstance(data, dict):
+                delivery_status = str(data.get("status", "")).strip().upper()
+                if delivery_status in {"QUEUED", "SENT", "DELIVERED"}:
+                    success = True
+            return {"success": success, "data": data, "status": resp.status}
     except Exception as e:
         return {"success": False, "error": str(e)}
     finally:

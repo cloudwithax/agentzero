@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """Tests for multimodal attachment handling in channel integrations."""
 
+import asyncio
 import json
 import os
 
 from integrations import (
+    NVCF_ASSET_DESCRIPTION,
     _build_user_message_content,
     _extract_agent_response_payload,
     _extract_nvcf_asset_fields,
+    _target_content_type_for_non_native_image,
+    _upload_attachment_to_nvcf_asset,
 )
 
 
@@ -28,7 +32,14 @@ def test_multimodal_message_blocks() -> None:
             os.environ["MODEL_ID"] = previous_model
 
     assert isinstance(content, list)
-    assert content[0] == {"type": "text", "text": "Please describe these."}
+    assert content[0] == {
+        "type": "text",
+        "text": (
+            "IMPORTANT: You can view and analyze the attached images in this "
+            "message. Do not claim you cannot view images.\n\n"
+            "User message: Please describe these."
+        ),
+    }
     assert content[1] == {
         "type": "image_url",
         "image_url": {"url": "https://img.example/a.png"},
@@ -121,12 +132,87 @@ def test_extract_nvcf_asset_fields_with_nested_payload() -> None:
     assert upload_url == "https://bucket.example/upload"
 
 
+def test_target_content_type_for_non_native_image() -> None:
+    """Normalize non-JPEG/PNG images to model-friendly formats."""
+    assert _target_content_type_for_non_native_image("image/jpeg") is None
+    assert _target_content_type_for_non_native_image("image/png") is None
+    assert _target_content_type_for_non_native_image("image/heic") == "image/jpeg"
+    assert _target_content_type_for_non_native_image("image/webp") == "image/png"
+
+
+class _FakeResponse:
+    def __init__(self, *, status: int, body: bytes = b"", headers: dict | None = None):
+        self.status = status
+        self._body = body
+        self.headers = headers or {}
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def read(self) -> bytes:
+        return self._body
+
+    async def text(self) -> str:
+        return self._body.decode("utf-8", errors="replace")
+
+    async def json(self, content_type=None):
+        return {
+            "assetId": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "uploadUrl": "https://bucket.example/upload",
+        }
+
+
+class _FakeSession:
+    def __init__(self):
+        self.put_headers = None
+
+    def get(self, _url: str) -> _FakeResponse:
+        return _FakeResponse(
+            status=200,
+            body=b"fake-image-bytes",
+            headers={"Content-Type": "image/png"},
+        )
+
+    def post(self, _url: str, json=None, headers=None) -> _FakeResponse:
+        return _FakeResponse(status=200, body=b"{}")
+
+    def put(self, _url: str, data=None, headers=None) -> _FakeResponse:
+        self.put_headers = headers or {}
+        return _FakeResponse(status=204)
+
+
+def test_nvcf_upload_includes_signed_description_header() -> None:
+    """Include all signed headers when uploading to pre-signed NVCF URLs."""
+    session = _FakeSession()
+
+    result = asyncio.run(
+        _upload_attachment_to_nvcf_asset(
+            session,
+            "test-api-key",
+            "https://img.example/one.png",
+        )
+    )
+
+    assert result == "data:image/png;asset_id,aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    assert session.put_headers is not None
+    assert session.put_headers.get("Content-Type") == "image/png"
+    assert (
+        session.put_headers.get("x-amz-meta-nvcf-asset-description")
+        == NVCF_ASSET_DESCRIPTION
+    )
+
+
 def main() -> int:
     test_multimodal_message_blocks()
     test_non_multimodal_fallback_text()
     test_extract_structured_response_payload()
     test_multimodal_asset_data_url_block()
     test_extract_nvcf_asset_fields_with_nested_payload()
+    test_target_content_type_for_non_native_image()
+    test_nvcf_upload_includes_signed_description_header()
     print("All multimodal integration tests passed")
     return 0
 
