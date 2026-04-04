@@ -236,6 +236,8 @@ All tools return a consistent dictionary format:
   **Fix:** Add startup backfill in `integrations.py` (`_backfill_untranscribed_voice_memo_conversations`) that retries legacy URLs and updates `conversations.content` via new `memory.py` helpers (`get_conversation_messages_with_untranscribed_voice_memos`, `update_conversation_message_content`), plus regression coverage in `tests/test_sendblue_voice_memo.py` (`test_backfill_untranscribed_voice_memos_updates_conversation_content`). Validate with: `PYTHONPATH=. .venv/bin/python tests/test_sendblue_voice_memo.py`.
 - **Pitfall: Auto-tapback reactions can fail silently if inbound `message_handle` metadata is dropped during debounce/replay/polling paths.**
   **Fix:** Add explicit Sendblue reactions support in `integrations.py` (`send_reaction`, `_maybe_send_random_sendblue_tapback`) and propagate `message_handle`/`part_index` through startup replay plus queued webhook flush paths before calling `process_imessage_and_reply`. Guard behavior with env controls (`SENDBLUE_AUTO_TAPBACK_ENABLED`, `SENDBLUE_TAPBACK_PROBABILITY`) and relevance heuristics. Validate with: `PYTHONPATH=. .venv/bin/python tests/test_sendblue_debounce.py`.
+- **Pitfall: Implementing a capability in `integrations.py` is not enough for autonomous use if it is not also in the public tool schema.**
+  **Fix:** Expose Sendblue tapbacks as a first-class tool by adding `send_tapback_tool` in `tools.py`, registering it in `TOOLS` + `validate_tool_args()`, and adding `send_tapback` to `BASE_PAYLOAD["tools"]` in `handler.py`. Validate with: `PYTHONPATH=. .venv/bin/python tests/test_simple.py`.
 
 ## Key Functions Reference
 

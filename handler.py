@@ -417,6 +417,39 @@ BASE_PAYLOAD = {
         {
             "type": "function",
             "function": {
+                "name": "send_tapback",
+                "description": "Send an iMessage tapback reaction to a specific inbound Sendblue message",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "message_handle": {
+                            "type": "string",
+                            "description": "Sendblue message handle/GUID from inbound webhook payload",
+                        },
+                        "reaction": {
+                            "type": "string",
+                            "enum": [
+                                "love",
+                                "like",
+                                "dislike",
+                                "laugh",
+                                "emphasize",
+                                "question",
+                            ],
+                            "description": "Tapback reaction type",
+                        },
+                        "part_index": {
+                            "type": "integer",
+                            "description": "Optional non-negative part index for multi-part messages",
+                        },
+                    },
+                    "required": ["message_handle", "reaction"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "consortium_start",
                 "description": "Start a consortium-mode task in the background",
                 "parameters": {

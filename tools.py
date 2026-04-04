@@ -603,6 +603,46 @@ async def web_search_tool(
         return {"success": False, "error": str(e)}
 
 
+async def send_tapback_tool(
+    message_handle: str,
+    reaction: str,
+    part_index: Optional[int] = None,
+):
+    """Send an iMessage tapback reaction for a specific Sendblue message handle.
+
+    Args:
+        message_handle: Sendblue message handle/GUID from inbound webhook payloads
+        reaction: One of love, like, dislike, laugh, emphasize, question
+        part_index: Optional non-negative part index for multi-part messages
+    """
+    try:
+        try:
+            from integrations import send_reaction
+        except Exception as import_error:
+            return {
+                "success": False,
+                "error": f"Tapback integration unavailable: {import_error}",
+            }
+
+        normalized_part_index = None
+        if part_index is not None:
+            try:
+                normalized_part_index = int(part_index)
+            except (TypeError, ValueError):
+                return {
+                    "success": False,
+                    "error": "part_index must be an integer when provided",
+                }
+
+        return await send_reaction(
+            message_handle=str(message_handle),
+            reaction=str(reaction),
+            part_index=normalized_part_index,
+        )
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 # Tool registry for easy access - defined before handle() to avoid NameError
 # Includes aliases for compatibility with benchmark grading
 TOOLS = {
@@ -626,6 +666,8 @@ TOOLS = {
     "forget": forget_tool,
     "memory_stats": memory_stats_tool,
     "web_search": web_search_tool,
+    "send_tapback": send_tapback_tool,
+    "send_reaction": send_tapback_tool,  # Alias for clarity
     "consortium_start": consortium_start_tool,
     "consortium_stop": consortium_stop_tool,
     "consortium_status": consortium_status_tool,
@@ -657,6 +699,8 @@ def validate_tool_args(func_name: str, func_args: dict) -> tuple:
         "recall": ["query"],
         "forget": ["memory_id"],
         "web_search": ["query"],
+        "send_tapback": ["message_handle", "reaction"],
+        "send_reaction": ["message_handle", "reaction"],
         "consortium_start": ["task"],
         "consortium_stop": ["task_id"],
         "consortium_status": [],
