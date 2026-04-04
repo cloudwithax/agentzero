@@ -39,11 +39,7 @@ Optional Sendblue reliability settings:
 - `SENDBLUE_RECEIVE_WEBHOOK_URL` - If set, periodically verifies your Sendblue `receive` webhook and re-adds it if missing using append-only `POST /api/account/webhooks`.
 - `SENDBLUE_TYPING_WEBHOOK_URL` - Optional dedicated URL for Sendblue `typing_indicator` webhook registration. If unset, the bot reuses `SENDBLUE_RECEIVE_WEBHOOK_URL`.
 - `SENDBLUE_WEBHOOK_CHECK_INTERVAL` - Seconds between webhook checks (default: `60`, min enforced: `10`).
-- `SENDBLUE_STARTUP_REPLAY_ENABLED` - On startup, fetch and process recent inbound messages sent while the bot was offline (default: `1`).
-- `SENDBLUE_STARTUP_LOOKBACK_SECONDS` - Startup lookback window for offline message replay (default: `21600`, i.e. 6 hours).
-- `SENDBLUE_STARTUP_UNREAD_ONLY` - When Sendblue read-state fields are present, replay only unread inbound messages (default: `1`).
-- `SENDBLUE_STARTUP_REPLAY_UNKNOWN_READ_STATE` - If read-state is missing, still replay recent inbound messages within lookback window (default: `1`).
-- `SENDBLUE_DEDUP_TTL_SECONDS` - TTL for in-memory Sendblue message-handle dedupe across startup replay + webhook/polling handoff (default: `60`, min enforced: `10`).
+- `SENDBLUE_DEDUP_TTL_SECONDS` - TTL for in-memory Sendblue message-handle dedupe within live webhook and polling handling (default: `60`, min enforced: `10`).
 - `SENDBLUE_ATTACHMENT_DEBOUNCE_SECONDS` - Debounce window for attachment-first inbound webhook sequences before sending to the agent (default: `2.0`).
 - `SENDBLUE_TYPING_DEBOUNCE_SECONDS` - Optional debounce extension window for typing webhook events when a sender already has pending queued content (default: attachment debounce value).
 - `SENDBLUE_VOICE_MEMO_TRANSCRIPTION_ENABLED` - Enable/disable voice memo transcription for inbound iMessage audio attachments (default: `1`).
@@ -62,12 +58,6 @@ Multimodal/NVIDIA asset handling:
 
 - `NVCF_ASSET_UPLOAD_ENABLED` - Upload inbound multimodal image URLs to NVIDIA NVCF Assets before inference and pass `asset_id` references (default: `1`, set `0` to disable).
 - This is enabled by default for supported multimodal models and helps with large/private channel attachment URLs that cannot be fetched reliably by the model endpoint.
-
-Optional Telegram reliability settings:
-
-- `TELEGRAM_REPLAY_PENDING_UPDATES_ON_STARTUP` - Process queued Telegram updates immediately after reconnect and before normal polling starts (default: `1`).
-- `TELEGRAM_PENDING_UPDATES_BATCH_SIZE` - Batch size used when draining startup backlog (default: `100`, max: `100`).
-- `TELEGRAM_PENDING_UPDATES_MAX_BATCHES` - Max startup batches to drain per boot (default: `5`).
 
 Optional memory cadence and consolidation settings:
 

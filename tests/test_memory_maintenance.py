@@ -468,6 +468,74 @@ async def test_imessage_session_injects_mobile_prompt_defaults() -> None:
             os.remove(tmp.name)
 
 
+async def test_imessage_handle_ids_are_injected_and_persisted() -> None:
+    print("=== Test: iMessage handle IDs are injected and persisted ===")
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+    tmp.close()
+
+    try:
+        store, handler = _create_store_and_handler(tmp.name)
+        session_id = "imessage_+15550002222"
+
+        store.add_conversation_message(
+            role="user",
+            content="Earlier inbound message",
+            session_id=session_id,
+            metadata={"message_handle": "older-handle", "part_index": 2},
+        )
+
+        captured_payload: dict[str, object] = {}
+
+        async def _fake_api_call(_session, _url, payload, _headers):
+            captured_payload["messages"] = payload.get("messages", [])
+            return {"id": "fake", "choices": [{"message": {"role": "assistant"}}]}
+
+        with (
+            patch.object(
+                handler.memory_store, "search_memories", new=AsyncMock(return_value=[])
+            ),
+            patch(
+                "handler.api_call_with_retry", new=AsyncMock(side_effect=_fake_api_call)
+            ),
+            patch("handler.process_response", new=AsyncMock(return_value="ok")),
+        ):
+            result = await handler.handle(
+                {"messages": [{"role": "user", "content": "Tapback this one"}]},
+                session_id=session_id,
+                request_metadata={"message_handle": "current-handle", "part_index": 1},
+            )
+
+        assert result == "ok"
+        assert captured_payload.get("messages")
+
+        system_content = str(captured_payload["messages"][0]["content"])
+        assert "Available iMessage tapback handles" in system_content
+        assert "current-handle" in system_content
+        assert "older-handle" in system_content
+        assert "part_index=1" in system_content
+        assert "part_index=2" in system_content
+
+        history = store.get_conversation_history(session_id=session_id, limit=10)
+        matching_user_rows = [
+            message
+            for message in history
+            if message.get("role") == "user"
+            and message.get("content") == "Tapback this one"
+        ]
+        assert matching_user_rows
+        latest_user_row = matching_user_rows[0]
+        assert (
+            latest_user_row.get("metadata", {}).get("message_handle")
+            == "current-handle"
+        )
+        assert latest_user_row.get("metadata", {}).get("part_index") == 1
+
+        print("✓ iMessage handles are visible to the model and stored in history")
+    finally:
+        if os.path.exists(tmp.name):
+            os.remove(tmp.name)
+
+
 async def main() -> int:
     await test_auto_memory_cadence_bounds()
     await test_dream_profile_and_consolidation_helpers()
@@ -475,6 +543,7 @@ async def main() -> int:
     await test_cross_channel_recall_prefers_current_session_when_same_channel()
     await test_cross_channel_recall_is_injected_into_handle_context()
     await test_imessage_session_injects_mobile_prompt_defaults()
+    await test_imessage_handle_ids_are_injected_and_persisted()
     print("\nAll memory-maintenance tests passed")
     return 0
 

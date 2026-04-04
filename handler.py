@@ -20,6 +20,8 @@ from tools import set_consortium_controller
 
 logger = logging.getLogger(__name__)
 
+IMESSAGE_HANDLE_CONTEXT_LIMIT = 50
+
 
 def _content_to_text(content: Any) -> str:
     """Extract plain text from message content that may include multimodal blocks."""
@@ -1170,6 +1172,123 @@ class AgentHandler:
         )
 
     @staticmethod
+    def _normalize_request_metadata(
+        request_metadata: Optional[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Keep only normalized request metadata fields that matter to the model."""
+        if not isinstance(request_metadata, dict):
+            return {}
+
+        normalized: dict[str, Any] = {}
+
+        message_handle = request_metadata.get("message_handle")
+        if isinstance(message_handle, str) and message_handle.strip():
+            normalized["message_handle"] = message_handle.strip()
+
+        part_index = request_metadata.get("part_index")
+        if isinstance(part_index, str) and part_index.strip().isdigit():
+            part_index = int(part_index.strip())
+        if isinstance(part_index, int) and part_index >= 0:
+            normalized["part_index"] = part_index
+
+        return normalized
+
+    @staticmethod
+    def _build_imessage_handle_context_line(
+        entry_index: int,
+        message_handle: str,
+        part_index: Optional[int],
+        content: str,
+        label: str,
+    ) -> str:
+        """Format one iMessage tapback target line for the system prompt."""
+        normalized_content = re.sub(r"\s+", " ", (content or "").strip())
+        if len(normalized_content) > 160:
+            normalized_content = f"{normalized_content[:157]}..."
+
+        part_suffix = ""
+        if isinstance(part_index, int) and part_index >= 0:
+            part_suffix = f"; part_index={part_index}"
+
+        if normalized_content:
+            return (
+                f"{entry_index}. {label}: message_handle={message_handle}{part_suffix}; "
+                f'message="{normalized_content}"'
+            )
+
+        return f"{entry_index}. {label}: message_handle={message_handle}{part_suffix}"
+
+    def _build_imessage_handle_context(
+        self,
+        user_query: str,
+        session_id: Optional[str],
+        request_metadata: Optional[dict[str, Any]],
+    ) -> str:
+        """Expose recent iMessage handle IDs so send_tapback can be called concretely."""
+        if not session_id or not session_id.startswith("imessage_"):
+            return ""
+
+        normalized_request_metadata = self._normalize_request_metadata(request_metadata)
+        history = self.memory_store.get_conversation_history(
+            session_id=session_id,
+            limit=IMESSAGE_HANDLE_CONTEXT_LIMIT,
+        )
+
+        lines: list[str] = []
+        seen_targets: set[tuple[str, Optional[int]]] = set()
+
+        current_handle = normalized_request_metadata.get("message_handle")
+        current_part_index = normalized_request_metadata.get("part_index")
+        if isinstance(current_handle, str) and current_handle:
+            target = (current_handle, current_part_index)
+            seen_targets.add(target)
+            lines.append(
+                self._build_imessage_handle_context_line(
+                    entry_index=len(lines) + 1,
+                    message_handle=current_handle,
+                    part_index=current_part_index,
+                    content=user_query,
+                    label="current inbound message",
+                )
+            )
+
+        for message in history:
+            if str(message.get("role", "")).strip().lower() != "user":
+                continue
+
+            metadata = self._normalize_request_metadata(message.get("metadata"))
+            message_handle = metadata.get("message_handle")
+            if not isinstance(message_handle, str) or not message_handle:
+                continue
+
+            part_index = metadata.get("part_index")
+            target = (message_handle, part_index)
+            if target in seen_targets:
+                continue
+
+            seen_targets.add(target)
+            lines.append(
+                self._build_imessage_handle_context_line(
+                    entry_index=len(lines) + 1,
+                    message_handle=message_handle,
+                    part_index=part_index,
+                    content=_content_to_text(message.get("content", "")),
+                    label="recent inbound message",
+                )
+            )
+
+        if not lines:
+            return ""
+
+        return (
+            "\n\n"
+            "[Available iMessage tapback handles from current and recent messages]:\n"
+            "Use these exact message_handle values when calling send_tapback. Include part_index when present.\n"
+            + "\n".join(lines)
+            + "\n"
+        )
+
+    @staticmethod
     def _normalize_memory_text(content: str) -> str:
         """Normalize memory text for robust duplicate checks."""
         normalized = re.sub(r"\s+", " ", (content or "")).strip().lower()
@@ -2123,9 +2242,11 @@ class AgentHandler:
         request,
         session_id: Optional[str] = None,
         interim_response_callback: Optional[Callable[[str], Awaitable[None]]] = None,
+        request_metadata: Optional[dict[str, Any]] = None,
     ):
         """Handle a request and return the response content."""
         data = request
+        normalized_request_metadata = self._normalize_request_metadata(request_metadata)
 
         # Get the user's message for memory retrieval
         user_messages = [m for m in data["messages"] if m.get("role") == "user"]
@@ -2197,6 +2318,18 @@ class AgentHandler:
                     memory_context += cross_channel_context
             except Exception as e:
                 logger.warning(f"Failed to build cross-channel context: {e}")
+
+        if user_query:
+            try:
+                imessage_handle_context = self._build_imessage_handle_context(
+                    user_query=user_query,
+                    session_id=session_id,
+                    request_metadata=normalized_request_metadata,
+                )
+                if imessage_handle_context:
+                    memory_context += imessage_handle_context
+            except Exception as e:
+                logger.warning(f"Failed to build iMessage handle context: {e}")
 
         # Get few-shot examples for the task type
         few_shot_examples = []
@@ -2276,7 +2409,10 @@ class AgentHandler:
 
                 if session_id and user_query:
                     self.memory_store.add_conversation_message(
-                        role="user", content=user_query, session_id=session_id
+                        role="user",
+                        content=user_query,
+                        session_id=session_id,
+                        metadata=normalized_request_metadata or None,
                     )
                 if session_id and acknowledgement_delivered and acknowledgement:
                     self.memory_store.add_conversation_message(
@@ -2339,7 +2475,10 @@ class AgentHandler:
             # Store conversation in memory
             if session_id and user_query:
                 self.memory_store.add_conversation_message(
-                    role="user", content=user_query, session_id=session_id
+                    role="user",
+                    content=user_query,
+                    session_id=session_id,
+                    metadata=normalized_request_metadata or None,
                 )
             if session_id and content:
                 self.memory_store.add_conversation_message(

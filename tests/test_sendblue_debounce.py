@@ -4,7 +4,6 @@
 import asyncio
 import os
 import tempfile
-from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from integrations import _extract_sendblue_typing_state, _queue_sendblue_pending_message
@@ -22,10 +21,6 @@ from integrations import (
 from integrations import _split_outbound_message_chunks
 from integrations import _is_sendblue_message_unread
 from integrations import handle_imessage, pending_prompt_phone_numbers
-from integrations import (
-    _replay_sendblue_startup_backlog,
-    _replay_telegram_pending_updates,
-)
 from memory import MemoryStore
 
 
@@ -658,6 +653,45 @@ async def test_imessage_memory_stats_command() -> None:
             os.unlink(db_path)
 
 
+async def test_handle_imessage_passes_request_metadata_to_handler() -> None:
+    """Inbound iMessage metadata should be forwarded to the handler."""
+
+    captured: dict[str, object] = {}
+
+    class _FakeHandler:
+        def __init__(self) -> None:
+            self.memory_store = MagicMock()
+
+        async def handle(
+            self,
+            request,
+            session_id=None,
+            interim_response_callback=None,
+            request_metadata=None,
+        ):
+            captured["request"] = request
+            captured["session_id"] = session_id
+            captured["request_metadata"] = request_metadata
+            captured["interim_response_callback"] = interim_response_callback
+            return "ok"
+
+    handler = _FakeHandler()
+    result = await handle_imessage(
+        handler,
+        "+15550124444",
+        "hello there",
+        message_handle="handle-abc",
+        part_index=3,
+    )
+
+    assert result == "ok"
+    assert captured["session_id"] == "imessage_+15550124444"
+    assert captured["request_metadata"] == {
+        "message_handle": "handle-abc",
+        "part_index": 3,
+    }
+
+
 def test_sendblue_unread_detection() -> None:
     """Detect unread state from common Sendblue read-status fields."""
     assert _is_sendblue_message_unread({"is_read": False}) is True
@@ -667,133 +701,6 @@ def test_sendblue_unread_detection() -> None:
     assert _is_sendblue_message_unread({"status": "READ"}) is False
     assert _is_sendblue_message_unread({"status": "delivered"}) is True
     assert _is_sendblue_message_unread({"status": "unknown"}) is None
-
-
-async def test_sendblue_startup_replay_processes_unread_messages() -> None:
-    """Startup replay should process only inbound unread messages by default."""
-    previous_replay_enabled = os.environ.get("SENDBLUE_STARTUP_REPLAY_ENABLED")
-    previous_lookback = os.environ.get("SENDBLUE_STARTUP_LOOKBACK_SECONDS")
-    previous_unread_only = os.environ.get("SENDBLUE_STARTUP_UNREAD_ONLY")
-
-    os.environ["SENDBLUE_STARTUP_REPLAY_ENABLED"] = "1"
-    os.environ["SENDBLUE_STARTUP_LOOKBACK_SECONDS"] = "600"
-    os.environ["SENDBLUE_STARTUP_UNREAD_ONLY"] = "1"
-
-    checkpoint_time = datetime(2026, 4, 3, 12, 0, 0)
-    processed_handles: set[str] = set()
-
-    messages = [
-        {
-            "message_handle": "skip-outbound",
-            "direction": "outgoing",
-            "number": "+15550000001",
-            "content": "ignore",
-            "is_read": False,
-        },
-        {
-            "message_handle": "process-unread",
-            "direction": "incoming",
-            "number": "+15550000002",
-            "content": "hello from offline",
-            "is_read": False,
-        },
-        {
-            "message_handle": "skip-read",
-            "direction": "incoming",
-            "number": "+15550000003",
-            "content": "already read",
-            "is_read": True,
-        },
-    ]
-
-    process_reply_mock = AsyncMock()
-
-    async def _fake_build_content(text: str, attachment_urls: list[str]):
-        return text, attachment_urls
-
-    try:
-        with (
-            patch(
-                "integrations.get_imessages",
-                new=AsyncMock(
-                    return_value={"success": True, "data": {"messages": messages}}
-                ),
-            ),
-            patch("integrations._build_imessage_user_content", new=_fake_build_content),
-            patch("integrations.process_imessage_and_reply", new=process_reply_mock),
-        ):
-            replayed_count = await _replay_sendblue_startup_backlog(
-                object(),
-                checkpoint_time=checkpoint_time,
-                processed_handles=processed_handles,
-            )
-    finally:
-        if previous_replay_enabled is None:
-            os.environ.pop("SENDBLUE_STARTUP_REPLAY_ENABLED", None)
-        else:
-            os.environ["SENDBLUE_STARTUP_REPLAY_ENABLED"] = previous_replay_enabled
-
-        if previous_lookback is None:
-            os.environ.pop("SENDBLUE_STARTUP_LOOKBACK_SECONDS", None)
-        else:
-            os.environ["SENDBLUE_STARTUP_LOOKBACK_SECONDS"] = previous_lookback
-
-        if previous_unread_only is None:
-            os.environ.pop("SENDBLUE_STARTUP_UNREAD_ONLY", None)
-        else:
-            os.environ["SENDBLUE_STARTUP_UNREAD_ONLY"] = previous_unread_only
-
-    assert replayed_count == 1
-    assert process_reply_mock.await_count == 1
-    assert process_reply_mock.await_args.args[1] == "+15550000002"
-    assert "process-unread" in processed_handles
-    assert "skip-outbound" not in processed_handles
-    assert "skip-read" not in processed_handles
-
-
-async def test_telegram_startup_replay_processes_pending_updates() -> None:
-    """Telegram startup replay should process queued updates and ack offset."""
-    previous_enabled = os.environ.get("TELEGRAM_REPLAY_PENDING_UPDATES_ON_STARTUP")
-    previous_batch_size = os.environ.get("TELEGRAM_PENDING_UPDATES_BATCH_SIZE")
-    previous_max_batches = os.environ.get("TELEGRAM_PENDING_UPDATES_MAX_BATCHES")
-
-    os.environ["TELEGRAM_REPLAY_PENDING_UPDATES_ON_STARTUP"] = "1"
-    os.environ["TELEGRAM_PENDING_UPDATES_BATCH_SIZE"] = "100"
-    os.environ["TELEGRAM_PENDING_UPDATES_MAX_BATCHES"] = "3"
-
-    class _FakeUpdate:
-        def __init__(self, update_id: int):
-            self.update_id = update_id
-
-    app = MagicMock()
-    app.bot = MagicMock()
-    app.bot.get_updates = AsyncMock(
-        side_effect=[[_FakeUpdate(1), _FakeUpdate(2)], [], []]
-    )
-    app.process_update = AsyncMock()
-
-    try:
-        processed_count = await _replay_telegram_pending_updates(app)
-    finally:
-        if previous_enabled is None:
-            os.environ.pop("TELEGRAM_REPLAY_PENDING_UPDATES_ON_STARTUP", None)
-        else:
-            os.environ["TELEGRAM_REPLAY_PENDING_UPDATES_ON_STARTUP"] = previous_enabled
-
-        if previous_batch_size is None:
-            os.environ.pop("TELEGRAM_PENDING_UPDATES_BATCH_SIZE", None)
-        else:
-            os.environ["TELEGRAM_PENDING_UPDATES_BATCH_SIZE"] = previous_batch_size
-
-        if previous_max_batches is None:
-            os.environ.pop("TELEGRAM_PENDING_UPDATES_MAX_BATCHES", None)
-        else:
-            os.environ["TELEGRAM_PENDING_UPDATES_MAX_BATCHES"] = previous_max_batches
-
-    assert processed_count == 2
-    assert app.process_update.await_count == 2
-    assert app.bot.get_updates.await_count == 3
-    assert app.bot.get_updates.await_args_list[-1].kwargs.get("offset") == 3
 
 
 async def test_attachment_then_text_are_coalesced() -> None:
@@ -946,6 +853,8 @@ async def test_typing_indicator_stops_as_soon_as_reply_is_sent() -> None:
         _phone: str,
         _content,
         interim_response_callback=None,
+        message_handle=None,
+        part_index=None,
     ) -> str:
         if interim_response_callback is not None:
             await interim_response_callback("Working on it.")
@@ -996,8 +905,7 @@ async def main() -> int:
     await test_send_imessage_typing_directive_triggers_indicator()
     await test_imessage_start_and_setprompt_flow()
     await test_imessage_memory_stats_command()
-    await test_sendblue_startup_replay_processes_unread_messages()
-    await test_telegram_startup_replay_processes_pending_updates()
+    await test_handle_imessage_passes_request_metadata_to_handler()
     await test_attachment_then_text_are_coalesced()
     await test_typing_event_extends_existing_debounce()
     await test_typing_event_without_pending_message_is_ignored()

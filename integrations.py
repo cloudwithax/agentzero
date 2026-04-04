@@ -12,7 +12,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, Optional
 from urllib.parse import urlparse
 
@@ -78,10 +78,7 @@ VOICE_MEMO_CONVERTED_FILENAME = "voice-memo-converted.wav"
 VOICE_MEMO_CONVERTED_CONTENT_TYPE = "audio/wav"
 IMAGE_FFMPEG_BIN_DEFAULT = "ffmpeg"
 IMAGE_MAGICK_BIN_ENV = "SENDBLUE_IMAGE_MAGICK_BIN"
-SENDBLUE_STARTUP_LOOKBACK_SECONDS_DEFAULT = 6 * 60 * 60
 SENDBLUE_TAPBACK_PROBABILITY_DEFAULT = 0.2
-TELEGRAM_PENDING_UPDATES_BATCH_SIZE_DEFAULT = 100
-TELEGRAM_PENDING_UPDATES_MAX_BATCHES_DEFAULT = 5
 IMESSAGE_LABEL_BREAK_PATTERN = re.compile(
     r"\s+(?=(?:name|order(?:\s*#)?|date|items|drinks|sauces|restaurant(?:\s*#)?)\s*:)",
     re.IGNORECASE,
@@ -1457,103 +1454,6 @@ def _remember_processed_sendblue_handle(
         dedup_ttl_seconds,
         lambda handle=normalized: processed_handles.discard(handle),
     )
-
-
-async def _replay_sendblue_startup_backlog(
-    handler: AgentHandler,
-    checkpoint_time: datetime,
-    processed_handles: Optional[set[str]] = None,
-) -> int:
-    """Replay recent inbound Sendblue messages sent while the bot was offline."""
-    if not _to_bool(os.environ.get("SENDBLUE_STARTUP_REPLAY_ENABLED", "1")):
-        return 0
-
-    lookback_seconds = _env_int(
-        "SENDBLUE_STARTUP_LOOKBACK_SECONDS",
-        SENDBLUE_STARTUP_LOOKBACK_SECONDS_DEFAULT,
-        minimum=0,
-    )
-    if lookback_seconds <= 0:
-        return 0
-
-    unread_only = _to_bool(os.environ.get("SENDBLUE_STARTUP_UNREAD_ONLY", "1"))
-    replay_unknown_read_state = _to_bool(
-        os.environ.get("SENDBLUE_STARTUP_REPLAY_UNKNOWN_READ_STATE", "1")
-    )
-    lookback_start = checkpoint_time - timedelta(seconds=lookback_seconds)
-
-    result = await get_imessages(last_check=lookback_start)
-    if not result.get("success"):
-        logger.error(
-            "Failed to fetch Sendblue startup backlog: %s",
-            result.get("error") or result,
-        )
-        return 0
-
-    messages = _extract_sendblue_message_list(result.get("data"))
-    if not messages:
-        return 0
-
-    own_number = os.environ.get("SENDBLUE_NUMBER", "").strip()
-    replayed_count = 0
-
-    for msg in _sort_sendblue_messages_for_replay(messages):
-        if _is_sendblue_outbound_message(msg, own_number):
-            continue
-
-        unread_state = _is_sendblue_message_unread(msg)
-        if unread_only:
-            if unread_state is False:
-                continue
-            if unread_state is None and not replay_unknown_read_state:
-                continue
-
-        message_handle = _extract_sendblue_message_handle(msg)
-        if message_handle and processed_handles is not None:
-            if message_handle in processed_handles:
-                continue
-            processed_handles.add(message_handle)
-
-        sender_number = _extract_sendblue_sender_number(msg)
-        if not sender_number:
-            logger.debug(
-                "Skipping startup replay message without sender number: %s", msg
-            )
-            continue
-
-        content = msg.get("content") or msg.get("message") or msg.get("text") or ""
-        attachments = _extract_sendblue_attachment_urls(msg)
-        normalized_content = content if isinstance(content, str) else str(content)
-        if not normalized_content.strip() and not attachments:
-            continue
-
-        try:
-            user_content = await _build_imessage_user_content(
-                normalized_content,
-                attachments,
-            )
-            await process_imessage_and_reply(
-                handler,
-                sender_number,
-                user_content,
-                message_handle=message_handle,
-                part_index=_extract_sendblue_part_index(msg),
-            )
-            replayed_count += 1
-        except Exception as e:
-            logger.error(
-                "Failed to replay Sendblue startup message from %s: %s",
-                sender_number,
-                e,
-            )
-
-    if replayed_count:
-        logger.info(
-            "Processed %s unread Sendblue backlog message(s) after reconnect",
-            replayed_count,
-        )
-
-    return replayed_count
 
 
 def _schedule_sendblue_pending_flush_locked(
@@ -3059,6 +2959,9 @@ async def handle_imessage(
     phone_number: str,
     user_content: str | list[dict[str, Any]],
     interim_response_callback: Optional[Callable[[str], Awaitable[None]]] = None,
+    *,
+    message_handle: str | None = None,
+    part_index: int | None = None,
 ) -> str:
     """Process an incoming iMessage."""
     normalized_phone_number = (phone_number or "").strip()
@@ -3119,10 +3022,18 @@ async def handle_imessage(
             return f"❌ Failed to clear conversation: {str(e)}"
 
     try:
+        request_metadata: dict[str, Any] = {}
+        normalized_message_handle = (message_handle or "").strip()
+        if normalized_message_handle:
+            request_metadata["message_handle"] = normalized_message_handle
+        if isinstance(part_index, int) and part_index >= 0:
+            request_metadata["part_index"] = part_index
+
         return await handler.handle(
             {"messages": [{"role": "user", "content": user_content}]},
             session_id=session_id,
             interim_response_callback=interim_response_callback,
+            request_metadata=request_metadata or None,
         )
     except Exception as e:
         logger.error(f"Error: {e}")
@@ -3221,6 +3132,8 @@ async def process_imessage_and_reply(
                 phone_number,
                 user_content,
                 interim_response_callback=_send_interim_response,
+                message_handle=message_handle,
+                part_index=part_index,
             )
         finally:
             await _stop_typing_loop("response_ready")
@@ -3246,23 +3159,16 @@ async def process_imessage_and_reply(
 async def start_sendblue_webhook_server(
     handler: AgentHandler,
     port: int,
-    initial_processed_handles: Optional[set[str]] = None,
 ):
     """Start a webhook server for Sendblue."""
     app = web.Application()
     own_number = os.environ.get("SENDBLUE_NUMBER")
-    processed_handles = set(initial_processed_handles or set())
+    processed_handles: set[str] = set()
     dedup_ttl_seconds = _env_int(
         "SENDBLUE_DEDUP_TTL_SECONDS",
         60,
         minimum=10,
     )
-    for existing_handle in list(processed_handles):
-        _remember_processed_sendblue_handle(
-            processed_handles,
-            existing_handle,
-            dedup_ttl_seconds,
-        )
 
     pending_sendblue_messages: dict[str, dict[str, Any]] = {}
     pending_sendblue_lock = asyncio.Lock()
@@ -3476,22 +3382,11 @@ async def start_sendblue_bot(handler: AgentHandler):
     monitor_tasks: list[asyncio.Task] = []
     receive_webhook_url = os.environ.get("SENDBLUE_RECEIVE_WEBHOOK_URL", "").strip()
     typing_webhook_url = os.environ.get("SENDBLUE_TYPING_WEBHOOK_URL", "").strip()
-    processed_handles: set[str] = set()
 
     try:
         await _backfill_untranscribed_voice_memo_conversations(handler)
     except Exception as e:
         logger.error("Sendblue voice memo backfill failed: %s", e)
-
-    startup_checkpoint = datetime.utcnow()
-    try:
-        await _replay_sendblue_startup_backlog(
-            handler,
-            checkpoint_time=startup_checkpoint,
-            processed_handles=processed_handles,
-        )
-    except Exception as e:
-        logger.error("Sendblue startup replay failed: %s", e)
 
     if receive_webhook_url:
         monitor_tasks.append(asyncio.create_task(monitor_sendblue_receive_webhook()))
@@ -3506,11 +3401,7 @@ async def start_sendblue_bot(handler: AgentHandler):
     webhook_port = os.environ.get("SENDBLUE_WEBHOOK_PORT")
     if webhook_port:
         try:
-            await start_sendblue_webhook_server(
-                handler,
-                int(webhook_port),
-                initial_processed_handles=processed_handles,
-            )
+            await start_sendblue_webhook_server(handler, int(webhook_port))
         finally:
             for monitor_task in monitor_tasks:
                 monitor_task.cancel()
@@ -3518,18 +3409,13 @@ async def start_sendblue_bot(handler: AgentHandler):
 
     # Polling fallback
     interval = int(os.environ.get("SENDBLUE_POLL_INTERVAL", "10"))
-    last_check = startup_checkpoint
+    last_check = datetime.utcnow()
+    processed_handles: set[str] = set()
     dedup_ttl_seconds = _env_int(
         "SENDBLUE_DEDUP_TTL_SECONDS",
         60,
         minimum=10,
     )
-    for startup_handle in list(processed_handles):
-        _remember_processed_sendblue_handle(
-            processed_handles,
-            startup_handle,
-            dedup_ttl_seconds,
-        )
 
     logger.info(f"iMessage bot started (interval: {interval}s)")
     while True:
@@ -3774,83 +3660,6 @@ def run_telegram_bot(handler: AgentHandler):
     app.run_polling(drop_pending_updates=False)
 
 
-async def _replay_telegram_pending_updates(app: Any) -> int:
-    """Process queued Telegram updates that arrived while polling was offline."""
-    if not _to_bool(os.environ.get("TELEGRAM_REPLAY_PENDING_UPDATES_ON_STARTUP", "1")):
-        return 0
-
-    batch_size = _env_int(
-        "TELEGRAM_PENDING_UPDATES_BATCH_SIZE",
-        TELEGRAM_PENDING_UPDATES_BATCH_SIZE_DEFAULT,
-        minimum=1,
-        maximum=100,
-    )
-    max_batches = _env_int(
-        "TELEGRAM_PENDING_UPDATES_MAX_BATCHES",
-        TELEGRAM_PENDING_UPDATES_MAX_BATCHES_DEFAULT,
-        minimum=1,
-        maximum=100,
-    )
-
-    processed_count = 0
-    next_offset: int | None = None
-    reached_batch_limit = True
-
-    for _ in range(max_batches):
-        updates = await app.bot.get_updates(
-            offset=next_offset,
-            timeout=0,
-            limit=batch_size,
-            allowed_updates=["message"],
-        )
-        if not updates:
-            reached_batch_limit = False
-            break
-
-        for update in updates:
-            try:
-                await app.process_update(update)
-                processed_count += 1
-            except Exception as e:
-                logger.error(
-                    "Failed to process pending Telegram update %s: %s",
-                    getattr(update, "update_id", "unknown"),
-                    e,
-                )
-
-        last_update_id = getattr(updates[-1], "update_id", None)
-        if not isinstance(last_update_id, int):
-            reached_batch_limit = False
-            break
-        next_offset = last_update_id + 1
-
-    if reached_batch_limit:
-        logger.warning(
-            "Telegram startup replay hit batch limit (%s x %s); older updates may remain queued",
-            max_batches,
-            batch_size,
-        )
-
-    if next_offset is not None:
-        try:
-            await app.bot.get_updates(
-                offset=next_offset,
-                timeout=0,
-                limit=1,
-                allowed_updates=["message"],
-            )
-        except Exception as e:
-            logger.debug("Failed to acknowledge pending Telegram updates: %s", e)
-
-    if processed_count:
-        logger.info(
-            "Processed %s pending Telegram update(s) after reconnect",
-            processed_count,
-        )
-
-    return processed_count
-
-
 async def run_telegram_bot_async(handler: AgentHandler):
     """Run the telegram bot asynchronously."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -3898,7 +3707,6 @@ async def run_telegram_bot_async(handler: AgentHandler):
     assert app.updater is not None, "Updater should not be None"
     async with app:
         await app.start()
-        await _replay_telegram_pending_updates(app)
         await app.updater.start_polling(
             error_callback=telegram_polling_error_handler,
             drop_pending_updates=False,

@@ -238,6 +238,10 @@ All tools return a consistent dictionary format:
   **Fix:** Add explicit Sendblue reactions support in `integrations.py` (`send_reaction`, `_maybe_send_random_sendblue_tapback`) and propagate `message_handle`/`part_index` through startup replay plus queued webhook flush paths before calling `process_imessage_and_reply`. Guard behavior with env controls (`SENDBLUE_AUTO_TAPBACK_ENABLED`, `SENDBLUE_TAPBACK_PROBABILITY`) and relevance heuristics. Validate with: `PYTHONPATH=. .venv/bin/python tests/test_sendblue_debounce.py`.
 - **Pitfall: Implementing a capability in `integrations.py` is not enough for autonomous use if it is not also in the public tool schema.**
   **Fix:** Expose Sendblue tapbacks as a first-class tool by adding `send_tapback_tool` in `tools.py`, registering it in `TOOLS` + `validate_tool_args()`, and adding `send_tapback` to `BASE_PAYLOAD["tools"]` in `handler.py`. Validate with: `PYTHONPATH=. .venv/bin/python tests/test_simple.py`.
+- **Pitfall: Exposing `send_tapback` in the tool schema was still insufficient because the model could not see the concrete inbound `message_handle` IDs required to call it.**
+  **Fix:** Thread Sendblue `message_handle` / `part_index` metadata through `handle_imessage()` into `AgentHandler.handle()`, persist it on conversation rows, and inject an `[Available iMessage tapback handles ...]` context block into the system prompt for iMessage sessions. Validate with: `PYTHONPATH=. .venv/bin/python tests/test_memory_maintenance.py` and `PYTHONPATH=. .venv/bin/python tests/test_sendblue_debounce.py`.
+- **Pitfall: Startup message replay and pending-update draining were brittle enough to replay stale or broken channel state on boot.**
+  **Fix:** Remove Sendblue startup backlog replay and Telegram pending-update replay from `integrations.py`, keep only live webhook/polling handling, and drop the related env knobs/tests/docs. Validate with: `PYTHONPATH=. .venv/bin/python tests/test_sendblue_debounce.py`.
 
 ## Key Functions Reference
 
