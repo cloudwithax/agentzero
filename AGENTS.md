@@ -234,6 +234,8 @@ All tools return a consistent dictionary format:
   **Fix:** Broaden recall regex token matching to tolerate apostrophes and short filler words, then add regression coverage in `tests/test_memory_maintenance.py` (`test_cross_channel_recall_injects_requested_history`, `test_cross_channel_recall_prefers_current_session_when_same_channel`). Validate with: `PYTHONPATH=. python3 tests/test_memory_maintenance.py`.
 - **Pitfall: Early Sendblue voice memo rows could be stored with only `[Voice memo attachments not transcribed]` URL blocks, leaving conversation history without transcript text.**
   **Fix:** Add startup backfill in `integrations.py` (`_backfill_untranscribed_voice_memo_conversations`) that retries legacy URLs and updates `conversations.content` via new `memory.py` helpers (`get_conversation_messages_with_untranscribed_voice_memos`, `update_conversation_message_content`), plus regression coverage in `tests/test_sendblue_voice_memo.py` (`test_backfill_untranscribed_voice_memos_updates_conversation_content`). Validate with: `PYTHONPATH=. .venv/bin/python tests/test_sendblue_voice_memo.py`.
+- **Pitfall: Auto-tapback reactions can fail silently if inbound `message_handle` metadata is dropped during debounce/replay/polling paths.**
+  **Fix:** Add explicit Sendblue reactions support in `integrations.py` (`send_reaction`, `_maybe_send_random_sendblue_tapback`) and propagate `message_handle`/`part_index` through startup replay plus queued webhook flush paths before calling `process_imessage_and_reply`. Guard behavior with env controls (`SENDBLUE_AUTO_TAPBACK_ENABLED`, `SENDBLUE_TAPBACK_PROBABILITY`) and relevance heuristics. Validate with: `PYTHONPATH=. .venv/bin/python tests/test_sendblue_debounce.py`.
 
 ## Key Functions Reference
 

@@ -7,6 +7,7 @@ import mimetypes
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -78,10 +79,43 @@ VOICE_MEMO_CONVERTED_CONTENT_TYPE = "audio/wav"
 IMAGE_FFMPEG_BIN_DEFAULT = "ffmpeg"
 IMAGE_MAGICK_BIN_ENV = "SENDBLUE_IMAGE_MAGICK_BIN"
 SENDBLUE_STARTUP_LOOKBACK_SECONDS_DEFAULT = 6 * 60 * 60
+SENDBLUE_TAPBACK_PROBABILITY_DEFAULT = 0.2
 TELEGRAM_PENDING_UPDATES_BATCH_SIZE_DEFAULT = 100
 TELEGRAM_PENDING_UPDATES_MAX_BATCHES_DEFAULT = 5
 IMESSAGE_LABEL_BREAK_PATTERN = re.compile(
     r"\s+(?=(?:name|order(?:\s*#)?|date|items|drinks|sauces|restaurant(?:\s*#)?)\s*:)",
+    re.IGNORECASE,
+)
+SENDBLUE_TAPBACK_VALID_REACTIONS = {
+    "love",
+    "like",
+    "dislike",
+    "laugh",
+    "emphasize",
+    "question",
+}
+SENDBLUE_TAPBACK_LAUGH_PATTERN = re.compile(
+    r"\b(?:lol|lmao|lmfao|rofl|haha+|hehe+)\b",
+    re.IGNORECASE,
+)
+SENDBLUE_TAPBACK_QUESTION_HINT_PATTERN = re.compile(
+    r"^\s*(?:who|what|when|where|why|how|can|could|would|should|do|did|is|are|will|wont|won't)\b",
+    re.IGNORECASE,
+)
+SENDBLUE_TAPBACK_LOVE_PATTERN = re.compile(
+    r"\b(?:love|adore|heart)\b",
+    re.IGNORECASE,
+)
+SENDBLUE_TAPBACK_POSITIVE_PATTERN = re.compile(
+    r"\b(?:thanks|thank\s+you|great|awesome|perfect|sounds\s+good|nice|amazing|works|yep|yes)\b",
+    re.IGNORECASE,
+)
+SENDBLUE_TAPBACK_DISLIKE_PATTERN = re.compile(
+    r"\b(?:hate|dislike|sucks|terrible|awful|bad\s+idea|nope)\b",
+    re.IGNORECASE,
+)
+SENDBLUE_TAPBACK_EMPHASIZE_PATTERN = re.compile(
+    r"(?:!{2,}|\b(?:wow|omg|urgent|asap|seriously|important)\b)",
     re.IGNORECASE,
 )
 OUTBOUND_MESSAGE_BLOCK_PATTERN = re.compile(
@@ -154,6 +188,29 @@ def _env_int(
     raw_value = os.environ.get(name, str(default))
     try:
         parsed = int(str(raw_value).strip())
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s=%r, defaulting to %s", name, raw_value, default)
+        parsed = default
+
+    if minimum is not None and parsed < minimum:
+        parsed = minimum
+    if maximum is not None and parsed > maximum:
+        parsed = maximum
+
+    return parsed
+
+
+def _env_float(
+    name: str,
+    default: float,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
+    """Parse float env vars with optional clamping and warning logs."""
+    raw_value = os.environ.get(name, str(default))
+    try:
+        parsed = float(str(raw_value).strip())
     except (TypeError, ValueError):
         logger.warning("Invalid %s=%r, defaulting to %s", name, raw_value, default)
         parsed = default
@@ -1171,6 +1228,76 @@ def _extract_sendblue_message_handle(payload: dict[str, Any]) -> str:
     return ""
 
 
+def _extract_sendblue_part_index(payload: dict[str, Any]) -> int | None:
+    """Extract Sendblue message part index when provided."""
+    for key in ("part_index", "partIndex"):
+        value = payload.get(key)
+        if value is None:
+            continue
+
+        try:
+            parsed = int(str(value).strip())
+        except (TypeError, ValueError):
+            continue
+
+        if parsed >= 0:
+            return parsed
+
+    return None
+
+
+def _sendblue_auto_tapback_enabled() -> bool:
+    """Allow disabling random inbound tapbacks for troubleshooting."""
+    return _to_bool(os.environ.get("SENDBLUE_AUTO_TAPBACK_ENABLED", "1"))
+
+
+def _sendblue_tapback_probability() -> float:
+    """Resolve random tapback probability from env with sane defaults."""
+    return _env_float(
+        "SENDBLUE_TAPBACK_PROBABILITY",
+        SENDBLUE_TAPBACK_PROBABILITY_DEFAULT,
+        minimum=0.0,
+        maximum=1.0,
+    )
+
+
+def _choose_sendblue_tapback_reaction(message_text: str) -> str | None:
+    """Pick a context-relevant Sendblue tapback reaction for inbound text."""
+    normalized = (message_text or "").strip()
+    if not normalized:
+        return None
+
+    command, _ = _parse_slash_command(normalized)
+    if command:
+        return None
+
+    candidates: list[str] = []
+    lowered = normalized.lower()
+
+    if SENDBLUE_TAPBACK_LAUGH_PATTERN.search(lowered):
+        candidates.append("laugh")
+
+    if "?" in normalized or SENDBLUE_TAPBACK_QUESTION_HINT_PATTERN.search(lowered):
+        candidates.append("question")
+
+    if SENDBLUE_TAPBACK_LOVE_PATTERN.search(lowered):
+        candidates.extend(["love", "like"])
+    elif SENDBLUE_TAPBACK_POSITIVE_PATTERN.search(lowered):
+        candidates.append("like")
+
+    if SENDBLUE_TAPBACK_DISLIKE_PATTERN.search(lowered):
+        candidates.append("dislike")
+
+    if SENDBLUE_TAPBACK_EMPHASIZE_PATTERN.search(normalized):
+        candidates.append("emphasize")
+
+    if not candidates:
+        return None
+
+    unique_candidates = list(dict.fromkeys(candidates))
+    return random.choice(unique_candidates)
+
+
 def _parse_datetime_like(value: Any) -> datetime | None:
     """Best-effort datetime parser for mixed API date/time payload formats."""
     if value is None:
@@ -1405,7 +1532,13 @@ async def _replay_sendblue_startup_backlog(
                 normalized_content,
                 attachments,
             )
-            await process_imessage_and_reply(handler, sender_number, user_content)
+            await process_imessage_and_reply(
+                handler,
+                sender_number,
+                user_content,
+                message_handle=message_handle,
+                part_index=_extract_sendblue_part_index(msg),
+            )
             replayed_count += 1
         except Exception as e:
             logger.error(
@@ -1428,7 +1561,9 @@ def _schedule_sendblue_pending_flush_locked(
     sender_number: str,
     pending_sendblue_lock: asyncio.Lock,
     debounce_seconds: float,
-    process_callback: Callable[[str, str, list[str]], Awaitable[None]],
+    process_callback: Callable[
+        [str, str, list[str], str | None, int | None], Awaitable[None]
+    ],
 ) -> None:
     """Reset and schedule delayed processing for a queued sender payload."""
     pending_payload = pending_sendblue_messages.get(sender_number)
@@ -1453,11 +1588,23 @@ def _schedule_sendblue_pending_flush_locked(
                 part for part in text_parts if isinstance(part, str) and part.strip()
             ).strip()
             attachments = _normalize_attachment_urls(payload.get("attachments", []))
+            message_handle = payload.get("message_handle")
+            if not isinstance(message_handle, str) or not message_handle.strip():
+                message_handle = None
+            part_index = payload.get("part_index")
+            if not isinstance(part_index, int) or part_index < 0:
+                part_index = None
 
             if not text and not attachments:
                 return
 
-            await process_callback(sender_number, text, attachments)
+            await process_callback(
+                sender_number,
+                text,
+                attachments,
+                message_handle,
+                part_index,
+            )
         except asyncio.CancelledError:
             return
         except Exception as e:
@@ -1473,26 +1620,44 @@ async def _queue_sendblue_pending_message(
     text: str,
     attachments: list[str],
     debounce_seconds: float,
-    process_callback: Callable[[str, str, list[str]], Awaitable[None]],
+    process_callback: Callable[
+        [str, str, list[str], str | None, int | None], Awaitable[None]
+    ],
     *,
     create_if_missing: bool = True,
+    message_handle: str | None = None,
+    part_index: int | None = None,
 ) -> bool:
     """Queue or update a sender payload, then debounce-send it to the agent."""
     normalized_text = (text or "").strip()
     normalized_attachments = _normalize_attachment_urls(attachments)
+    normalized_message_handle = (message_handle or "").strip()
+    normalized_part_index = part_index if isinstance(part_index, int) else None
+    if normalized_part_index is not None and normalized_part_index < 0:
+        normalized_part_index = None
 
     async with pending_sendblue_lock:
         payload = pending_sendblue_messages.get(sender_number)
         if payload is None:
             if not create_if_missing:
                 return False
-            payload = {"text_parts": [], "attachments": [], "task": None}
+            payload = {
+                "text_parts": [],
+                "attachments": [],
+                "task": None,
+                "message_handle": None,
+                "part_index": None,
+            }
             pending_sendblue_messages[sender_number] = payload
 
         if normalized_text:
             payload["text_parts"].append(normalized_text)
         if normalized_attachments:
             payload["attachments"].extend(normalized_attachments)
+        if normalized_message_handle:
+            payload["message_handle"] = normalized_message_handle
+        if normalized_part_index is not None:
+            payload["part_index"] = normalized_part_index
 
         _schedule_sendblue_pending_flush_locked(
             pending_sendblue_messages,
@@ -2435,6 +2600,129 @@ async def send_typing_indicator(
             await session.close()
 
 
+async def send_reaction(
+    message_handle: str,
+    reaction: str,
+    part_index: int | None = None,
+    session: Optional[aiohttp.ClientSession] = None,
+) -> dict:
+    """Send an iMessage tapback reaction via Sendblue API v2."""
+    api_key = os.environ.get("SENDBLUE_API_KEY")
+    api_secret = os.environ.get("SENDBLUE_API_SECRET")
+    from_number = os.environ.get("SENDBLUE_NUMBER")
+    if not api_key or not api_secret or not from_number:
+        return {"success": False, "error": "Credentials or SENDBLUE_NUMBER missing"}
+
+    normalized_handle = (message_handle or "").strip()
+    if not normalized_handle:
+        return {"success": False, "error": "message_handle is required"}
+
+    normalized_reaction = (reaction or "").strip().lower()
+    if normalized_reaction not in SENDBLUE_TAPBACK_VALID_REACTIONS:
+        return {
+            "success": False,
+            "error": (
+                "Invalid reaction. Must be one of: "
+                + ", ".join(sorted(SENDBLUE_TAPBACK_VALID_REACTIONS))
+            ),
+        }
+
+    normalized_part_index = part_index if isinstance(part_index, int) else None
+    if normalized_part_index is not None and normalized_part_index < 0:
+        return {"success": False, "error": "part_index must be non-negative"}
+
+    headers = {
+        "Content-Type": "application/json",
+        "sb-api-key-id": api_key,
+        "sb-api-secret-key": api_secret,
+    }
+    payload: dict[str, Any] = {
+        "from_number": from_number,
+        "message_handle": normalized_handle,
+        "reaction": normalized_reaction,
+    }
+    if normalized_part_index is not None:
+        payload["part_index"] = normalized_part_index
+
+    close_session = False
+    if session is None:
+        session = aiohttp.ClientSession()
+        close_session = True
+
+    try:
+        async with session.post(
+            "https://api.sendblue.com/api/send-reaction",
+            json=payload,
+            headers=headers,
+        ) as resp:
+            try:
+                data = await resp.json(content_type=None)
+            except Exception:
+                data = {"raw": await resp.text()}
+
+            success = 200 <= resp.status < 300
+            if isinstance(data, dict):
+                status = str(data.get("status", "")).strip().upper()
+                if status == "OK":
+                    success = True
+                elif status == "ERROR":
+                    success = False
+
+            return {
+                "success": success,
+                "data": data,
+                "status": resp.status,
+            }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+    finally:
+        if close_session:
+            await session.close()
+
+
+async def _maybe_send_random_sendblue_tapback(
+    phone_number: str,
+    user_content: str | list[dict[str, Any]],
+    message_handle: str | None,
+    part_index: int | None,
+    session: Optional[aiohttp.ClientSession] = None,
+) -> dict | None:
+    """Randomly send an appropriate tapback reaction for relevant inbound text."""
+    normalized_handle = (message_handle or "").strip()
+    if not normalized_handle or not _sendblue_auto_tapback_enabled():
+        return None
+
+    message_text = _extract_text_from_user_content(user_content)
+    reaction = _choose_sendblue_tapback_reaction(message_text)
+    if not reaction:
+        return None
+
+    if random.random() > _sendblue_tapback_probability():
+        return None
+
+    result = await send_reaction(
+        message_handle=normalized_handle,
+        reaction=reaction,
+        part_index=part_index,
+        session=session,
+    )
+    if result.get("success"):
+        logger.debug(
+            "Sent auto tapback reaction=%s for inbound message_handle=%s from %s",
+            reaction,
+            normalized_handle,
+            phone_number,
+        )
+    else:
+        logger.debug(
+            "Failed auto tapback for inbound message_handle=%s from %s: %s",
+            normalized_handle,
+            phone_number,
+            result,
+        )
+    return result
+
+
 async def send_read_receipt(
     phone_number: str, session: Optional[aiohttp.ClientSession] = None
 ) -> dict:
@@ -2820,6 +3108,9 @@ async def process_imessage_and_reply(
     handler: Any,
     phone_number: str,
     user_content: str | list[dict[str, Any]],
+    *,
+    message_handle: str | None = None,
+    part_index: int | None = None,
 ) -> None:
     """Send read receipt/typing signals, run agent, then send response."""
 
@@ -2827,6 +3118,14 @@ async def process_imessage_and_reply(
         read_res = await send_read_receipt(phone_number, session=session)
         if not read_res.get("success"):
             logger.warning("Failed to send read receipt: %s", read_res)
+
+        await _maybe_send_random_sendblue_tapback(
+            phone_number,
+            user_content,
+            message_handle,
+            part_index,
+            session=session,
+        )
 
         stop_typing = asyncio.Event()
 
@@ -2973,10 +3272,20 @@ async def start_sendblue_webhook_server(
         )
 
     async def _process_queued_sender_payload(
-        sender_number: str, text: str, attachments: list[str]
+        sender_number: str,
+        text: str,
+        attachments: list[str],
+        message_handle: str | None,
+        part_index: int | None,
     ) -> None:
         user_content = await _build_imessage_user_content(text, attachments)
-        await process_imessage_and_reply(handler, sender_number, user_content)
+        await process_imessage_and_reply(
+            handler,
+            sender_number,
+            user_content,
+            message_handle=message_handle,
+            part_index=part_index,
+        )
 
     async def webhook_endpoint(request):
         try:
@@ -2996,6 +3305,7 @@ async def start_sendblue_webhook_server(
             direction = str(data.get("direction", "")).lower()
             is_outbound = _to_bool(data.get("is_outbound"))
             message_handle = _extract_sendblue_message_handle(data)
+            message_part_index = _extract_sendblue_part_index(data)
 
             if message_handle:
                 if message_handle in processed_handles:
@@ -3064,6 +3374,8 @@ async def start_sendblue_webhook_server(
                         attachments,
                         attachment_debounce_seconds,
                         _process_queued_sender_payload,
+                        message_handle=message_handle,
+                        part_index=message_part_index,
                     )
                     return web.Response(status=200, text="OK")
 
@@ -3072,7 +3384,11 @@ async def start_sendblue_webhook_server(
                 async def _process_and_reply():
                     try:
                         await process_imessage_and_reply(
-                            handler, sender_number, user_content
+                            handler,
+                            sender_number,
+                            user_content,
+                            message_handle=message_handle,
+                            part_index=message_part_index,
                         )
                     except Exception as e:
                         logger.error(f"Error processing webhook message: {e}")
@@ -3242,7 +3558,13 @@ async def start_sendblue_bot(handler: AgentHandler):
                         content,
                         attachments,
                     )
-                    await process_imessage_and_reply(handler, num, user_content)
+                    await process_imessage_and_reply(
+                        handler,
+                        num,
+                        user_content,
+                        message_handle=message_handle,
+                        part_index=_extract_sendblue_part_index(msg),
+                    )
             # Move checkpoint to poll start time to avoid gaps where messages
             # arrive while the previous batch is being processed.
             last_check = poll_started_at

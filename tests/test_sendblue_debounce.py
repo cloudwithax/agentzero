@@ -8,9 +8,11 @@ from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from integrations import _extract_sendblue_typing_state, _queue_sendblue_pending_message
+from integrations import _choose_sendblue_tapback_reaction
 from integrations import _extract_sendblue_sender_number
 from integrations import _extract_webhook_type_urls, process_imessage_and_reply
 from integrations import _format_sendblue_message_content, send_imessage
+from integrations import _maybe_send_random_sendblue_tapback, send_reaction
 from integrations import _split_outbound_message_chunks
 from integrations import _is_sendblue_message_unread
 from integrations import handle_imessage, pending_prompt_phone_numbers
@@ -51,6 +53,18 @@ def test_sender_number_extraction_priority() -> None:
         == "+19175550000"
     )
     assert _extract_sendblue_sender_number({}) == ""
+
+
+def test_choose_sendblue_tapback_reaction_is_contextual() -> None:
+    """Tapback selection should map common intents to relevant reactions."""
+    with patch("integrations.random.choice", side_effect=lambda options: options[0]):
+        assert _choose_sendblue_tapback_reaction("lol that is hilarious") == "laugh"
+        assert (
+            _choose_sendblue_tapback_reaction("Can you send that over?") == "question"
+        )
+        assert _choose_sendblue_tapback_reaction("thanks, that works great") == "like"
+        assert _choose_sendblue_tapback_reaction("/start") is None
+        assert _choose_sendblue_tapback_reaction("plain status update") is None
 
 
 def test_extract_webhook_type_urls_for_typing_indicator() -> None:
@@ -176,6 +190,115 @@ async def test_send_imessage_normalizes_content_before_send() -> None:
     assert result.get("success") is True
     assert fake_session.payload is not None
     assert fake_session.payload.get("content") == "line one\r\rline two"
+
+
+async def test_send_reaction_posts_expected_payload() -> None:
+    """send_reaction should call Sendblue reactions endpoint with message handle."""
+
+    class _FakeResponse:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, _exc_type, _exc, _tb):
+            return False
+
+        async def json(self, content_type=None):
+            return {"status": "OK", "message": "Reaction request sent"}
+
+    class _FakeSession:
+        def __init__(self):
+            self.url = None
+            self.payload = None
+
+        def post(self, url: str, json=None, headers=None):
+            self.url = url
+            self.payload = json
+            return _FakeResponse()
+
+    previous_api_key = os.environ.get("SENDBLUE_API_KEY")
+    previous_api_secret = os.environ.get("SENDBLUE_API_SECRET")
+    previous_number = os.environ.get("SENDBLUE_NUMBER")
+
+    os.environ["SENDBLUE_API_KEY"] = "test-key"
+    os.environ["SENDBLUE_API_SECRET"] = "test-secret"
+    os.environ["SENDBLUE_NUMBER"] = "+15550001111"
+
+    fake_session = _FakeSession()
+    try:
+        result = await send_reaction(
+            message_handle="abc-123",
+            reaction="laugh",
+            part_index=1,
+            session=fake_session,
+        )
+    finally:
+        if previous_api_key is None:
+            os.environ.pop("SENDBLUE_API_KEY", None)
+        else:
+            os.environ["SENDBLUE_API_KEY"] = previous_api_key
+
+        if previous_api_secret is None:
+            os.environ.pop("SENDBLUE_API_SECRET", None)
+        else:
+            os.environ["SENDBLUE_API_SECRET"] = previous_api_secret
+
+        if previous_number is None:
+            os.environ.pop("SENDBLUE_NUMBER", None)
+        else:
+            os.environ["SENDBLUE_NUMBER"] = previous_number
+
+    assert result.get("success") is True
+    assert fake_session.url == "https://api.sendblue.com/api/send-reaction"
+    assert fake_session.payload == {
+        "from_number": "+15550001111",
+        "message_handle": "abc-123",
+        "reaction": "laugh",
+        "part_index": 1,
+    }
+
+
+async def test_auto_tapback_sends_when_relevant_and_random_passes() -> None:
+    """Auto tapback should react when the message is relevant and random gate passes."""
+    previous_enabled = os.environ.get("SENDBLUE_AUTO_TAPBACK_ENABLED")
+    previous_probability = os.environ.get("SENDBLUE_TAPBACK_PROBABILITY")
+
+    os.environ["SENDBLUE_AUTO_TAPBACK_ENABLED"] = "1"
+    os.environ["SENDBLUE_TAPBACK_PROBABILITY"] = "1"
+
+    try:
+        with (
+            patch(
+                "integrations.send_reaction",
+                new=AsyncMock(return_value={"success": True}),
+            ) as send_reaction_mock,
+            patch("integrations.random.choice", side_effect=lambda options: options[0]),
+            patch("integrations.random.random", return_value=0.0),
+        ):
+            result = await _maybe_send_random_sendblue_tapback(
+                "+15551234567",
+                "lol this made my day",
+                "handle-42",
+                0,
+                session=object(),
+            )
+    finally:
+        if previous_enabled is None:
+            os.environ.pop("SENDBLUE_AUTO_TAPBACK_ENABLED", None)
+        else:
+            os.environ["SENDBLUE_AUTO_TAPBACK_ENABLED"] = previous_enabled
+
+        if previous_probability is None:
+            os.environ.pop("SENDBLUE_TAPBACK_PROBABILITY", None)
+        else:
+            os.environ["SENDBLUE_TAPBACK_PROBABILITY"] = previous_probability
+
+    assert result is not None
+    assert result.get("success") is True
+    assert send_reaction_mock.await_count == 1
+    assert send_reaction_mock.await_args.kwargs.get("message_handle") == "handle-42"
+    assert send_reaction_mock.await_args.kwargs.get("reaction") == "laugh"
 
 
 async def test_send_imessage_sends_explicit_message_blocks_separately() -> None:
@@ -557,7 +680,13 @@ async def test_attachment_then_text_are_coalesced() -> None:
     pending_lock = asyncio.Lock()
     calls: list[tuple[str, str, list[str]]] = []
 
-    async def process_callback(sender: str, text: str, attachments: list[str]) -> None:
+    async def process_callback(
+        sender: str,
+        text: str,
+        attachments: list[str],
+        _message_handle: str | None,
+        _part_index: int | None,
+    ) -> None:
         calls.append((sender, text, attachments))
 
     sender = "+15551234567"
@@ -598,7 +727,13 @@ async def test_typing_event_extends_existing_debounce() -> None:
     pending_lock = asyncio.Lock()
     calls: list[tuple[str, str, list[str]]] = []
 
-    async def process_callback(sender: str, text: str, attachments: list[str]) -> None:
+    async def process_callback(
+        sender: str,
+        text: str,
+        attachments: list[str],
+        _message_handle: str | None,
+        _part_index: int | None,
+    ) -> None:
         calls.append((sender, text, attachments))
 
     sender = "+15557654321"
@@ -640,7 +775,11 @@ async def test_typing_event_without_pending_message_is_ignored() -> None:
     pending_lock = asyncio.Lock()
 
     async def process_callback(
-        _sender: str, _text: str, _attachments: list[str]
+        _sender: str,
+        _text: str,
+        _attachments: list[str],
+        _message_handle: str | None,
+        _part_index: int | None,
     ) -> None:
         raise AssertionError("Callback should not run")
 
@@ -721,6 +860,7 @@ async def main() -> int:
     test_documented_typing_payload_parsing()
     test_typing_event_fallback_parsing()
     test_sender_number_extraction_priority()
+    test_choose_sendblue_tapback_reaction_is_contextual()
     test_extract_webhook_type_urls_for_typing_indicator()
     test_extract_webhook_type_urls_for_receive()
     test_sendblue_message_formatting_prefers_carriage_returns()
@@ -728,6 +868,8 @@ async def main() -> int:
     test_split_outbound_message_chunks_ignores_typing_directives()
     test_sendblue_unread_detection()
     await test_send_imessage_normalizes_content_before_send()
+    await test_send_reaction_posts_expected_payload()
+    await test_auto_tapback_sends_when_relevant_and_random_passes()
     await test_send_imessage_sends_explicit_message_blocks_separately()
     await test_send_imessage_typing_directive_triggers_indicator()
     await test_imessage_start_and_setprompt_flow()
