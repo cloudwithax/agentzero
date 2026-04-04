@@ -9,10 +9,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from integrations import _extract_sendblue_typing_state, _queue_sendblue_pending_message
 from integrations import _choose_sendblue_tapback_reaction
+from integrations import _is_sendblue_invalid_typing_webhook_type_error
 from integrations import _extract_sendblue_sender_number
 from integrations import _extract_webhook_type_urls, process_imessage_and_reply
 from integrations import _format_sendblue_message_content, send_imessage
-from integrations import _maybe_send_random_sendblue_tapback, send_reaction
+from integrations import (
+    _maybe_send_random_sendblue_tapback,
+    get_imessages,
+    monitor_sendblue_typing_webhook,
+    send_reaction,
+)
 from integrations import _split_outbound_message_chunks
 from integrations import _is_sendblue_message_unread
 from integrations import handle_imessage, pending_prompt_phone_numbers
@@ -85,6 +91,22 @@ def test_extract_webhook_type_urls_for_receive() -> None:
     hooks = {"receive": [{"url": "https://example.com/webhook/receive"}]}
     urls = _extract_webhook_type_urls(hooks, "receive")
     assert urls == {"https://example.com/webhook/receive"}
+
+
+def test_detect_invalid_sendblue_typing_webhook_type_error() -> None:
+    """The monitor should recognize unrecoverable typing_indicator webhook errors."""
+    assert _is_sendblue_invalid_typing_webhook_type_error(
+        {
+            "status": 400,
+            "data": {
+                "status": "ERROR",
+                "message": ("Invalid webhook type. Must be one of: receive, call_log"),
+            },
+        }
+    )
+    assert not _is_sendblue_invalid_typing_webhook_type_error(
+        {"status": 500, "error": "temporary error"}
+    )
 
 
 def test_sendblue_message_formatting_prefers_carriage_returns() -> None:
@@ -257,6 +279,106 @@ async def test_send_reaction_posts_expected_payload() -> None:
         "reaction": "laugh",
         "part_index": 1,
     }
+
+
+async def test_get_imessages_uses_created_at_gte_filter() -> None:
+    """Startup replay should query Sendblue with the documented created_at_gte filter."""
+
+    class _FakeResponse:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, _exc_type, _exc, _tb):
+            return False
+
+        async def json(self):
+            return {"status": "OK", "data": []}
+
+    class _FakeSession:
+        def __init__(self):
+            self.params = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, _exc_type, _exc, _tb):
+            return False
+
+        def get(self, _url: str, params=None, headers=None):
+            self.params = params
+            return _FakeResponse()
+
+    previous_api_key = os.environ.get("SENDBLUE_API_KEY")
+    previous_api_secret = os.environ.get("SENDBLUE_API_SECRET")
+    os.environ["SENDBLUE_API_KEY"] = "test-key"
+    os.environ["SENDBLUE_API_SECRET"] = "test-secret"
+
+    fake_session = _FakeSession()
+    try:
+        with patch("integrations.aiohttp.ClientSession", return_value=fake_session):
+            result = await get_imessages(
+                phone_number="+15551234567",
+                last_check=datetime(2026, 4, 4, 12, 0, 0),
+            )
+    finally:
+        if previous_api_key is None:
+            os.environ.pop("SENDBLUE_API_KEY", None)
+        else:
+            os.environ["SENDBLUE_API_KEY"] = previous_api_key
+
+        if previous_api_secret is None:
+            os.environ.pop("SENDBLUE_API_SECRET", None)
+        else:
+            os.environ["SENDBLUE_API_SECRET"] = previous_api_secret
+
+    assert result.get("success") is True
+    assert fake_session.params is not None
+    assert fake_session.params.get("number") == "+15551234567"
+    assert fake_session.params.get("created_at_gte") == "2026-04-04T12:00:00"
+    assert "after" not in fake_session.params
+
+
+async def test_typing_webhook_monitor_disables_on_invalid_type() -> None:
+    """Typing webhook monitor should stop retrying when Sendblue rejects the type."""
+    previous_url = os.environ.get("SENDBLUE_TYPING_WEBHOOK_URL")
+    previous_interval = os.environ.get("SENDBLUE_WEBHOOK_CHECK_INTERVAL")
+
+    os.environ["SENDBLUE_TYPING_WEBHOOK_URL"] = "https://example.com/webhook/typing"
+    os.environ["SENDBLUE_WEBHOOK_CHECK_INTERVAL"] = "10"
+
+    try:
+        with (
+            patch(
+                "integrations.ensure_sendblue_typing_webhook",
+                new=AsyncMock(
+                    return_value={
+                        "success": False,
+                        "status": 400,
+                        "data": {
+                            "status": "ERROR",
+                            "message": "Invalid webhook type. Must be one of: receive",
+                        },
+                    }
+                ),
+            ) as ensure_mock,
+            patch("integrations.asyncio.sleep", new=AsyncMock()) as sleep_mock,
+        ):
+            await monitor_sendblue_typing_webhook()
+    finally:
+        if previous_url is None:
+            os.environ.pop("SENDBLUE_TYPING_WEBHOOK_URL", None)
+        else:
+            os.environ["SENDBLUE_TYPING_WEBHOOK_URL"] = previous_url
+
+        if previous_interval is None:
+            os.environ.pop("SENDBLUE_WEBHOOK_CHECK_INTERVAL", None)
+        else:
+            os.environ["SENDBLUE_WEBHOOK_CHECK_INTERVAL"] = previous_interval
+
+    assert ensure_mock.await_count == 1
+    assert sleep_mock.await_count == 0
 
 
 async def test_auto_tapback_sends_when_relevant_and_random_passes() -> None:

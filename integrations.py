@@ -2772,7 +2772,7 @@ async def get_imessages(
     if phone_number:
         params["number"] = phone_number
     if last_check:
-        params["after"] = last_check.isoformat()
+        params["created_at_gte"] = last_check.isoformat()
 
     async with aiohttp.ClientSession() as session:
         async with session.get(
@@ -2916,6 +2916,26 @@ def _extract_webhook_type_urls(hooks: Any, webhook_type: str) -> set:
     return urls
 
 
+def _is_sendblue_invalid_typing_webhook_type_error(result: dict[str, Any]) -> bool:
+    """Detect API variants that reject typing_indicator webhook registration."""
+    if not isinstance(result, dict):
+        return False
+
+    data = result.get("data")
+    message = ""
+    if isinstance(data, dict):
+        raw_message = data.get("message") or data.get("error_message")
+        if isinstance(raw_message, str):
+            message = raw_message.strip().lower()
+
+    if not message:
+        raw_error = result.get("error")
+        if isinstance(raw_error, str):
+            message = raw_error.strip().lower()
+
+    return "invalid webhook type" in message and "typing_indicator" in message
+
+
 async def ensure_sendblue_receive_webhook(
     webhook_url: str, session: Optional[aiohttp.ClientSession] = None
 ) -> dict:
@@ -3019,6 +3039,11 @@ async def monitor_sendblue_typing_webhook(webhook_url: Optional[str] = None) -> 
     while True:
         try:
             result = await ensure_sendblue_typing_webhook(target_url)
+            if _is_sendblue_invalid_typing_webhook_type_error(result):
+                logger.warning(
+                    "Sendblue typing webhook registration is rejected by the current API/account; disabling typing webhook monitor"
+                )
+                return
             if not result.get("success"):
                 logger.error(
                     "Sendblue typing webhook check failed: %s",
