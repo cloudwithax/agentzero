@@ -234,6 +234,24 @@ def infer_tool_calls_from_content(content: str) -> list[dict[str, Any]]:
     return _parse_json_tool_calls_blob(content)
 
 
+def _extract_allowed_tool_names(payload: dict[str, Any]) -> set[str]:
+    """Extract allowed tool names from a payload's declared tool schema."""
+    allowed: set[str] = set()
+    for tool in payload.get("tools", []):
+        if not isinstance(tool, dict):
+            continue
+
+        function_obj = tool.get("function", {})
+        if not isinstance(function_obj, dict):
+            continue
+
+        name = function_obj.get("name")
+        if isinstance(name, str) and name:
+            allowed.add(name)
+
+    return allowed
+
+
 async def api_call_with_retry(
     session: aiohttp.ClientSession,
     url: str,
@@ -295,7 +313,10 @@ async def api_call_with_retry(
     return {"error": {"message": "Max retries exceeded"}}
 
 
-async def execute_tool_calls(message: dict[str, Any]) -> list[dict[str, Any]]:
+async def execute_tool_calls(
+    message: dict[str, Any],
+    allowed_tool_names: set[str] | None = None,
+) -> list[dict[str, Any]]:
     """Execute tool calls from a message and return results."""
     tool_results = []
 
@@ -303,6 +324,21 @@ async def execute_tool_calls(message: dict[str, Any]) -> list[dict[str, Any]]:
     for tool_call in message.get("tool_calls", []):
         func_name = tool_call["function"]["name"]
         func_args = json.loads(tool_call["function"]["arguments"])
+
+        if allowed_tool_names is not None and func_name not in allowed_tool_names:
+            tool_results.append(
+                {
+                    "tool_call_id": tool_call["id"],
+                    "role": "tool",
+                    "content": json.dumps(
+                        {
+                            "success": False,
+                            "error": f"Tool not available in current payload: {func_name}",
+                        }
+                    ),
+                }
+            )
+            continue
 
         # Validate the tool call arguments
         is_valid, error = validate_tool_args(func_name, func_args)
@@ -377,7 +413,11 @@ async def process_response(
         # Keep processing tool calls until there are none
         while "tool_calls" in message and message["tool_calls"]:
             # Execute tool calls
-            tool_results = await execute_tool_calls(message)
+            allowed_tool_names = _extract_allowed_tool_names(base_payload)
+            tool_results = await execute_tool_calls(
+                message,
+                allowed_tool_names=allowed_tool_names,
+            )
 
             # Build conversation history
             messages.append(message)

@@ -3,12 +3,16 @@
 
 import asyncio
 import os
+from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, Mock, patch
 
 from integrations import (
+    _backfill_untranscribed_voice_memo_conversations,
     _append_voice_memo_transcripts,
+    _extract_voice_memo_failure_urls_from_content,
     _is_native_imessage_m4a,
+    _remove_voice_memo_failure_block,
     _split_voice_memo_attachments,
     _transcribe_audio_bytes_with_whisper,
     _transcribe_sendblue_voice_memos,
@@ -46,6 +50,29 @@ def test_append_voice_memo_transcripts_with_failures() -> None:
     assert "2. hello from memo two" in merged
     assert "[Voice memo attachments not transcribed]" in merged
     assert "https://cdn.example/voice-3.opus" in merged
+
+
+def test_extract_and_remove_voice_memo_failure_block() -> None:
+    """Extract unresolved URLs and strip failure markers from stored content."""
+    content = (
+        "Need this transcribed\n\n"
+        "[Voice memo attachments not transcribed]\n"
+        "- https://cdn.example/voice-1.caf\n"
+        "- https://cdn.example/voice-2.caf\n\n"
+        "[Image attachments]\n"
+        "- https://cdn.example/photo.png"
+    )
+
+    extracted_urls = _extract_voice_memo_failure_urls_from_content(content)
+    assert extracted_urls == [
+        "https://cdn.example/voice-1.caf",
+        "https://cdn.example/voice-2.caf",
+    ]
+
+    cleaned = _remove_voice_memo_failure_block(content)
+    assert "[Voice memo attachments not transcribed]" not in cleaned
+    assert "https://cdn.example/voice-1.caf" not in cleaned
+    assert "https://cdn.example/photo.png" in cleaned
 
 
 def test_is_native_imessage_m4a_detects_common_signatures() -> None:
@@ -117,6 +144,83 @@ async def test_transcribe_sendblue_voice_memos_respects_disable_flag() -> None:
         "https://cdn.example/voice-1.opus",
         "https://cdn.example/photo.png",
     ]
+
+
+async def test_backfill_untranscribed_voice_memos_updates_conversation_content() -> None:
+    """Backfill should retry unresolved URLs and write transcripts into conversation content."""
+    previous_enabled = os.environ.get("SENDBLUE_VOICE_MEMO_TRANSCRIPTION_ENABLED")
+    previous_backfill = os.environ.get("SENDBLUE_VOICE_MEMO_BACKFILL_ON_STARTUP")
+    previous_limit = os.environ.get("SENDBLUE_VOICE_MEMO_BACKFILL_LIMIT")
+    os.environ["SENDBLUE_VOICE_MEMO_TRANSCRIPTION_ENABLED"] = "1"
+    os.environ["SENDBLUE_VOICE_MEMO_BACKFILL_ON_STARTUP"] = "1"
+    os.environ["SENDBLUE_VOICE_MEMO_BACKFILL_LIMIT"] = "5"
+
+    class _FakeMemoryStore:
+        def __init__(self) -> None:
+            self.updated_rows: dict[int, str] = {}
+
+        def get_conversation_messages_with_untranscribed_voice_memos(
+            self, limit: int = 50
+        ) -> list[dict[str, Any]]:
+            assert limit == 5
+            return [
+                {
+                    "id": 42,
+                    "content": (
+                        "[Voice memo attachments not transcribed]\n"
+                        "- https://cdn.example/voice-1.caf\n"
+                        "- https://cdn.example/voice-2.caf"
+                    ),
+                }
+            ]
+
+        def update_conversation_message_content(
+            self,
+            message_id: int,
+            content: str,
+            metadata: dict[str, Any] | None = None,
+        ) -> bool:
+            self.updated_rows[message_id] = content
+            return True
+
+    fake_store = _FakeMemoryStore()
+    handler = SimpleNamespace(memory_store=fake_store)
+
+    try:
+        with patch(
+            "integrations._transcribe_voice_memo_attachment_url",
+            new=AsyncMock(side_effect=["Recovered transcript", None]),
+        ):
+            result = await _backfill_untranscribed_voice_memo_conversations(
+                cast(Any, handler)
+            )
+    finally:
+        if previous_enabled is None:
+            os.environ.pop("SENDBLUE_VOICE_MEMO_TRANSCRIPTION_ENABLED", None)
+        else:
+            os.environ["SENDBLUE_VOICE_MEMO_TRANSCRIPTION_ENABLED"] = previous_enabled
+
+        if previous_backfill is None:
+            os.environ.pop("SENDBLUE_VOICE_MEMO_BACKFILL_ON_STARTUP", None)
+        else:
+            os.environ["SENDBLUE_VOICE_MEMO_BACKFILL_ON_STARTUP"] = previous_backfill
+
+        if previous_limit is None:
+            os.environ.pop("SENDBLUE_VOICE_MEMO_BACKFILL_LIMIT", None)
+        else:
+            os.environ["SENDBLUE_VOICE_MEMO_BACKFILL_LIMIT"] = previous_limit
+
+    assert result["scanned"] == 1
+    assert result["updated"] == 1
+    assert result["transcripts_added"] == 1
+    assert result["still_unresolved"] == 1
+
+    updated_content = fake_store.updated_rows[42]
+    assert "[Voice memo transcript]" in updated_content
+    assert "Recovered transcript" in updated_content
+    assert "https://cdn.example/voice-1.caf" not in updated_content
+    assert "https://cdn.example/voice-2.caf" in updated_content
+    assert "[Voice memo attachments not transcribed]" in updated_content
 
 
 async def test_transcribe_audio_bytes_retries_m4a_with_ffmpeg() -> None:
@@ -239,9 +343,11 @@ async def test_transcribe_audio_bytes_uses_parakeet_defaults() -> None:
 async def main() -> int:
     test_split_voice_memo_attachments_detects_audio_urls()
     test_append_voice_memo_transcripts_with_failures()
+    test_extract_and_remove_voice_memo_failure_block()
     test_is_native_imessage_m4a_detects_common_signatures()
     await test_transcribe_sendblue_voice_memos_merges_and_filters()
     await test_transcribe_sendblue_voice_memos_respects_disable_flag()
+    await test_backfill_untranscribed_voice_memos_updates_conversation_content()
     await test_transcribe_audio_bytes_retries_m4a_with_ffmpeg()
     await test_transcribe_audio_bytes_retries_caf_with_ffmpeg()
     await test_transcribe_audio_bytes_uses_parakeet_defaults()

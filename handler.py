@@ -1,11 +1,13 @@
 """Main handler and chat loop for the agent."""
 
+import asyncio
 import aiohttp
 import datetime
 import json
 import logging
 import os
 import re
+import uuid
 from difflib import SequenceMatcher
 from typing import Any, Awaitable, Callable, Optional
 
@@ -14,6 +16,7 @@ from capabilities import CapabilityProfile, AdaptiveFormatter
 from examples import AdaptiveFewShotManager
 from planning import TaskType, TaskPlanner, TaskAnalyzer
 from api import api_call_with_retry, process_response
+from tools import set_consortium_controller
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +38,39 @@ def _content_to_text(content: Any) -> str:
         return "\n".join(part for part in parts if part).strip()
 
     return "" if content is None else str(content)
+
+
+def _build_consortium_agree_tool_schema() -> dict[str, Any]:
+    """Build internal-only tool schema used by consortium members."""
+    return {
+        "type": "function",
+        "function": {
+            "name": "consortium_agree",
+            "description": "Signal that a consortium member agrees on the final verdict",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "verdict": {
+                        "type": "string",
+                        "description": "Final verdict proposed by this member",
+                    },
+                    "rationale": {
+                        "type": "string",
+                        "description": "Short reasoning for the verdict",
+                    },
+                    "confidence": {
+                        "type": "number",
+                        "description": "Confidence from 0 to 1",
+                    },
+                    "key_points": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional bullet points supporting agreement",
+                    },
+                },
+            },
+        },
+    }
 
 
 # Configuration
@@ -381,28 +417,57 @@ BASE_PAYLOAD = {
         {
             "type": "function",
             "function": {
-                "name": "consortium_agree",
-                "description": "Signal that a consortium member agrees on the final verdict",
+                "name": "consortium_start",
+                "description": "Start a consortium-mode task in the background",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "verdict": {
+                        "task": {
                             "type": "string",
-                            "description": "Final verdict proposed by this member",
+                            "description": "The user request or task prompt to send to consortium mode",
                         },
-                        "rationale": {
+                        "task_id": {
                             "type": "string",
-                            "description": "Short reasoning for the verdict",
+                            "description": "Optional task identifier. If omitted, one is generated",
                         },
-                        "confidence": {
-                            "type": "number",
-                            "description": "Confidence from 0 to 1",
+                    },
+                    "required": ["task"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "consortium_stop",
+                "description": "Stop a running consortium-mode task",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {
+                            "type": "string",
+                            "description": "The consortium task identifier",
                         },
-                        "key_points": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Optional bullet points supporting agreement",
+                        "reason": {
+                            "type": "string",
+                            "description": "Optional reason for stopping the task",
                         },
+                    },
+                    "required": ["task_id"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "consortium_status",
+                "description": "Check status for one consortium task or all consortium tasks",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {
+                            "type": "string",
+                            "description": "Optional task identifier. If omitted, returns all tasks",
+                        }
                     },
                 },
             },
@@ -413,6 +478,16 @@ BASE_PAYLOAD = {
 CONSORTIUM_CONTACT_MESSAGE = "contacting the consortium to decide your verdict"
 CONSORTIUM_COMPLETION_MESSAGE = "the consortium has reached an agreement."
 CONSORTIUM_MAX_ROUNDS = 4
+IMESSAGE_SYSTEM_PROMPT_SUFFIX = (
+    '"The person is using iMessage. A phone screen shows about 6-8 sentences at a time. '
+    "For simple questions, you will answer in 1-2 sentences. For how-to questions, a short "
+    "list with no intro. For substantive topics, 2-3 short paragraphs - roughly one screenful. "
+    "For complex questions, you should keep it under two screenfuls. You will always lead with "
+    "the answer. No preamble, no restating the question, no filler. If the answer is naturally "
+    "list-shaped - benefits and precautions, a checklist, a comparison - keep it as a short "
+    "list. Lists scan faster than prose on a small screen. These are defaults - if the person "
+    'asks to go deeper or explain fully, you will respond at whatever length the topic needs."'
+)
 
 AUTO_MEMORY_ENABLED = os.environ.get("AUTO_MEMORY_ENABLED", "1").strip() != "0"
 AUTO_MEMORY_MIN_MESSAGES_PER_MEMORY = max(
@@ -431,6 +506,22 @@ AUTO_MEMORY_TARGET_MESSAGES_PER_MEMORY = min(
 )
 AUTO_MEMORY_DEDUPE_THRESHOLD = max(
     0.7, min(0.99, float(os.environ.get("AUTO_MEMORY_DEDUPE_THRESHOLD", "0.9")))
+)
+
+CROSS_CHANNEL_CONTEXT_ENABLED = (
+    os.environ.get("CROSS_CHANNEL_CONTEXT_ENABLED", "1").strip() != "0"
+)
+CROSS_CHANNEL_CONTEXT_DEFAULT_MESSAGES = max(
+    2,
+    int(os.environ.get("CROSS_CHANNEL_CONTEXT_DEFAULT_MESSAGES", "12")),
+)
+CROSS_CHANNEL_CONTEXT_MAX_MESSAGES = max(
+    CROSS_CHANNEL_CONTEXT_DEFAULT_MESSAGES,
+    int(os.environ.get("CROSS_CHANNEL_CONTEXT_MAX_MESSAGES", "40")),
+)
+CROSS_CHANNEL_SESSION_LOOKUP_LIMIT = max(
+    1,
+    int(os.environ.get("CROSS_CHANNEL_SESSION_LOOKUP_LIMIT", "10")),
 )
 
 DREAM_MODE_ENABLED = os.environ.get("MEMORY_DREAM_ENABLED", "1").strip() != "0"
@@ -511,6 +602,238 @@ class AgentHandler:
         self.task_planner = task_planner
         self.task_analyzer = task_analyzer
         self.adaptive_formatter = adaptive_formatter
+        self._consortium_tasks: dict[str, dict[str, Any]] = {}
+        self._consortium_tasks_lock = asyncio.Lock()
+        set_consortium_controller(self)
+
+    def _utc_timestamp(self) -> str:
+        """Return UTC timestamp with second precision."""
+        return datetime.datetime.now(datetime.timezone.utc).isoformat(
+            timespec="seconds"
+        )
+
+    def _normalize_consortium_task_id(self, task_id: Optional[str]) -> str:
+        """Normalize task IDs to safe characters used in API/tool results."""
+        if task_id is None:
+            return ""
+
+        normalized = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(task_id).strip())
+        normalized = normalized.strip("_")
+        return normalized[:80]
+
+    def _generate_consortium_task_id(self) -> str:
+        """Generate a unique consortium task ID."""
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+        return f"consortium_task_{stamp}_{uuid.uuid4().hex[:8]}"
+
+    def _consortium_task_snapshot(self, entry: dict[str, Any]) -> dict[str, Any]:
+        """Return a public-safe consortium task snapshot."""
+        runner_task = entry.get("runner_task")
+        is_running = isinstance(runner_task, asyncio.Task) and not runner_task.done()
+
+        return {
+            "task_id": entry.get("task_id", ""),
+            "task": entry.get("task", ""),
+            "status": entry.get("status", "unknown"),
+            "created_at": entry.get("created_at"),
+            "updated_at": entry.get("updated_at"),
+            "completed_at": entry.get("completed_at"),
+            "running": is_running,
+            "cancel_reason": entry.get("cancel_reason", ""),
+            "error": entry.get("error", ""),
+            "result": entry.get("result", ""),
+        }
+
+    async def _update_consortium_task(self, task_id: str, **updates: Any) -> None:
+        """Apply updates to a consortium task if it still exists."""
+        async with self._consortium_tasks_lock:
+            task = self._consortium_tasks.get(task_id)
+            if task is None:
+                return
+
+            task.update(updates)
+            task["updated_at"] = self._utc_timestamp()
+
+    async def _execute_consortium_task(self, task_id: str, user_query: str) -> None:
+        """Run one consortium task to completion in the background."""
+        try:
+            custom_prompt = self.memory_store.get_system_prompt() or ""
+            async with aiohttp.ClientSession() as session:
+                result = await self._run_consortium_mode(
+                    user_query=user_query,
+                    session=session,
+                    custom_prompt=custom_prompt,
+                    memory_context="",
+                )
+
+            completion_time = self._utc_timestamp()
+            await self._update_consortium_task(
+                task_id,
+                status="completed",
+                completed_at=completion_time,
+                result=result,
+                error="",
+            )
+        except asyncio.CancelledError:
+            cancel_reason = "Stopped by request"
+            async with self._consortium_tasks_lock:
+                task = self._consortium_tasks.get(task_id)
+                if task and str(task.get("cancel_reason", "")).strip():
+                    cancel_reason = str(task.get("cancel_reason")).strip()
+
+            completion_time = self._utc_timestamp()
+            await self._update_consortium_task(
+                task_id,
+                status="stopped",
+                completed_at=completion_time,
+                cancel_reason=cancel_reason,
+                error="",
+            )
+            raise
+        except Exception as exc:
+            logger.exception("Consortium task %s failed", task_id)
+            completion_time = self._utc_timestamp()
+            await self._update_consortium_task(
+                task_id,
+                status="failed",
+                completed_at=completion_time,
+                error=str(exc),
+            )
+
+    async def start_consortium_task(
+        self, task: str, task_id: Optional[str] = None
+    ) -> dict[str, Any]:
+        """Start a new consortium task and return its initial status."""
+        task_text = str(task or "").strip()
+        if not task_text:
+            return {"success": False, "error": "task must be a non-empty string"}
+
+        normalized_task_id = self._normalize_consortium_task_id(task_id)
+        if task_id and not normalized_task_id:
+            return {
+                "success": False,
+                "error": "task_id must include letters, numbers, '-' or '_'",
+            }
+
+        if not normalized_task_id:
+            normalized_task_id = self._generate_consortium_task_id()
+
+        async with self._consortium_tasks_lock:
+            if normalized_task_id in self._consortium_tasks:
+                return {
+                    "success": False,
+                    "error": f"Task already exists: {normalized_task_id}",
+                }
+
+            now = self._utc_timestamp()
+            runner_task = asyncio.create_task(
+                self._execute_consortium_task(
+                    task_id=normalized_task_id,
+                    user_query=task_text,
+                )
+            )
+
+            self._consortium_tasks[normalized_task_id] = {
+                "task_id": normalized_task_id,
+                "task": task_text,
+                "status": "running",
+                "created_at": now,
+                "updated_at": now,
+                "completed_at": None,
+                "cancel_reason": "",
+                "error": "",
+                "result": "",
+                "runner_task": runner_task,
+            }
+            snapshot = self._consortium_task_snapshot(
+                self._consortium_tasks[normalized_task_id]
+            )
+
+        return {
+            "success": True,
+            "message": f"Started consortium task {normalized_task_id}",
+            "task": snapshot,
+        }
+
+    async def stop_consortium_task(
+        self, task_id: str, reason: str = ""
+    ) -> dict[str, Any]:
+        """Stop a running consortium task."""
+        normalized_task_id = self._normalize_consortium_task_id(task_id)
+        if not normalized_task_id:
+            return {"success": False, "error": "task_id is required"}
+
+        async with self._consortium_tasks_lock:
+            task = self._consortium_tasks.get(normalized_task_id)
+            if task is None:
+                return {
+                    "success": False,
+                    "error": f"Task not found: {normalized_task_id}",
+                }
+
+            runner_task = task.get("runner_task")
+            status = str(task.get("status", ""))
+            if status in {"completed", "failed", "stopped"} or not isinstance(
+                runner_task, asyncio.Task
+            ):
+                return {
+                    "success": True,
+                    "message": f"Task {normalized_task_id} is already {status or 'finished'}",
+                    "task": self._consortium_task_snapshot(task),
+                }
+
+            task["status"] = "stopping"
+            task["cancel_reason"] = (
+                str(reason).strip() if str(reason).strip() else "Stopped by request"
+            )
+            task["updated_at"] = self._utc_timestamp()
+            snapshot = self._consortium_task_snapshot(task)
+
+        if isinstance(runner_task, asyncio.Task) and not runner_task.done():
+            runner_task.cancel()
+
+        return {
+            "success": True,
+            "message": f"Stopping consortium task {normalized_task_id}",
+            "task": snapshot,
+        }
+
+    async def get_consortium_task_status(
+        self, task_id: Optional[str] = None
+    ) -> dict[str, Any]:
+        """Get status for one consortium task or all consortium tasks."""
+        normalized_task_id = self._normalize_consortium_task_id(task_id)
+
+        async with self._consortium_tasks_lock:
+            if normalized_task_id:
+                task = self._consortium_tasks.get(normalized_task_id)
+                if task is None:
+                    return {
+                        "success": False,
+                        "error": f"Task not found: {normalized_task_id}",
+                    }
+
+                return {
+                    "success": True,
+                    "task": self._consortium_task_snapshot(task),
+                }
+
+            tasks = [
+                self._consortium_task_snapshot(task)
+                for task in self._consortium_tasks.values()
+            ]
+
+        tasks.sort(key=lambda item: item.get("created_at") or "", reverse=True)
+        running_count = sum(
+            1 for task in tasks if task.get("status") in {"running", "stopping"}
+        )
+
+        return {
+            "success": True,
+            "count": len(tasks),
+            "running_count": running_count,
+            "tasks": tasks,
+        }
 
     def _detect_consortium_contact_intent(self, user_query: str) -> tuple[bool, bool]:
         """Return (should_contact_consortium, is_confident) for routing decisions."""
@@ -644,6 +967,174 @@ class AgentHandler:
             return datetime.datetime.fromisoformat(candidate.replace(" ", "T"))
         except ValueError:
             return None
+
+    @staticmethod
+    def _normalize_channel_name(raw_channel: str) -> str:
+        """Normalize channel aliases to canonical values."""
+        normalized = re.sub(r"[^a-z]", "", (raw_channel or "").lower())
+        if normalized == "telegram":
+            return "telegram"
+        if normalized in {"imessage", "imsg"}:
+            return "imessage"
+        return ""
+
+    @staticmethod
+    def _channel_session_prefix(channel_name: str) -> str:
+        """Map canonical channel name to session ID prefix."""
+        if channel_name == "telegram":
+            return "tg_"
+        if channel_name == "imessage":
+            return "imessage_"
+        return ""
+
+    def _parse_cross_channel_recall_request(
+        self,
+        user_query: str,
+    ) -> Optional[dict[str, Any]]:
+        """Detect explicit cross-channel recall requests and parse options."""
+        if not CROSS_CHANNEL_CONTEXT_ENABLED or not user_query:
+            return None
+
+        normalized_query = re.sub(r"\s+", " ", user_query.strip().lower())
+        normalized_query = normalized_query.replace("’", "'")
+        if not normalized_query:
+            return None
+
+        match = re.search(
+            r"\b(?:remember|recall)\b[^.?!\n]{0,180}"
+            r"\bwhat\s+we(?:\s+[a-z']+){0,3}\s+"
+            r"(?:talk(?:ing|ed)|discuss(?:ing|ed))\s+about\b"
+            r"[^.?!\n]{0,120}\b(?:on|from)\s+(?:the\s+)?"
+            r"(?P<channel>i[\s-]?message|telegram)\b",
+            normalized_query,
+        )
+        if not match:
+            return None
+
+        channel_name = self._normalize_channel_name(match.group("channel"))
+        if not channel_name:
+            return None
+
+        message_limit = CROSS_CHANNEL_CONTEXT_DEFAULT_MESSAGES
+        limit_match = re.search(
+            r"\blast\s+(?P<count>\d{1,3})(?:\s*(?:messages?|msgs?))?\b",
+            normalized_query,
+        )
+        if not limit_match:
+            limit_match = re.search(
+                r"\b(?P<count>\d{1,3})\s*(?:messages?|msgs?)\b",
+                normalized_query,
+            )
+
+        if limit_match:
+            message_limit = int(limit_match.group("count"))
+
+        message_limit = max(1, min(CROSS_CHANNEL_CONTEXT_MAX_MESSAGES, message_limit))
+
+        return {
+            "channel": channel_name,
+            "limit": message_limit,
+        }
+
+    def _resolve_cross_channel_session_id(
+        self,
+        current_session_id: Optional[str],
+        channel_name: str,
+    ) -> Optional[str]:
+        """Resolve which session to use for a requested channel recall."""
+        session_prefix = self._channel_session_prefix(channel_name)
+        if not session_prefix:
+            return None
+
+        if current_session_id and current_session_id.startswith(session_prefix):
+            return current_session_id
+
+        candidates = self.memory_store.get_recent_session_ids_by_prefix(
+            session_prefix,
+            limit=CROSS_CHANNEL_SESSION_LOOKUP_LIMIT,
+        )
+        if current_session_id:
+            candidates = [sid for sid in candidates if sid != current_session_id]
+
+        if not candidates:
+            return None
+
+        return candidates[0]
+
+    def _build_cross_channel_context(
+        self,
+        user_query: str,
+        session_id: Optional[str],
+    ) -> str:
+        """Build context block from recent channel-specific conversation messages."""
+        recall_request = self._parse_cross_channel_recall_request(user_query)
+        if not recall_request:
+            return ""
+
+        channel_name = str(recall_request.get("channel", "")).strip().lower()
+        message_limit = int(
+            recall_request.get("limit", CROSS_CHANNEL_CONTEXT_DEFAULT_MESSAGES)
+        )
+        session_prefix = self._channel_session_prefix(channel_name)
+        if not session_prefix:
+            return ""
+
+        source_session_id = self._resolve_cross_channel_session_id(
+            current_session_id=session_id,
+            channel_name=channel_name,
+        )
+        if not source_session_id:
+            return (
+                "\n\n"
+                f"[Cross-channel recall requested for {channel_name}, but no prior "
+                f"{channel_name} conversation history is available.]\n"
+            )
+
+        history = self.memory_store.get_recent_conversation_messages_for_prefix(
+            session_prefix=session_prefix,
+            limit=message_limit,
+            session_id=source_session_id,
+        )
+        if not history:
+            return (
+                "\n\n"
+                f"[Cross-channel recall requested for {channel_name}, but no messages "
+                "were found in the selected channel session.]\n"
+            )
+
+        lines: list[str] = []
+        for index, message in enumerate(reversed(history), start=1):
+            content = re.sub(
+                r"\s+",
+                " ",
+                _content_to_text(message.get("content", "")).strip(),
+            )
+            if not content:
+                continue
+
+            if len(content) > 320:
+                content = f"{content[:317]}..."
+
+            role = str(message.get("role", "assistant")).strip().lower()
+            if role not in {"user", "assistant", "system"}:
+                role = "assistant"
+
+            lines.append(f"{index}. {role}: {content}")
+
+        if not lines:
+            return (
+                "\n\n"
+                f"[Cross-channel recall requested for {channel_name}, but matching "
+                "messages were empty after normalization.]\n"
+            )
+
+        return (
+            "\n\n"
+            f"[Cross-channel context injected from {channel_name} "
+            f"({source_session_id}), last {len(lines)} messages]:\n"
+            + "\n".join(lines)
+            + "\n"
+        )
 
     @staticmethod
     def _normalize_memory_text(content: str) -> str:
@@ -1232,6 +1723,7 @@ class AgentHandler:
         memory_context: str,
         plan_context: str,
         example_context: str,
+        session_prompt_suffix: str = "",
     ) -> str:
         """Build the canonical system prompt used by the primary agent."""
         current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1242,14 +1734,19 @@ class AgentHandler:
             "If the user asks you to remember or store something, you MUST use the remember() tool.\n"
             "Use recall() to retrieve past memories.\n"
             "If you need access to current information not available to you, use the web_search() tool.\n"
+            "Use consortium_start() to launch a consortium task, consortium_status() to check progress/results, and consortium_stop() to cancel an active consortium task.\n"
             'For readability, you may split a reply into multiple chunks using <message>...</message> blocks. You may also insert <typing seconds="1.2"/> between message blocks to add brief pacing pauses. If you use this format, keep all user-visible text inside those message blocks.\n'
             "IMPORTANT: Do not use markdown formatting, code blocks, or emojis in your responses. Respond in plain text only.\n"
+        )
+        session_suffix = (
+            f"\n\n{session_prompt_suffix}\n" if session_prompt_suffix else ""
         )
 
         if custom_prompt:
             return (
                 custom_prompt
                 + universal_instructions
+                + session_suffix
                 + memory_context
                 + plan_context
                 + example_context
@@ -1257,8 +1754,14 @@ class AgentHandler:
 
         return (
             "You are a helpful AI assistant with persistent memory."
-            f"{universal_instructions}{memory_context}{plan_context}{example_context}"
+            f"{universal_instructions}{session_suffix}{memory_context}{plan_context}{example_context}"
         )
+
+    def _get_session_prompt_suffix(self, session_id: Optional[str]) -> str:
+        """Return channel-specific prompt guidance for the active session."""
+        if session_id and session_id.startswith("imessage_"):
+            return IMESSAGE_SYSTEM_PROMPT_SUFFIX
+        return ""
 
     async def _generate_consortium_acknowledgement(
         self,
@@ -1350,6 +1853,7 @@ class AgentHandler:
         round_number: int,
         custom_prompt: str,
         memory_context: str,
+        session_prompt_suffix: str,
     ) -> tuple[str, dict[str, Any] | None]:
         """Run one model turn in consortium mode."""
         system_parts = [
@@ -1379,6 +1883,9 @@ class AgentHandler:
         if custom_prompt:
             system_parts.append(f"User-configured system prompt: {custom_prompt}")
 
+        if session_prompt_suffix:
+            system_parts.append(session_prompt_suffix)
+
         if memory_context:
             system_parts.append(memory_context.strip())
 
@@ -1407,6 +1914,7 @@ class AgentHandler:
         payload = BASE_PAYLOAD.copy()
         payload["model"] = CONSORTIUM_MODEL_ID
         payload["temperature"] = member_temperature
+        payload["tools"] = [_build_consortium_agree_tool_schema()]
         payload["messages"] = member_messages
 
         response_data = await api_call_with_retry(
@@ -1435,6 +1943,7 @@ class AgentHandler:
         session: aiohttp.ClientSession,
         custom_prompt: str = "",
         memory_context: str = "",
+        session_prompt_suffix: str = "",
     ) -> str:
         """Run four-persona consortium debate and then judge synthesis."""
         transcript: list[dict[str, Any]] = []
@@ -1463,6 +1972,7 @@ class AgentHandler:
                         round_number=round_number,
                         custom_prompt=custom_prompt,
                         memory_context=memory_context,
+                        session_prompt_suffix=session_prompt_suffix,
                     )
                 except Exception as exc:
                     logger.exception(
@@ -1504,6 +2014,8 @@ class AgentHandler:
         ]
         if custom_prompt:
             judge_system_parts.append(f"User-configured system prompt: {custom_prompt}")
+        if session_prompt_suffix:
+            judge_system_parts.append(session_prompt_suffix)
         if memory_context:
             judge_system_parts.append(memory_context.strip())
 
@@ -1521,6 +2033,7 @@ class AgentHandler:
 
         judge_payload = BASE_PAYLOAD.copy()
         judge_payload["model"] = CONSORTIUM_MODEL_ID
+        judge_payload["tools"] = []
         judge_payload["messages"] = [
             {"role": "system", "content": "\n".join(judge_system_parts)},
             {"role": "user", "content": judge_user_prompt},
@@ -1641,6 +2154,17 @@ class AgentHandler:
             except Exception as e:
                 logger.warning(f"Failed to retrieve memories: {e}")
 
+        if user_query:
+            try:
+                cross_channel_context = self._build_cross_channel_context(
+                    user_query=user_query,
+                    session_id=session_id,
+                )
+                if cross_channel_context:
+                    memory_context += cross_channel_context
+            except Exception as e:
+                logger.warning(f"Failed to build cross-channel context: {e}")
+
         # Get few-shot examples for the task type
         few_shot_examples = []
         if task:
@@ -1652,6 +2176,7 @@ class AgentHandler:
 
         # Build system prompt with adaptive formatting
         custom_prompt = self.memory_store.get_system_prompt() or ""
+        session_prompt_suffix = self._get_session_prompt_suffix(session_id)
 
         # Add task plan context if available
         plan_context = ""
@@ -1674,6 +2199,7 @@ class AgentHandler:
             memory_context=memory_context,
             plan_context=plan_context,
             example_context=example_context,
+            session_prompt_suffix=session_prompt_suffix,
         )
 
         should_contact_consortium = False
@@ -1709,6 +2235,7 @@ class AgentHandler:
                     session=session,
                     custom_prompt=custom_prompt,
                     memory_context=memory_context,
+                    session_prompt_suffix=session_prompt_suffix,
                 )
 
                 if acknowledgement and not acknowledgement_delivered:

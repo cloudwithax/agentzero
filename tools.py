@@ -7,7 +7,7 @@ import os
 import re
 import subprocess
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Any, Optional
 
 import aiohttp
 
@@ -16,12 +16,19 @@ from memory import EnhancedMemoryStore
 
 # Initialize memory store (will be set from main module)
 memory_store: Optional[EnhancedMemoryStore] = None
+consortium_controller: Any = None
 
 
 def set_memory_store(store: EnhancedMemoryStore):
     """Set the memory store instance for tools to use."""
     global memory_store
     memory_store = store
+
+
+def set_consortium_controller(controller: Any):
+    """Set the consortium task controller used by consortium tools."""
+    global consortium_controller
+    consortium_controller = controller
 
 
 # File tools
@@ -380,6 +387,45 @@ async def memory_stats_tool():
         return {"success": False, "error": str(e)}
 
 
+async def consortium_start_tool(task: str, task_id: Optional[str] = None):
+    """Start a consortium task in the background."""
+    try:
+        if consortium_controller is None:
+            return {"success": False, "error": "Consortium controller not initialized"}
+
+        return await consortium_controller.start_consortium_task(
+            task=task,
+            task_id=task_id,
+        )
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+async def consortium_stop_tool(task_id: str, reason: str = ""):
+    """Stop a running consortium task."""
+    try:
+        if consortium_controller is None:
+            return {"success": False, "error": "Consortium controller not initialized"}
+
+        return await consortium_controller.stop_consortium_task(
+            task_id=task_id,
+            reason=reason,
+        )
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+async def consortium_status_tool(task_id: Optional[str] = None):
+    """Get status for one consortium task or all consortium tasks."""
+    try:
+        if consortium_controller is None:
+            return {"success": False, "error": "Consortium controller not initialized"}
+
+        return await consortium_controller.get_consortium_task_status(task_id=task_id)
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 async def consortium_agree_tool(
     verdict: str = "",
     rationale: str = "",
@@ -580,6 +626,9 @@ TOOLS = {
     "forget": forget_tool,
     "memory_stats": memory_stats_tool,
     "web_search": web_search_tool,
+    "consortium_start": consortium_start_tool,
+    "consortium_stop": consortium_stop_tool,
+    "consortium_status": consortium_status_tool,
     "consortium_agree": consortium_agree_tool,
 }
 
@@ -608,6 +657,9 @@ def validate_tool_args(func_name: str, func_args: dict) -> tuple:
         "recall": ["query"],
         "forget": ["memory_id"],
         "web_search": ["query"],
+        "consortium_start": ["task"],
+        "consortium_stop": ["task_id"],
+        "consortium_status": [],
         "consortium_agree": [],
     }
 

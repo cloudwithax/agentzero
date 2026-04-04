@@ -13,6 +13,7 @@ from examples import ExampleBank, AdaptiveFewShotManager
 from handler import AgentHandler
 from memory import EnhancedMemoryStore
 from planning import TaskAnalyzer, TaskPlanner
+from tools import TOOLS
 
 
 load_dotenv()
@@ -175,10 +176,93 @@ async def test_handle_routes_to_consortium_mode() -> None:
             os.unlink(db_path)
 
 
+async def test_consortium_task_tools() -> None:
+    """Ensure consortium task management tools can start/stop/status tasks."""
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+        db_path = tmp.name
+
+    try:
+        handler = create_test_handler(db_path)
+
+        with patch.object(
+            handler,
+            "_run_consortium_mode",
+            new=AsyncMock(return_value="the consortium has reached an agreement."),
+        ):
+            start_result = await TOOLS["consortium_start"](
+                task="Ask the consortium about mattress options",
+                task_id="mattress_consensus",
+            )
+            assert start_result["success"]
+
+            task_id = start_result["task"]["task_id"]
+            final_status = None
+            for _ in range(50):
+                status_result = await TOOLS["consortium_status"](task_id=task_id)
+                assert status_result["success"]
+                final_status = status_result["task"]
+                if final_status["status"] == "completed":
+                    break
+                await asyncio.sleep(0.01)
+
+            assert final_status is not None
+            assert final_status["status"] == "completed"
+            assert "consortium has reached an agreement" in final_status["result"]
+
+            all_status = await TOOLS["consortium_status"]()
+            assert all_status["success"]
+            assert all_status["count"] >= 1
+
+            stop_result = await TOOLS["consortium_stop"](
+                task_id=task_id,
+                reason="No longer needed",
+            )
+            assert stop_result["success"]
+
+        async def slow_consortium_mode(*args, **kwargs):
+            await asyncio.sleep(0.3)
+            return "slow run complete"
+
+        with patch.object(
+            handler,
+            "_run_consortium_mode",
+            new=AsyncMock(side_effect=slow_consortium_mode),
+        ):
+            start_result = await TOOLS["consortium_start"](
+                task="Run a long consortium analysis",
+                task_id="long_task",
+            )
+            assert start_result["success"]
+            long_task_id = start_result["task"]["task_id"]
+
+            stop_result = await TOOLS["consortium_stop"](
+                task_id=long_task_id,
+                reason="cancel requested",
+            )
+            assert stop_result["success"]
+
+            stopped_status = None
+            for _ in range(50):
+                status_result = await TOOLS["consortium_status"](task_id=long_task_id)
+                assert status_result["success"]
+                stopped_status = status_result["task"]
+                if stopped_status["status"] == "stopped":
+                    break
+                await asyncio.sleep(0.01)
+
+            assert stopped_status is not None
+            assert stopped_status["status"] in {"stopping", "stopped"}
+        print("✓ Consortium task tools work")
+    finally:
+        if os.path.exists(db_path):
+            os.unlink(db_path)
+
+
 async def main() -> int:
     """Run consortium mode tests."""
     await test_trigger_detection()
     await test_handle_routes_to_consortium_mode()
+    await test_consortium_task_tools()
     print("All consortium mode tests passed")
     return 0
 

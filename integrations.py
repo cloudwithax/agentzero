@@ -109,6 +109,9 @@ VOICE_MEMO_AUDIO_EXTENSIONS = {
     ".wav",
     ".webm",
 }
+VOICE_MEMO_TRANSCRIPT_HEADER = "[Voice memo transcript]"
+VOICE_MEMO_TRANSCRIPTS_HEADER = "[Voice memo transcripts]"
+VOICE_MEMO_FAILURE_HEADER = "[Voice memo attachments not transcribed]"
 
 # Optional telegram imports
 try:
@@ -498,10 +501,10 @@ def _append_voice_memo_transcripts(
 
     if cleaned_transcripts:
         if len(cleaned_transcripts) == 1:
-            transcript_header = "[Voice memo transcript]"
+            transcript_header = VOICE_MEMO_TRANSCRIPT_HEADER
             transcript_body = cleaned_transcripts[0]
         else:
-            transcript_header = "[Voice memo transcripts]"
+            transcript_header = VOICE_MEMO_TRANSCRIPTS_HEADER
             transcript_body = "\n".join(
                 f"{index}. {value}"
                 for index, value in enumerate(cleaned_transcripts, start=1)
@@ -511,11 +514,65 @@ def _append_voice_memo_transcripts(
     failed_urls = _normalize_attachment_urls(failed_voice_memo_urls)
     if failed_urls:
         failed_lines = "\n".join(f"- {url}" for url in failed_urls)
-        content_blocks.append(
-            "[Voice memo attachments not transcribed]\n" f"{failed_lines}"
-        )
+        content_blocks.append(f"{VOICE_MEMO_FAILURE_HEADER}\n{failed_lines}")
 
     return "\n\n".join(content_blocks).strip()
+
+
+def _extract_voice_memo_failure_urls_from_content(content: str) -> list[str]:
+    """Extract unresolved voice memo attachment URLs from stored conversation text."""
+    lines = str(content or "").splitlines()
+    marker = VOICE_MEMO_FAILURE_HEADER.lower()
+    urls: list[str] = []
+    in_failure_block = False
+
+    for line in lines:
+        stripped = line.strip()
+        if not in_failure_block:
+            if stripped.lower() == marker:
+                in_failure_block = True
+            continue
+
+        if not stripped.startswith("- "):
+            in_failure_block = False
+            continue
+
+        candidate_url = stripped[2:].strip()
+        if candidate_url:
+            urls.append(candidate_url)
+
+    return _normalize_attachment_urls(urls)
+
+
+def _remove_voice_memo_failure_block(content: str) -> str:
+    """Remove unresolved voice memo marker blocks from stored conversation text."""
+    lines = str(content or "").splitlines()
+    marker = VOICE_MEMO_FAILURE_HEADER.lower()
+    cleaned_lines: list[str] = []
+
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+        if stripped.lower() != marker:
+            cleaned_lines.append(lines[i])
+            i += 1
+            continue
+
+        i += 1
+        while i < len(lines) and lines[i].strip().startswith("- "):
+            i += 1
+
+        while cleaned_lines and not cleaned_lines[-1].strip():
+            cleaned_lines.pop()
+
+        while i < len(lines) and not lines[i].strip():
+            i += 1
+
+        if cleaned_lines and i < len(lines):
+            cleaned_lines.append("")
+
+    cleaned = "\n".join(cleaned_lines).strip()
+    return re.sub(r"\n{3,}", "\n\n", cleaned)
 
 
 def _voice_memo_filename_from_url(source_url: str, index: int) -> str:
@@ -866,6 +923,178 @@ async def _transcribe_sendblue_voice_memos(
         failed_voice_memo_urls,
     )
     return merged_text, passthrough_urls
+
+
+async def _backfill_untranscribed_voice_memo_conversations(
+    handler: AgentHandler,
+) -> dict[str, int | str]:
+    """Retry transcription for legacy conversation rows with unresolved voice memo URLs."""
+    if not _voice_memo_transcription_enabled():
+        return {
+            "scanned": 0,
+            "updated": 0,
+            "transcripts_added": 0,
+            "still_unresolved": 0,
+            "reason": "transcription_disabled",
+        }
+
+    if not _to_bool(os.environ.get("SENDBLUE_VOICE_MEMO_BACKFILL_ON_STARTUP", "1")):
+        return {
+            "scanned": 0,
+            "updated": 0,
+            "transcripts_added": 0,
+            "still_unresolved": 0,
+            "reason": "backfill_disabled",
+        }
+
+    memory_store = getattr(handler, "memory_store", None)
+    if memory_store is None:
+        return {
+            "scanned": 0,
+            "updated": 0,
+            "transcripts_added": 0,
+            "still_unresolved": 0,
+            "reason": "missing_memory_store",
+        }
+
+    get_candidates = getattr(
+        memory_store,
+        "get_conversation_messages_with_untranscribed_voice_memos",
+        None,
+    )
+    update_content = getattr(memory_store, "update_conversation_message_content", None)
+    if not callable(get_candidates) or not callable(update_content):
+        return {
+            "scanned": 0,
+            "updated": 0,
+            "transcripts_added": 0,
+            "still_unresolved": 0,
+            "reason": "memory_store_missing_helpers",
+        }
+
+    limit = _env_int(
+        "SENDBLUE_VOICE_MEMO_BACKFILL_LIMIT",
+        25,
+        minimum=1,
+        maximum=500,
+    )
+    try:
+        raw_candidates = get_candidates(limit=limit)
+    except Exception as e:
+        logger.warning("Voice memo backfill candidate query failed: %s", e)
+        return {
+            "scanned": 0,
+            "updated": 0,
+            "transcripts_added": 0,
+            "still_unresolved": 0,
+            "reason": "candidate_query_failed",
+        }
+
+    if not isinstance(raw_candidates, list):
+        return {
+            "scanned": 0,
+            "updated": 0,
+            "transcripts_added": 0,
+            "still_unresolved": 0,
+            "reason": "invalid_candidate_payload",
+        }
+
+    candidates: list[Any] = raw_candidates
+
+    scanned = 0
+    updated = 0
+    transcripts_added = 0
+    still_unresolved = 0
+
+    async with aiohttp.ClientSession() as session:
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+
+            message_id = candidate.get("id")
+            if not isinstance(message_id, int):
+                continue
+
+            original_content = candidate.get("content")
+            normalized_content = (
+                original_content if isinstance(original_content, str) else ""
+            )
+
+            failed_urls = _extract_voice_memo_failure_urls_from_content(
+                normalized_content
+            )
+            if not failed_urls:
+                continue
+
+            scanned += 1
+            recovered_transcripts: list[str] = []
+            unresolved_urls: list[str] = []
+
+            for index, source_url in enumerate(failed_urls, start=1):
+                transcript = await _transcribe_voice_memo_attachment_url(
+                    session,
+                    source_url,
+                    index,
+                )
+                if transcript:
+                    recovered_transcripts.append(transcript)
+                else:
+                    unresolved_urls.append(source_url)
+
+            if not recovered_transcripts:
+                still_unresolved += 1
+                continue
+
+            content_without_failure_block = _remove_voice_memo_failure_block(
+                normalized_content
+            )
+            rebuilt_content = _append_voice_memo_transcripts(
+                content_without_failure_block,
+                recovered_transcripts,
+                unresolved_urls,
+            )
+
+            try:
+                did_update = bool(
+                    update_content(
+                        message_id=message_id,
+                        content=rebuilt_content,
+                    )
+                )
+            except TypeError:
+                did_update = bool(update_content(message_id, rebuilt_content))
+            except Exception as e:
+                logger.warning(
+                    "Failed updating conversation row %s during voice memo backfill: %s",
+                    message_id,
+                    e,
+                )
+                did_update = False
+
+            if not did_update:
+                still_unresolved += 1
+                continue
+
+            updated += 1
+            transcripts_added += len(recovered_transcripts)
+            if unresolved_urls:
+                still_unresolved += 1
+
+    if scanned:
+        logger.info(
+            "Voice memo backfill scanned=%s updated=%s transcripts_added=%s unresolved=%s",
+            scanned,
+            updated,
+            transcripts_added,
+            still_unresolved,
+        )
+
+    return {
+        "scanned": scanned,
+        "updated": updated,
+        "transcripts_added": transcripts_added,
+        "still_unresolved": still_unresolved,
+    }
 
 
 def _extract_sendblue_attachment_urls(payload: dict[str, Any]) -> list[str]:
@@ -2907,6 +3136,11 @@ async def start_sendblue_bot(handler: AgentHandler):
     receive_webhook_url = os.environ.get("SENDBLUE_RECEIVE_WEBHOOK_URL", "").strip()
     typing_webhook_url = os.environ.get("SENDBLUE_TYPING_WEBHOOK_URL", "").strip()
     processed_handles: set[str] = set()
+
+    try:
+        await _backfill_untranscribed_voice_memo_conversations(handler)
+    except Exception as e:
+        logger.error("Sendblue voice memo backfill failed: %s", e)
 
     startup_checkpoint = datetime.utcnow()
     try:

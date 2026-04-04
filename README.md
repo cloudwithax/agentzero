@@ -53,6 +53,8 @@ Optional Sendblue reliability settings:
 - `SENDBLUE_VOICE_MEMO_LANGUAGE` - Language hint (`en-US` default for Parakeet, override if you route to a different ASR model).
 - `SENDBLUE_VOICE_MEMO_FFMPEG_BIN` - Optional `ffmpeg` binary/path used to convert iMessage `.m4a`/`.caf` voice memos when direct transcription fails (default: `ffmpeg`).
 - `SENDBLUE_VOICE_MEMO_MAX_BYTES` - Maximum voice memo download size in bytes for transcription (default: `26214400`, 25MB).
+- `SENDBLUE_VOICE_MEMO_BACKFILL_ON_STARTUP` - Retry legacy conversation rows that still contain `[Voice memo attachments not transcribed]` and update stored content with recovered transcripts when possible (default: `1`).
+- `SENDBLUE_VOICE_MEMO_BACKFILL_LIMIT` - Max legacy conversation rows to attempt per startup backfill pass (default: `25`, min: `1`, max: `500`).
 
 For iMessage native `.m4a`/`.caf` voice memo fallback conversion, install `ffmpeg` on the host machine.
 

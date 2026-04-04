@@ -224,6 +224,16 @@ All tools return a consistent dictionary format:
   **Fix:** Extend outbound parsing in `integrations.py` to support `<typing seconds="..."/>` directives between `<message>` blocks, then emit channel-appropriate typing pauses before the next chunk.
 - **Pitfall: Typing-directive behavior can silently break while basic chunk splitting still passes.**
   **Fix:** Add regression assertions in `tests/test_sendblue_debounce.py` (`test_split_outbound_message_chunks_ignores_typing_directives`, `test_send_imessage_typing_directive_triggers_indicator`) and validate with: `PYTHONPATH=. .venv/bin/python tests/test_sendblue_debounce.py`.
+- **Pitfall: Internal consortium voting tool (`consortium_agree`) was exposed in the primary agent tool schema, allowing inappropriate top-level usage.**
+  **Fix:** Remove `consortium_agree` from `BASE_PAYLOAD["tools"]`, expose explicit task controls (`consortium_start`, `consortium_stop`, `consortium_status`) for the main agent, and keep `consortium_agree` internal to consortium-member turns only.
+- **Pitfall: Tool execution accepted any registered tool name, even when not declared in the active payload schema.**
+  **Fix:** Enforce payload-scoped tool execution in `api.py` by filtering tool calls against the payload’s declared tool names before execution; return a structured tool error when unavailable.
+- **Pitfall: Cross-channel continuity was fragmented because rolling context only read messages from the active `session_id` (`tg_*` vs `imessage_*`).**
+  **Fix:** Add explicit cross-channel recall parsing in `handler.py` for prompts like "remember what we were talking about on telegram/imessage", fetch last-N channel messages via new `memory.py` prefix helpers (`get_recent_session_ids_by_prefix`, `get_recent_conversation_messages_for_prefix`), and inject the selected history into system context for that turn.
+- **Pitfall: Natural-language trigger detection missed contractions/typos (for example, "we we're talking about"), causing silent non-injection of requested channel history.**
+  **Fix:** Broaden recall regex token matching to tolerate apostrophes and short filler words, then add regression coverage in `tests/test_memory_maintenance.py` (`test_cross_channel_recall_injects_requested_history`, `test_cross_channel_recall_prefers_current_session_when_same_channel`). Validate with: `PYTHONPATH=. python3 tests/test_memory_maintenance.py`.
+- **Pitfall: Early Sendblue voice memo rows could be stored with only `[Voice memo attachments not transcribed]` URL blocks, leaving conversation history without transcript text.**
+  **Fix:** Add startup backfill in `integrations.py` (`_backfill_untranscribed_voice_memo_conversations`) that retries legacy URLs and updates `conversations.content` via new `memory.py` helpers (`get_conversation_messages_with_untranscribed_voice_memos`, `update_conversation_message_content`), plus regression coverage in `tests/test_sendblue_voice_memo.py` (`test_backfill_untranscribed_voice_memos_updates_conversation_content`). Validate with: `PYTHONPATH=. .venv/bin/python tests/test_sendblue_voice_memo.py`.
 
 ## Key Functions Reference
 

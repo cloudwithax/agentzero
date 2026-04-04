@@ -47,7 +47,8 @@ class MemoryStore:
         cursor = conn.cursor()
 
         # Main memories table with vector storage
-        cursor.execute("""
+        cursor.execute(
+            """
             CREATE TABLE IF NOT EXISTS memories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 content TEXT NOT NULL,
@@ -56,16 +57,20 @@ class MemoryStore:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-        """)
+        """
+        )
 
         # Index for faster lookups
-        cursor.execute("""
+        cursor.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_memories_created 
             ON memories(created_at)
-        """)
+        """
+        )
 
         # Conversations table for session history
-        cursor.execute("""
+        cursor.execute(
+            """
             CREATE TABLE IF NOT EXISTS conversations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT,
@@ -74,20 +79,24 @@ class MemoryStore:
                 metadata TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-        """)
+        """
+        )
 
         # Topics/tags table for categorization
-        cursor.execute("""
+        cursor.execute(
+            """
             CREATE TABLE IF NOT EXISTS topics (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT UNIQUE NOT NULL,
                 description TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-        """)
+        """
+        )
 
         # Memory-topic associations
-        cursor.execute("""
+        cursor.execute(
+            """
             CREATE TABLE IF NOT EXISTS memory_topics (
                 memory_id INTEGER,
                 topic_id INTEGER,
@@ -95,16 +104,19 @@ class MemoryStore:
                 FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE,
                 FOREIGN KEY (topic_id) REFERENCES topics(id) ON DELETE CASCADE
             )
-        """)
+        """
+        )
 
         # Agent-wide state for long-running behavior (e.g., dream schedule)
-        cursor.execute("""
+        cursor.execute(
+            """
             CREATE TABLE IF NOT EXISTS agent_state (
                 key TEXT PRIMARY KEY,
                 value TEXT,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-        """)
+        """
+        )
 
         conn.commit()
         conn.close()
@@ -403,6 +415,72 @@ class MemoryStore:
 
         return msg_id
 
+    def update_conversation_message_content(
+        self,
+        message_id: int,
+        content: str,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> bool:
+        """Update stored content (and optional metadata) for a conversation row."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        normalized_content = "" if content is None else str(content)
+        if metadata is None:
+            cursor.execute(
+                "UPDATE conversations SET content = ? WHERE id = ?",
+                (normalized_content, int(message_id)),
+            )
+        else:
+            cursor.execute(
+                "UPDATE conversations SET content = ?, metadata = ? WHERE id = ?",
+                (normalized_content, json.dumps(metadata), int(message_id)),
+            )
+
+        updated = cursor.rowcount > 0
+        conn.commit()
+        conn.close()
+        return updated
+
+    def get_conversation_messages_with_untranscribed_voice_memos(
+        self,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Return user rows that still contain unresolved voice memo URL markers."""
+        limit = max(1, int(limit))
+
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT id, session_id, role, content, metadata, created_at
+            FROM conversations
+            WHERE role = 'user'
+              AND LOWER(content) LIKE '%[voice memo attachments not transcribed]%'
+            ORDER BY created_at DESC
+            LIMIT ?
+        """,
+            (limit,),
+        )
+
+        rows = cursor.fetchall()
+        conn.close()
+
+        messages: list[dict[str, Any]] = []
+        for row in rows:
+            messages.append(
+                {
+                    "id": row[0],
+                    "session_id": row[1],
+                    "role": row[2],
+                    "content": row[3],
+                    "metadata": json.loads(row[4] or "{}"),
+                    "created_at": row[5],
+                }
+            )
+
+        return messages
+
     def get_conversation_history(
         self, session_id: Optional[str] = None, limit: int = 50
     ) -> list[dict[str, Any]]:
@@ -436,6 +514,97 @@ class MemoryStore:
         conn.close()
 
         messages = []
+        for row in rows:
+            messages.append(
+                {
+                    "id": row[0],
+                    "session_id": row[1],
+                    "role": row[2],
+                    "content": row[3],
+                    "metadata": json.loads(row[4] or "{}"),
+                    "created_at": row[5],
+                }
+            )
+
+        return messages
+
+    def get_recent_session_ids_by_prefix(
+        self,
+        session_prefix: str,
+        limit: int = 10,
+    ) -> list[str]:
+        """Return recent session IDs whose IDs start with the provided prefix."""
+        prefix = str(session_prefix or "").strip()
+        if not prefix:
+            return []
+
+        limit = max(1, int(limit))
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT session_id, MAX(created_at) AS last_seen
+            FROM conversations
+            WHERE session_id LIKE ?
+            GROUP BY session_id
+            ORDER BY last_seen DESC
+            LIMIT ?
+        """,
+            (f"{prefix}%", limit),
+        )
+        rows = cursor.fetchall()
+        conn.close()
+
+        session_ids: list[str] = []
+        for row in rows:
+            session_id = row[0]
+            if isinstance(session_id, str) and session_id.strip():
+                session_ids.append(session_id.strip())
+
+        return session_ids
+
+    def get_recent_conversation_messages_for_prefix(
+        self,
+        session_prefix: str,
+        limit: int = 20,
+        session_id: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Return recent conversation messages for a session prefix or explicit session."""
+        prefix = str(session_prefix or "").strip()
+        if not prefix:
+            return []
+
+        limit = max(1, int(limit))
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        if session_id:
+            cursor.execute(
+                """
+                SELECT id, session_id, role, content, metadata, created_at
+                FROM conversations
+                WHERE session_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+            """,
+                (session_id, limit),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT id, session_id, role, content, metadata, created_at
+                FROM conversations
+                WHERE session_id LIKE ?
+                ORDER BY created_at DESC
+                LIMIT ?
+            """,
+                (f"{prefix}%", limit),
+            )
+
+        rows = cursor.fetchall()
+        conn.close()
+
+        messages: list[dict[str, Any]] = []
         for row in rows:
             messages.append(
                 {
@@ -697,7 +866,14 @@ class MemoryStore:
         candidates: list[Memory] = []
 
         for row in rows:
-            memory_id, content, embedding_bytes, metadata_blob, created_at, updated_at = row
+            (
+                memory_id,
+                content,
+                embedding_bytes,
+                metadata_blob,
+                created_at,
+                updated_at,
+            ) = row
             metadata = self._parse_metadata_blob(metadata_blob)
             memory_type = str(metadata.get("type", "")).strip()
 
@@ -819,30 +995,34 @@ class MemoryStore:
 
     def clear_conversation_history(self, session_id: Optional[str] = None) -> int:
         """Clear conversation history for a session (or all if no session specified).
-        
+
         Args:
             session_id: Session ID to clear, or None to clear all conversations
-            
+
         Returns:
             Number of conversations deleted
         """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        
+
         if session_id:
-            cursor.execute("SELECT COUNT(*) FROM conversations WHERE session_id = ?", (session_id,))
+            cursor.execute(
+                "SELECT COUNT(*) FROM conversations WHERE session_id = ?", (session_id,)
+            )
             count = cursor.fetchone()[0]
-            cursor.execute("DELETE FROM conversations WHERE session_id = ?", (session_id,))
+            cursor.execute(
+                "DELETE FROM conversations WHERE session_id = ?", (session_id,)
+            )
         else:
             cursor.execute("SELECT COUNT(*) FROM conversations")
             count = cursor.fetchone()[0]
             cursor.execute("DELETE FROM conversations")
-        
+
         conn.commit()
         conn.close()
-        
+
         return count
-    
+
     def clear_system_prompt(self) -> bool:
         """Clear the custom system prompt."""
         conn = sqlite3.connect(self.db_path)
@@ -885,7 +1065,8 @@ class EnhancedMemoryStore(MemoryStore):
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
-        cursor.execute("""
+        cursor.execute(
+            """
             CREATE TABLE IF NOT EXISTS memory_outcomes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 memory_id INTEGER,
@@ -895,9 +1076,11 @@ class EnhancedMemoryStore(MemoryStore):
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
             )
-        """)
+        """
+        )
 
-        cursor.execute("""
+        cursor.execute(
+            """
             CREATE TABLE IF NOT EXISTS memory_access_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 memory_id INTEGER,
@@ -906,17 +1089,22 @@ class EnhancedMemoryStore(MemoryStore):
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
             )
-        """)
+        """
+        )
 
-        cursor.execute("""
+        cursor.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_memory_outcomes_memory
             ON memory_outcomes(memory_id)
-        """)
+        """
+        )
 
-        cursor.execute("""
+        cursor.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_memory_access_memory
             ON memory_access_log(memory_id)
-        """)
+        """
+        )
 
         conn.commit()
         conn.close()

@@ -6,10 +6,11 @@ import os
 import sqlite3
 import tempfile
 from datetime import datetime, timedelta
+from unittest.mock import AsyncMock, patch
 
 from capabilities import AdaptiveFormatter, Capability, CapabilityProfile
 from examples import AdaptiveFewShotManager, ExampleBank
-from handler import AgentHandler
+from handler import AgentHandler, IMESSAGE_SYSTEM_PROMPT_SUFFIX
 from memory import EnhancedMemoryStore
 from planning import TaskAnalyzer, TaskPlanner
 
@@ -278,9 +279,202 @@ async def test_dream_profile_and_consolidation_helpers() -> None:
             os.remove(tmp.name)
 
 
+async def test_cross_channel_recall_injects_requested_history() -> None:
+    print("=== Test: cross-channel recall injects requested history ===")
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+    tmp.close()
+
+    try:
+        _, handler = _create_store_and_handler(tmp.name)
+
+        anchor = datetime.now() - timedelta(minutes=5)
+        _insert_conversation_at(
+            db_path=tmp.name,
+            session_id="tg_123",
+            role="user",
+            content="Telegram oldest message",
+            timestamp=anchor,
+        )
+        _insert_conversation_at(
+            db_path=tmp.name,
+            session_id="tg_123",
+            role="assistant",
+            content="Telegram middle message",
+            timestamp=anchor + timedelta(minutes=1),
+        )
+        _insert_conversation_at(
+            db_path=tmp.name,
+            session_id="tg_123",
+            role="user",
+            content="Telegram latest message",
+            timestamp=anchor + timedelta(minutes=2),
+        )
+
+        context = handler._build_cross_channel_context(
+            user_query="hey remember what we we're talking about on telegram last 2 messages",
+            session_id="imessage_+15550001111",
+        )
+
+        assert "Cross-channel context injected from telegram" in context
+        assert "Telegram middle message" in context
+        assert "Telegram latest message" in context
+        assert "Telegram oldest message" not in context
+        print("✓ requested channel history injected")
+    finally:
+        if os.path.exists(tmp.name):
+            os.remove(tmp.name)
+
+
+async def test_cross_channel_recall_prefers_current_session_when_same_channel() -> None:
+    print(
+        "=== Test: cross-channel recall uses current session when channel matches ==="
+    )
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+    tmp.close()
+
+    try:
+        _, handler = _create_store_and_handler(tmp.name)
+
+        anchor = datetime.now() - timedelta(minutes=5)
+        _insert_conversation_at(
+            db_path=tmp.name,
+            session_id="tg_555",
+            role="user",
+            content="Current Telegram session message",
+            timestamp=anchor,
+        )
+        _insert_conversation_at(
+            db_path=tmp.name,
+            session_id="tg_999",
+            role="user",
+            content="Other Telegram session message",
+            timestamp=anchor + timedelta(minutes=1),
+        )
+
+        context = handler._build_cross_channel_context(
+            user_query="remember what we were talking about on telegram last 1 message",
+            session_id="tg_555",
+        )
+
+        assert "Current Telegram session message" in context
+        assert "Other Telegram session message" not in context
+        print("✓ current session is preferred for same-channel recall")
+    finally:
+        if os.path.exists(tmp.name):
+            os.remove(tmp.name)
+
+
+async def test_cross_channel_recall_is_injected_into_handle_context() -> None:
+    print("=== Test: cross-channel recall is injected into handle context ===")
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+    tmp.close()
+
+    try:
+        _, handler = _create_store_and_handler(tmp.name)
+
+        anchor = datetime.now() - timedelta(minutes=5)
+        _insert_conversation_at(
+            db_path=tmp.name,
+            session_id="tg_777",
+            role="assistant",
+            content="Telegram context payload message",
+            timestamp=anchor,
+        )
+
+        captured_payload: dict[str, object] = {}
+
+        async def _fake_api_call(_session, _url, payload, _headers):
+            captured_payload["messages"] = payload.get("messages", [])
+            return {"id": "fake", "choices": [{"message": {"role": "assistant"}}]}
+
+        with (
+            patch.object(
+                handler.memory_store, "search_memories", new=AsyncMock(return_value=[])
+            ),
+            patch(
+                "handler.api_call_with_retry", new=AsyncMock(side_effect=_fake_api_call)
+            ),
+            patch("handler.process_response", new=AsyncMock(return_value="ok")),
+        ):
+            result = await handler.handle(
+                {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "hey remember what we we're talking about on telegram last 1 message",
+                        }
+                    ]
+                },
+                session_id="imessage_+15558889999",
+            )
+
+        assert result == "ok"
+        assert captured_payload.get("messages")
+        system_content = str(captured_payload["messages"][0]["content"])
+        assert "Cross-channel context injected from telegram" in system_content
+        assert "Telegram context payload message" in system_content
+        print("✓ cross-channel context is injected into handler payload")
+    finally:
+        if os.path.exists(tmp.name):
+            os.remove(tmp.name)
+
+
+async def test_imessage_session_injects_mobile_prompt_defaults() -> None:
+    print("=== Test: iMessage sessions inject mobile prompt defaults ===")
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+    tmp.close()
+
+    try:
+        _, handler = _create_store_and_handler(tmp.name)
+
+        captured_payload: dict[str, object] = {}
+
+        async def _fake_api_call(_session, _url, payload, _headers):
+            captured_payload["messages"] = payload.get("messages", [])
+            return {"id": "fake", "choices": [{"message": {"role": "assistant"}}]}
+
+        with (
+            patch.object(
+                handler.memory_store, "search_memories", new=AsyncMock(return_value=[])
+            ),
+            patch(
+                "handler.api_call_with_retry", new=AsyncMock(side_effect=_fake_api_call)
+            ),
+            patch("handler.process_response", new=AsyncMock(return_value="ok")),
+        ):
+            imessage_result = await handler.handle(
+                {"messages": [{"role": "user", "content": "Quick status?"}]},
+                session_id="imessage_+15550001111",
+            )
+
+            assert imessage_result == "ok"
+            assert captured_payload.get("messages")
+            imessage_system_content = str(captured_payload["messages"][0]["content"])
+            assert IMESSAGE_SYSTEM_PROMPT_SUFFIX in imessage_system_content
+
+            telegram_result = await handler.handle(
+                {"messages": [{"role": "user", "content": "Quick status?"}]},
+                session_id="tg_123",
+            )
+
+            assert telegram_result == "ok"
+            assert captured_payload.get("messages")
+            telegram_system_content = str(captured_payload["messages"][0]["content"])
+            assert IMESSAGE_SYSTEM_PROMPT_SUFFIX not in telegram_system_content
+
+        print("✓ iMessage session prompt defaults are injected conditionally")
+    finally:
+        if os.path.exists(tmp.name):
+            os.remove(tmp.name)
+
+
 async def main() -> int:
     await test_auto_memory_cadence_bounds()
     await test_dream_profile_and_consolidation_helpers()
+    await test_cross_channel_recall_injects_requested_history()
+    await test_cross_channel_recall_prefers_current_session_when_same_channel()
+    await test_cross_channel_recall_is_injected_into_handle_context()
+    await test_imessage_session_injects_mobile_prompt_defaults()
     print("\nAll memory-maintenance tests passed")
     return 0
 

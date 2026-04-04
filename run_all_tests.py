@@ -9,6 +9,7 @@ tests = [
     "tests/test_multimodal_integrations.py",
     "tests/test_sendblue_debounce.py",
     "tests/test_sendblue_voice_memo.py",
+    "tests/test_memory_maintenance.py",
     "tests/test_consortium_mode.py",
 ]
 for t in tests:
