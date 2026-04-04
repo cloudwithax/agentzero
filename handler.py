@@ -21,6 +21,10 @@ from tools import set_consortium_controller
 logger = logging.getLogger(__name__)
 
 IMESSAGE_HANDLE_CONTEXT_LIMIT = 50
+REQUEST_FRESHNESS_INSTRUCTION = (
+    "[Request Freshness]: This turn includes a one-time freshness token to discourage "
+    "cache reuse and repeated phrasing. Treat the request as new and answer independently."
+)
 
 
 def _content_to_text(content: Any) -> str:
@@ -1876,6 +1880,7 @@ class AgentHandler:
         plan_context: str,
         example_context: str,
         session_prompt_suffix: str = "",
+        request_freshness_token: Optional[str] = None,
     ) -> str:
         """Build the canonical system prompt used by the primary agent."""
         current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1890,6 +1895,11 @@ class AgentHandler:
             'For readability, you may split a reply into multiple chunks using <message>...</message> blocks. You may also insert <typing seconds="1.2"/> between message blocks to add brief pacing pauses. If you use this format, keep all user-visible text inside those message blocks.\n'
             "IMPORTANT: Do not use markdown formatting, code blocks, or emojis in your responses. Respond in plain text only.\n"
         )
+        if request_freshness_token:
+            universal_instructions += (
+                f"{REQUEST_FRESHNESS_INSTRUCTION}\n"
+                f"[Freshness Token]: {request_freshness_token}\n"
+            )
         session_suffix = (
             f"\n\n{session_prompt_suffix}\n" if session_prompt_suffix else ""
         )
@@ -1908,6 +1918,10 @@ class AgentHandler:
             "You are a helpful AI assistant with persistent memory."
             f"{universal_instructions}{session_suffix}{memory_context}{plan_context}{example_context}"
         )
+
+    def _build_request_freshness_token(self) -> str:
+        """Return a unique token for the current visible response generation."""
+        return uuid.uuid4().hex
 
     def _get_session_prompt_suffix(self, session_id: Optional[str]) -> str:
         """Return channel-specific prompt guidance for the active session."""
@@ -2006,6 +2020,7 @@ class AgentHandler:
         custom_prompt: str,
         memory_context: str,
         session_prompt_suffix: str,
+        request_freshness_token: str = "",
     ) -> tuple[str, dict[str, Any] | None]:
         """Run one model turn in consortium mode."""
         system_parts = [
@@ -2040,6 +2055,10 @@ class AgentHandler:
 
         if memory_context:
             system_parts.append(memory_context.strip())
+
+        if request_freshness_token:
+            system_parts.append(REQUEST_FRESHNESS_INSTRUCTION)
+            system_parts.append(f"[Freshness Token]: {request_freshness_token}")
 
         if round_number == 1:
             panel_context = "Blind round: produce an independent first-pass analysis using only the user request."
@@ -2096,6 +2115,7 @@ class AgentHandler:
         custom_prompt: str = "",
         memory_context: str = "",
         session_prompt_suffix: str = "",
+        request_freshness_token: str = "",
     ) -> str:
         """Run four-persona consortium debate and then judge synthesis."""
         transcript: list[dict[str, Any]] = []
@@ -2125,6 +2145,7 @@ class AgentHandler:
                         custom_prompt=custom_prompt,
                         memory_context=memory_context,
                         session_prompt_suffix=session_prompt_suffix,
+                        request_freshness_token=request_freshness_token,
                     )
                 except Exception as exc:
                     logger.exception(
@@ -2170,6 +2191,9 @@ class AgentHandler:
             judge_system_parts.append(session_prompt_suffix)
         if memory_context:
             judge_system_parts.append(memory_context.strip())
+        if request_freshness_token:
+            judge_system_parts.append(REQUEST_FRESHNESS_INSTRUCTION)
+            judge_system_parts.append(f"[Freshness Token]: {request_freshness_token}")
 
         judge_user_prompt = (
             f"Original user request:\n{user_query}\n\n"
@@ -2360,12 +2384,15 @@ class AgentHandler:
                 example_context += f"Input: {ex['input']}\n"
                 example_context += f"Output: {ex['output']}\n\n"
 
+        request_freshness_token = self._build_request_freshness_token()
+
         system_content = self._build_system_content(
             custom_prompt=custom_prompt,
             memory_context=memory_context,
             plan_context=plan_context,
             example_context=example_context,
             session_prompt_suffix=session_prompt_suffix,
+            request_freshness_token=request_freshness_token,
         )
 
         should_contact_consortium = False
@@ -2402,6 +2429,7 @@ class AgentHandler:
                     custom_prompt=custom_prompt,
                     memory_context=memory_context,
                     session_prompt_suffix=session_prompt_suffix,
+                    request_freshness_token=request_freshness_token,
                 )
 
                 if acknowledgement and not acknowledgement_delivered:

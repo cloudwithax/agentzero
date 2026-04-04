@@ -242,6 +242,8 @@ All tools return a consistent dictionary format:
   **Fix:** Thread Sendblue `message_handle` / `part_index` metadata through `handle_imessage()` into `AgentHandler.handle()`, persist it on conversation rows, and inject an `[Available iMessage tapback handles ...]` context block into the system prompt for iMessage sessions. Validate with: `PYTHONPATH=. .venv/bin/python tests/test_memory_maintenance.py` and `PYTHONPATH=. .venv/bin/python tests/test_sendblue_debounce.py`.
 - **Pitfall: Startup message replay and pending-update draining were brittle enough to replay stale or broken channel state on boot.**
   **Fix:** Remove Sendblue startup backlog replay and Telegram pending-update replay from `integrations.py`, keep only live webhook/polling handling, and drop the related env knobs/tests/docs. Validate with: `PYTHONPATH=. .venv/bin/python tests/test_sendblue_debounce.py`.
+- **Pitfall: Repeated top-level user turns could arrive with nearly identical request bodies, making upstream cache reuse or repeated phrasing more likely.**
+  **Fix:** Add per-request no-cache headers plus a unique `X-Request-Id` in `api.py`, and inject a one-time freshness token into the main visible-response system prompt in `handler.py` so repeated turns are structurally distinct. Validate with: `PYTHONPATH=. .venv/bin/python tests/test_process_response.py` and `PYTHONPATH=. .venv/bin/python tests/test_memory_maintenance.py`.
 
 ## Key Functions Reference
 

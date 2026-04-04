@@ -10,7 +10,11 @@ from unittest.mock import AsyncMock, patch
 
 from capabilities import AdaptiveFormatter, Capability, CapabilityProfile
 from examples import AdaptiveFewShotManager, ExampleBank
-from handler import AgentHandler, IMESSAGE_SYSTEM_PROMPT_SUFFIX
+from handler import (
+    AgentHandler,
+    IMESSAGE_SYSTEM_PROMPT_SUFFIX,
+    REQUEST_FRESHNESS_INSTRUCTION,
+)
 from memory import EnhancedMemoryStore
 from planning import TaskAnalyzer, TaskPlanner
 
@@ -536,6 +540,46 @@ async def test_imessage_handle_ids_are_injected_and_persisted() -> None:
             os.remove(tmp.name)
 
 
+async def test_handle_injects_request_freshness_token() -> None:
+    print("=== Test: request freshness token is injected into system prompt ===")
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+    tmp.close()
+
+    try:
+        _, handler = _create_store_and_handler(tmp.name)
+
+        captured_payload: dict[str, object] = {}
+
+        async def _fake_api_call(_session, _url, payload, _headers):
+            captured_payload["messages"] = payload.get("messages", [])
+            return {"id": "fake", "choices": [{"message": {"role": "assistant"}}]}
+
+        with (
+            patch.object(
+                handler.memory_store, "search_memories", new=AsyncMock(return_value=[])
+            ),
+            patch(
+                "handler.api_call_with_retry", new=AsyncMock(side_effect=_fake_api_call)
+            ),
+            patch("handler.process_response", new=AsyncMock(return_value="ok")),
+        ):
+            result = await handler.handle(
+                {"messages": [{"role": "user", "content": "Say hello"}]},
+                session_id="tg_456",
+            )
+
+        assert result == "ok"
+        assert captured_payload.get("messages")
+
+        system_content = str(captured_payload["messages"][0]["content"])
+        assert REQUEST_FRESHNESS_INSTRUCTION in system_content
+        assert "[Freshness Token]:" in system_content
+        print("✓ request freshness token is included in the visible-response prompt")
+    finally:
+        if os.path.exists(tmp.name):
+            os.remove(tmp.name)
+
+
 async def main() -> int:
     await test_auto_memory_cadence_bounds()
     await test_dream_profile_and_consolidation_helpers()
@@ -544,6 +588,7 @@ async def main() -> int:
     await test_cross_channel_recall_is_injected_into_handle_context()
     await test_imessage_session_injects_mobile_prompt_defaults()
     await test_imessage_handle_ids_are_injected_and_persisted()
+    await test_handle_injects_request_freshness_token()
     print("\nAll memory-maintenance tests passed")
     return 0
 

@@ -6,8 +6,30 @@ import sys
 from unittest.mock import AsyncMock
 
 sys.path.insert(0, "/home/clxud/Documents/github/agentzero")
-from api import process_response, execute_tool_calls, _extract_nvcf_asset_ids
+from api import (
+    _apply_cache_busting_headers,
+    _extract_nvcf_asset_ids,
+    execute_tool_calls,
+    process_response,
+)
 from handler import BASE_URL, API_KEY, BASE_PAYLOAD
+
+
+def test_cache_busting_headers_are_applied() -> None:
+    """Every API request should carry explicit no-cache headers and a unique ID."""
+    print("Test 0a: Cache-busting headers")
+
+    first = _apply_cache_busting_headers({"Authorization": "Bearer test"})
+    second = _apply_cache_busting_headers({"Authorization": "Bearer test"})
+
+    assert first["Authorization"] == "Bearer test"
+    assert first["Cache-Control"] == "no-cache, no-store, max-age=0"
+    assert first["Pragma"] == "no-cache"
+    assert first["Expires"] == "0"
+    assert first["X-Request-Id"]
+    assert second["X-Request-Id"]
+    assert first["X-Request-Id"] != second["X-Request-Id"]
+    print("  ✓ Passed")
 
 
 def test_extract_nvcf_asset_ids_from_messages() -> None:
@@ -609,6 +631,7 @@ async def main():
     print("=" * 60)
     print()
 
+    test_cache_busting_headers_are_applied()
     test_extract_nvcf_asset_ids_from_messages()
 
     await test_regular_response()

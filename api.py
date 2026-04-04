@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+import uuid
 from typing import Any
 
 import aiohttp
@@ -14,6 +15,18 @@ from tools import TOOLS, validate_tool_args
 logger = logging.getLogger(__name__)
 
 ASSET_REFERENCE_PATTERN = re.compile(r"asset_id,([A-Za-z0-9-]+)")
+
+
+def _apply_cache_busting_headers(headers: dict[str, str]) -> dict[str, str]:
+    """Add per-request no-cache headers so upstream layers avoid reusing responses."""
+    request_headers = headers.copy()
+    request_headers["Cache-Control"] = "no-cache, no-store, max-age=0"
+    request_headers["Pragma"] = "no-cache"
+    request_headers["Expires"] = "0"
+    request_headers["X-Request-Id"] = request_headers.get(
+        "X-Request-Id", str(uuid.uuid4())
+    )
+    return request_headers
 
 
 def _message_content_to_text(content: Any) -> str:
@@ -261,7 +274,7 @@ async def api_call_with_retry(
     backoff: float = 2.0,
 ) -> dict[str, Any]:
     """Make an API call with retry logic for transient errors."""
-    request_headers = headers.copy()
+    request_headers = _apply_cache_busting_headers(headers)
     has_asset_header = any(
         key.lower() == "nvcf-input-asset-references" for key in request_headers
     )
