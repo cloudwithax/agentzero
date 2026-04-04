@@ -7,6 +7,7 @@ import mimetypes
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -75,6 +76,10 @@ VOICE_MEMO_CONVERTED_FILENAME = "voice-memo-converted.wav"
 VOICE_MEMO_CONVERTED_CONTENT_TYPE = "audio/wav"
 IMAGE_FFMPEG_BIN_DEFAULT = "ffmpeg"
 IMAGE_MAGICK_BIN_ENV = "SENDBLUE_IMAGE_MAGICK_BIN"
+IMESSAGE_LABEL_BREAK_PATTERN = re.compile(
+    r"\s+(?=(?:name|order(?:\s*#)?|date|items|drinks|sauces|restaurant(?:\s*#)?)\s*:)",
+    re.IGNORECASE,
+)
 VOICE_MEMO_AUDIO_EXTENSIONS = {
     ".aac",
     ".amr",
@@ -117,6 +122,41 @@ def _to_bool(value) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "y", "on"}
     return False
+
+
+def _format_sendblue_message_content(message: str) -> str:
+    """Normalize outbound Sendblue text and enforce carriage returns for iMessage."""
+    normalized = "" if message is None else str(message)
+
+    # Normalize mixed/native line ending forms plus literal escaped newline sequences.
+    normalized = (
+        normalized.replace("\\r\\n", "\n")
+        .replace("\\n", "\n")
+        .replace("\\r", "\n")
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
+    )
+    normalized = re.sub(r"[ \t]+\n", "\n", normalized)
+    normalized = re.sub(r"\n{3,}", "\n\n", normalized).strip()
+
+    # If model output is one dense paragraph, split predictable key/value labels
+    # or sentence boundaries for better iMessage readability.
+    if "\n" not in normalized and len(normalized) >= 90:
+        split_labels = IMESSAGE_LABEL_BREAK_PATTERN.sub("\n", normalized)
+        if split_labels != normalized:
+            normalized = split_labels
+        else:
+            sentence_parts = [
+                part.strip()
+                for part in re.split(r"(?<=[.!?])\s+", normalized)
+                if part.strip()
+            ]
+            if len(sentence_parts) > 1:
+                normalized = "\n".join(sentence_parts)
+
+    if _to_bool(os.environ.get("SENDBLUE_FORCE_CARRIAGE_RETURNS", "1")):
+        return normalized.replace("\n", "\r")
+    return normalized
 
 
 def _normalize_attachment_urls(value: Any) -> list[str]:
@@ -1515,10 +1555,11 @@ async def send_imessage(
         "sb-api-key-id": api_key,
         "sb-api-secret-key": api_secret,
     }
+    formatted_message = _format_sendblue_message_content(message)
     payload = {
         "number": phone_number,
         "from_number": from_number,
-        "content": message,
+        "content": formatted_message,
         "send_style": "regular",
     }
     payload: dict[str, Any] = payload

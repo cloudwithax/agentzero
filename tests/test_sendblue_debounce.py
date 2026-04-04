@@ -2,11 +2,13 @@
 """Tests for Sendblue inbound debounce behavior."""
 
 import asyncio
+import os
 from unittest.mock import patch
 
 from integrations import _extract_sendblue_typing_state, _queue_sendblue_pending_message
 from integrations import _extract_sendblue_sender_number
 from integrations import _extract_webhook_type_urls, process_imessage_and_reply
+from integrations import _format_sendblue_message_content, send_imessage
 
 
 def test_documented_typing_payload_parsing() -> None:
@@ -59,6 +61,95 @@ def test_extract_webhook_type_urls_for_receive() -> None:
     hooks = {"receive": [{"url": "https://example.com/webhook/receive"}]}
     urls = _extract_webhook_type_urls(hooks, "receive")
     assert urls == {"https://example.com/webhook/receive"}
+
+
+def test_sendblue_message_formatting_prefers_carriage_returns() -> None:
+    """Dense key/value text should be split and emitted with carriage returns."""
+    previous_force_cr = os.environ.get("SENDBLUE_FORCE_CARRIAGE_RETURNS")
+    os.environ["SENDBLUE_FORCE_CARRIAGE_RETURNS"] = "1"
+
+    try:
+        formatted = _format_sendblue_message_content(
+            "name: nicholas a order #: 900251 date: 04/02/2026 7:30 pm "
+            "items: bf potato griller drinks: 0 sauces: 0"
+        )
+    finally:
+        if previous_force_cr is None:
+            os.environ.pop("SENDBLUE_FORCE_CARRIAGE_RETURNS", None)
+        else:
+            os.environ["SENDBLUE_FORCE_CARRIAGE_RETURNS"] = previous_force_cr
+
+    assert "\r" in formatted
+    assert "\n" not in formatted
+    assert "name: nicholas a" in formatted
+    assert "\rorder #: 900251" in formatted
+    assert "\rdate: 04/02/2026 7:30 pm" in formatted
+
+
+async def test_send_imessage_normalizes_content_before_send() -> None:
+    """send_imessage should always submit carriage-return formatted content."""
+
+    class _FakeResponse:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, _exc_type, _exc, _tb):
+            return False
+
+        async def json(self):
+            return {"status": "QUEUED"}
+
+    class _FakeSession:
+        def __init__(self):
+            self.payload = None
+
+        def post(self, _url: str, json=None, headers=None):
+            self.payload = json
+            return _FakeResponse()
+
+    previous_api_key = os.environ.get("SENDBLUE_API_KEY")
+    previous_api_secret = os.environ.get("SENDBLUE_API_SECRET")
+    previous_number = os.environ.get("SENDBLUE_NUMBER")
+    previous_force_cr = os.environ.get("SENDBLUE_FORCE_CARRIAGE_RETURNS")
+
+    os.environ["SENDBLUE_API_KEY"] = "test-key"
+    os.environ["SENDBLUE_API_SECRET"] = "test-secret"
+    os.environ["SENDBLUE_NUMBER"] = "+15550001111"
+    os.environ["SENDBLUE_FORCE_CARRIAGE_RETURNS"] = "1"
+
+    fake_session = _FakeSession()
+    try:
+        result = await send_imessage(
+            "+15551234567",
+            "line one\nline two",
+            session=fake_session,
+        )
+    finally:
+        if previous_api_key is None:
+            os.environ.pop("SENDBLUE_API_KEY", None)
+        else:
+            os.environ["SENDBLUE_API_KEY"] = previous_api_key
+
+        if previous_api_secret is None:
+            os.environ.pop("SENDBLUE_API_SECRET", None)
+        else:
+            os.environ["SENDBLUE_API_SECRET"] = previous_api_secret
+
+        if previous_number is None:
+            os.environ.pop("SENDBLUE_NUMBER", None)
+        else:
+            os.environ["SENDBLUE_NUMBER"] = previous_number
+
+        if previous_force_cr is None:
+            os.environ.pop("SENDBLUE_FORCE_CARRIAGE_RETURNS", None)
+        else:
+            os.environ["SENDBLUE_FORCE_CARRIAGE_RETURNS"] = previous_force_cr
+
+    assert result.get("success") is True
+    assert fake_session.payload is not None
+    assert fake_session.payload.get("content") == "line one\rline two"
 
 
 async def test_attachment_then_text_are_coalesced() -> None:
@@ -233,6 +324,8 @@ async def main() -> int:
     test_sender_number_extraction_priority()
     test_extract_webhook_type_urls_for_typing_indicator()
     test_extract_webhook_type_urls_for_receive()
+    test_sendblue_message_formatting_prefers_carriage_returns()
+    await test_send_imessage_normalizes_content_before_send()
     await test_attachment_then_text_are_coalesced()
     await test_typing_event_extends_existing_debounce()
     await test_typing_event_without_pending_message_is_ignored()
