@@ -5,7 +5,7 @@ import math
 import os
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 import aiohttp
@@ -97,8 +97,43 @@ class MemoryStore:
             )
         """)
 
+        # Agent-wide state for long-running behavior (e.g., dream schedule)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS agent_state (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         conn.commit()
         conn.close()
+
+    @staticmethod
+    def _parse_metadata_blob(metadata_blob: Optional[str]) -> dict[str, Any]:
+        """Safely parse JSON metadata stored in SQLite."""
+        if not metadata_blob:
+            return {}
+        try:
+            parsed = json.loads(metadata_blob)
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    @staticmethod
+    def _parse_timestamp(value: Optional[str]) -> Optional[datetime]:
+        """Parse SQLite timestamp strings into datetime."""
+        if not value:
+            return None
+
+        candidate = str(value).strip()
+        if not candidate:
+            return None
+
+        try:
+            return datetime.fromisoformat(candidate.replace(" ", "T"))
+        except ValueError:
+            return None
 
     async def generate_embedding(
         self, text: str, input_type: str = "passage"
@@ -469,6 +504,273 @@ class MemoryStore:
             "total_topics": total_topics,
             "db_path": self.db_path,
         }
+
+    def get_conversation_message_count(self, session_id: Optional[str] = None) -> int:
+        """Return total conversation messages, optionally scoped to a session."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        if session_id:
+            cursor.execute(
+                "SELECT COUNT(*) FROM conversations WHERE session_id = ?", (session_id,)
+            )
+        else:
+            cursor.execute("SELECT COUNT(*) FROM conversations")
+
+        count = cursor.fetchone()[0]
+        conn.close()
+        return int(count)
+
+    def get_session_memory_cadence(
+        self,
+        session_id: str,
+        memory_types: Optional[set[str]] = None,
+    ) -> dict[str, Any]:
+        """Return memory cadence stats for a session based on memory metadata."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT metadata FROM memories")
+        rows = cursor.fetchall()
+        conn.close()
+
+        count = 0
+        latest_message_index: Optional[int] = None
+
+        for row in rows:
+            metadata = self._parse_metadata_blob(row[0])
+            if metadata.get("session_id") != session_id:
+                continue
+
+            memory_type = str(metadata.get("type", "")).strip()
+            if memory_types and memory_type not in memory_types:
+                continue
+
+            count += 1
+            message_index = metadata.get("message_index")
+            if isinstance(message_index, str) and message_index.isdigit():
+                message_index = int(message_index)
+
+            if isinstance(message_index, int):
+                if latest_message_index is None or message_index > latest_message_index:
+                    latest_message_index = message_index
+
+        return {
+            "memory_count": count,
+            "latest_message_index": latest_message_index,
+        }
+
+    def get_conversation_activity_by_hour(
+        self,
+        lookback_days: int = 21,
+    ) -> dict[str, Any]:
+        """Return hourly conversation activity across recent history."""
+        lookback_days = max(1, int(lookback_days))
+        cutoff = (datetime.now() - timedelta(days=lookback_days)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT created_at FROM conversations WHERE created_at >= ?", (cutoff,)
+        )
+        rows = cursor.fetchall()
+        conn.close()
+
+        hour_counts = {hour: 0 for hour in range(24)}
+        distinct_days: set[str] = set()
+
+        for (created_at_raw,) in rows:
+            parsed = self._parse_timestamp(created_at_raw)
+            if not parsed:
+                continue
+            hour_counts[parsed.hour] += 1
+            distinct_days.add(parsed.date().isoformat())
+
+        return {
+            "lookback_days": lookback_days,
+            "message_count": len(rows),
+            "distinct_days": len(distinct_days),
+            "hour_counts": hour_counts,
+        }
+
+    def infer_offpeak_hours(
+        self,
+        lookback_days: int = 21,
+        min_days: int = 14,
+        window_hours: int = 6,
+    ) -> dict[str, Any]:
+        """Infer a contiguous low-traffic hour window for dream-mode maintenance."""
+        stats = self.get_conversation_activity_by_hour(lookback_days=lookback_days)
+        min_days = max(1, int(min_days))
+        window_hours = max(2, min(12, int(window_hours)))
+
+        if stats["distinct_days"] < min_days:
+            return {
+                "hours": [],
+                "reason": "insufficient_history",
+                "stats": stats,
+            }
+
+        hour_counts = stats["hour_counts"]
+        best_start = 0
+        best_score: Optional[int] = None
+
+        for start in range(24):
+            window = [(start + offset) % 24 for offset in range(window_hours)]
+            score = sum(hour_counts[hour] for hour in window)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_start = start
+
+        selected_hours = sorted(
+            [(best_start + offset) % 24 for offset in range(window_hours)]
+        )
+
+        return {
+            "hours": selected_hours,
+            "reason": "ok",
+            "window_score": best_score if best_score is not None else 0,
+            "stats": stats,
+        }
+
+    def set_agent_state(self, key: str, value: Any):
+        """Persist a small JSON-serializable state value."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO agent_state (key, value, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(key)
+            DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+        """,
+            (key, json.dumps(value)),
+        )
+        conn.commit()
+        conn.close()
+
+    def get_agent_state(self, key: str, default: Any = None) -> Any:
+        """Retrieve a previously persisted JSON state value."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM agent_state WHERE key = ?", (key,))
+        row = cursor.fetchone()
+        conn.close()
+
+        if not row:
+            return default
+
+        try:
+            return json.loads(row[0])
+        except Exception:
+            return default
+
+    def get_memories_for_consolidation(
+        self,
+        limit: int = 24,
+        min_age_hours: int = 24,
+    ) -> list[Memory]:
+        """Return memory candidates eligible for dream consolidation."""
+        limit = max(1, int(limit))
+        min_age_hours = max(1, int(min_age_hours))
+        cutoff = (datetime.now() - timedelta(hours=min_age_hours)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT id, content, embedding, metadata, created_at, updated_at
+            FROM memories
+            WHERE created_at <= ?
+            ORDER BY created_at DESC
+            LIMIT ?
+        """,
+            (cutoff, limit * 3),
+        )
+        rows = cursor.fetchall()
+        conn.close()
+
+        disallowed_types = {"system_prompt", "long_term_memory"}
+        candidates: list[Memory] = []
+
+        for row in rows:
+            memory_id, content, embedding_bytes, metadata_blob, created_at, updated_at = row
+            metadata = self._parse_metadata_blob(metadata_blob)
+            memory_type = str(metadata.get("type", "")).strip()
+
+            if memory_type in disallowed_types:
+                continue
+            if metadata.get("dream_consolidated"):
+                continue
+
+            embedding = (
+                self._bytes_to_embedding(embedding_bytes) if embedding_bytes else None
+            )
+
+            candidates.append(
+                Memory(
+                    id=memory_id,
+                    content=content,
+                    embedding=embedding,
+                    metadata=metadata,
+                    created_at=created_at,
+                    updated_at=updated_at,
+                )
+            )
+
+            if len(candidates) >= limit:
+                break
+
+        return candidates
+
+    def mark_memories_dream_consolidated(
+        self,
+        memory_ids: list[int],
+        significance: Optional[float] = None,
+    ) -> int:
+        """Mark source memories as consolidated by the dream cycle."""
+        unique_ids = sorted({int(m_id) for m_id in memory_ids if int(m_id) > 0})
+        if not unique_ids:
+            return 0
+
+        consolidated_at = datetime.now().isoformat(timespec="seconds")
+        clamped_significance = None
+        if significance is not None:
+            clamped_significance = max(0.0, min(1.0, float(significance)))
+
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        updated = 0
+
+        for memory_id in unique_ids:
+            cursor.execute("SELECT metadata FROM memories WHERE id = ?", (memory_id,))
+            row = cursor.fetchone()
+            if not row:
+                continue
+
+            metadata = self._parse_metadata_blob(row[0])
+            metadata["dream_consolidated"] = True
+            metadata["dream_consolidated_at"] = consolidated_at
+            if clamped_significance is not None:
+                metadata["dream_significance"] = clamped_significance
+
+            cursor.execute(
+                """
+                UPDATE memories
+                SET metadata = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """,
+                (json.dumps(metadata), memory_id),
+            )
+            if cursor.rowcount:
+                updated += 1
+
+        conn.commit()
+        conn.close()
+        return updated
 
     def get_system_prompt(self) -> Optional[str]:
         """Get the custom system prompt."""

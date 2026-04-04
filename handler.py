@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+from difflib import SequenceMatcher
 from typing import Any, Awaitable, Callable, Optional
 
 from memory import EnhancedMemoryStore
@@ -412,6 +413,42 @@ BASE_PAYLOAD = {
 CONSORTIUM_CONTACT_MESSAGE = "contacting the consortium to decide your verdict"
 CONSORTIUM_COMPLETION_MESSAGE = "the consortium has reached an agreement."
 CONSORTIUM_MAX_ROUNDS = 4
+
+AUTO_MEMORY_ENABLED = os.environ.get("AUTO_MEMORY_ENABLED", "1").strip() != "0"
+AUTO_MEMORY_MIN_MESSAGES_PER_MEMORY = max(
+    2, int(os.environ.get("AUTO_MEMORY_MIN_MESSAGES_PER_MEMORY", "10"))
+)
+AUTO_MEMORY_MAX_MESSAGES_PER_MEMORY = max(
+    AUTO_MEMORY_MIN_MESSAGES_PER_MEMORY,
+    int(os.environ.get("AUTO_MEMORY_MAX_MESSAGES_PER_MEMORY", "20")),
+)
+AUTO_MEMORY_TARGET_MESSAGES_PER_MEMORY = min(
+    AUTO_MEMORY_MAX_MESSAGES_PER_MEMORY,
+    max(
+        AUTO_MEMORY_MIN_MESSAGES_PER_MEMORY,
+        int(os.environ.get("AUTO_MEMORY_TARGET_MESSAGES_PER_MEMORY", "15")),
+    ),
+)
+AUTO_MEMORY_DEDUPE_THRESHOLD = max(
+    0.7, min(0.99, float(os.environ.get("AUTO_MEMORY_DEDUPE_THRESHOLD", "0.9")))
+)
+
+DREAM_MODE_ENABLED = os.environ.get("MEMORY_DREAM_ENABLED", "1").strip() != "0"
+DREAM_LOOKBACK_DAYS = max(7, int(os.environ.get("MEMORY_DREAM_LOOKBACK_DAYS", "21")))
+DREAM_MIN_DAYS_FOR_PROFILE = max(7, int(os.environ.get("MEMORY_DREAM_MIN_DAYS", "14")))
+DREAM_OFFPEAK_WINDOW_HOURS = max(
+    2, min(12, int(os.environ.get("MEMORY_DREAM_OFFPEAK_WINDOW_HOURS", "6")))
+)
+DREAM_MIN_INTERVAL_HOURS = max(
+    6, int(os.environ.get("MEMORY_DREAM_MIN_INTERVAL_HOURS", "24"))
+)
+DREAM_MIN_CANDIDATES = max(1, int(os.environ.get("MEMORY_DREAM_MIN_CANDIDATES", "4")))
+DREAM_CANDIDATE_LIMIT = max(
+    DREAM_MIN_CANDIDATES,
+    int(os.environ.get("MEMORY_DREAM_CANDIDATE_LIMIT", "24")),
+)
+DREAM_MIN_AGE_HOURS = max(1, int(os.environ.get("MEMORY_DREAM_MIN_AGE_HOURS", "24")))
+
 CONSORTIUM_MEMBERS = [
     {
         "member_id": "forensic_skeptic",
@@ -558,6 +595,562 @@ class AgentHandler:
         )
         return should_contact and is_confident
 
+    @staticmethod
+    def _coerce_json_dict(raw_text: str) -> dict[str, Any]:
+        """Parse a JSON object from model output, tolerating wrapper text."""
+        if not raw_text:
+            return {}
+
+        candidate = raw_text.strip()
+        try:
+            parsed = json.loads(candidate)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            pass
+
+        match = re.search(r"\{[\s\S]*\}", candidate)
+        if not match:
+            return {}
+
+        try:
+            parsed = json.loads(match.group(0))
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _coerce_float(value: Any, default: float = 0.0) -> float:
+        """Convert arbitrary values to float with a safe default."""
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _parse_state_timestamp(value: Any) -> Optional[datetime.datetime]:
+        """Parse a timestamp from persisted state fields."""
+        if not value:
+            return None
+        candidate = str(value).strip()
+        if not candidate:
+            return None
+
+        try:
+            return datetime.datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+        except ValueError:
+            pass
+
+        try:
+            return datetime.datetime.fromisoformat(candidate.replace(" ", "T"))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _normalize_memory_text(content: str) -> str:
+        """Normalize memory text for robust duplicate checks."""
+        normalized = re.sub(r"\s+", " ", (content or "")).strip().lower()
+        normalized = re.sub(r"[^a-z0-9\s]", "", normalized)
+        return normalized
+
+    def _is_duplicate_memory(self, content: str, session_id: Optional[str]) -> bool:
+        """Check whether a memory candidate is near-duplicate of recent memories."""
+        candidate = self._normalize_memory_text(content)
+        if not candidate:
+            return True
+
+        recent_memories = self.memory_store.get_recent_memories(limit=80)
+        for memory in recent_memories:
+            metadata = memory.metadata or {}
+            if metadata.get("type") == "system_prompt":
+                continue
+
+            # Prefer session-scoped dedupe, but still avoid obvious global duplicates.
+            if session_id and metadata.get("session_id") not in (None, session_id):
+                continue
+
+            existing = self._normalize_memory_text(memory.content)
+            if not existing:
+                continue
+
+            if existing == candidate:
+                return True
+            if candidate in existing or existing in candidate:
+                return True
+
+            if (
+                SequenceMatcher(None, candidate, existing).ratio()
+                >= AUTO_MEMORY_DEDUPE_THRESHOLD
+            ):
+                return True
+
+        return False
+
+    def _should_capture_auto_memory(
+        self,
+        session_id: Optional[str],
+        message_count: int,
+    ) -> tuple[bool, dict[str, Any]]:
+        """Decide if automatic memory capture should run for this turn."""
+        if not AUTO_MEMORY_ENABLED:
+            return False, {"reason": "auto_memory_disabled"}
+
+        if not session_id:
+            return False, {"reason": "missing_session_id"}
+
+        if message_count < AUTO_MEMORY_MIN_MESSAGES_PER_MEMORY:
+            return False, {
+                "reason": "too_early",
+                "message_count": message_count,
+            }
+
+        cadence_stats = self.memory_store.get_session_memory_cadence(
+            session_id=session_id,
+            memory_types={"explicit_memory", "auto_memory", "long_term_memory"},
+        )
+        memory_count = int(cadence_stats.get("memory_count", 0) or 0)
+        latest_message_index = cadence_stats.get("latest_message_index")
+
+        ratio = float("inf") if memory_count == 0 else (message_count / memory_count)
+        messages_since_last = (
+            message_count - latest_message_index
+            if isinstance(latest_message_index, int)
+            else message_count
+        )
+
+        should_capture = False
+        reason = "cadence_ok"
+
+        if memory_count == 0 and message_count >= AUTO_MEMORY_MIN_MESSAGES_PER_MEMORY:
+            should_capture = True
+            reason = "bootstrap_memory"
+        elif ratio > AUTO_MEMORY_MAX_MESSAGES_PER_MEMORY:
+            should_capture = True
+            reason = "ratio_above_max"
+        elif messages_since_last >= AUTO_MEMORY_TARGET_MESSAGES_PER_MEMORY:
+            should_capture = True
+            reason = "stale_memory_interval"
+
+        return should_capture, {
+            "reason": reason,
+            "message_count": message_count,
+            "memory_count": memory_count,
+            "ratio": ratio,
+            "messages_since_last": messages_since_last,
+        }
+
+    async def _extract_auto_memory_candidate(
+        self,
+        session: aiohttp.ClientSession,
+        user_query: str,
+        assistant_response: str,
+    ) -> dict[str, Any]:
+        """Ask the model for one high-value memory candidate from the latest exchange."""
+        payload = BASE_PAYLOAD.copy()
+        payload["model"] = MODEL_ID
+        payload["temperature"] = 0.15
+        payload["max_tokens"] = 320
+        payload["tools"] = []
+        payload["messages"] = [
+            {
+                "role": "system",
+                "content": (
+                    "Extract at most one durable memory from the latest user/assistant exchange. "
+                    "Only store stable preferences, long-term projects, personal facts, recurring constraints, "
+                    "or high-impact commitments. Ignore one-off requests and generic chatter. "
+                    "Respond with JSON only using this schema: "
+                    '{"store": boolean, "content": string, "importance": "low"|"medium"|"high", '
+                    '"topics": string[], "significance": number, "reason": string}.'
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "User message:\n"
+                    f"{user_query}\n\n"
+                    "Assistant response:\n"
+                    f"{assistant_response}"
+                ),
+            },
+        ]
+
+        response_data = await api_call_with_retry(
+            session,
+            BASE_URL,
+            payload,
+            {"Authorization": f"Bearer {API_KEY}"},
+        )
+        raw_output = await process_response(
+            response_data,
+            payload["messages"],
+            session,
+            BASE_URL,
+            API_KEY,
+            payload,
+        )
+
+        parsed = self._coerce_json_dict(raw_output)
+        should_store = parsed.get("store", False)
+        if isinstance(should_store, str):
+            should_store = should_store.strip().lower() in {"true", "1", "yes"}
+        else:
+            should_store = bool(should_store)
+
+        content = str(parsed.get("content", "")).strip()
+        if len(content) < 20:
+            should_store = False
+
+        importance = str(parsed.get("importance", "medium")).strip().lower()
+        if importance not in {"low", "medium", "high"}:
+            importance = "medium"
+
+        topics_raw = parsed.get("topics", [])
+        topics: list[str] = []
+        if isinstance(topics_raw, list):
+            for item in topics_raw:
+                topic = str(item).strip().lower()
+                if not topic or topic in topics:
+                    continue
+                topics.append(topic)
+                if len(topics) >= 6:
+                    break
+
+        significance = max(
+            0.0,
+            min(1.0, self._coerce_float(parsed.get("significance"), default=0.5)),
+        )
+
+        return {
+            "store": should_store,
+            "content": content,
+            "importance": importance,
+            "topics": topics,
+            "significance": significance,
+            "reason": str(parsed.get("reason", "")).strip(),
+        }
+
+    async def _auto_capture_memory(
+        self,
+        session: aiohttp.ClientSession,
+        session_id: Optional[str],
+        user_query: str,
+        assistant_response: str,
+    ):
+        """Automatically capture memory while keeping a bounded messages-to-memory ratio."""
+        if not session_id or not user_query or not assistant_response:
+            return
+
+        message_count = self.memory_store.get_conversation_message_count(session_id)
+        should_capture, cadence = self._should_capture_auto_memory(
+            session_id=session_id,
+            message_count=message_count,
+        )
+        if not should_capture:
+            return
+
+        candidate = await self._extract_auto_memory_candidate(
+            session=session,
+            user_query=user_query,
+            assistant_response=assistant_response,
+        )
+        if not candidate.get("store"):
+            logger.info("Auto-memory skipped by extractor for session %s", session_id)
+            return
+
+        content = str(candidate.get("content", "")).strip()
+        if self._is_duplicate_memory(content, session_id=session_id):
+            logger.info("Auto-memory deduped for session %s", session_id)
+            return
+
+        metadata = {
+            "type": "auto_memory",
+            "source": "auto_capture",
+            "session_id": session_id,
+            "importance": candidate.get("importance", "medium"),
+            "significance": candidate.get("significance", 0.5),
+            "message_index": message_count,
+            "cadence_reason": cadence.get("reason"),
+            "cadence_ratio": cadence.get("ratio"),
+        }
+        if candidate.get("reason"):
+            metadata["extractor_reason"] = candidate["reason"]
+
+        memory_id = await self.memory_store.add_memory(
+            content=content,
+            metadata=metadata,
+            topics=candidate.get("topics", []),
+            generate_embedding=True,
+        )
+        logger.info(
+            "Auto-memory stored: id=%s session=%s reason=%s ratio=%s",
+            memory_id,
+            session_id,
+            cadence.get("reason"),
+            cadence.get("ratio"),
+        )
+
+    def _get_or_refresh_dream_profile(self) -> dict[str, Any]:
+        """Compute or refresh the learned off-peak profile used for dream mode."""
+        now = datetime.datetime.now()
+        profile = self.memory_store.get_agent_state("dream.profile", default={})
+        if not isinstance(profile, dict):
+            profile = {}
+
+        profiled_at = self._parse_state_timestamp(profile.get("profiled_at"))
+        should_refresh = (
+            not profile
+            or not profile.get("hours")
+            or not profiled_at
+            or (now - profiled_at).total_seconds() >= 24 * 3600
+        )
+
+        if not should_refresh:
+            return profile
+
+        inferred = self.memory_store.infer_offpeak_hours(
+            lookback_days=DREAM_LOOKBACK_DAYS,
+            min_days=DREAM_MIN_DAYS_FOR_PROFILE,
+            window_hours=DREAM_OFFPEAK_WINDOW_HOURS,
+        )
+        refreshed_profile = {
+            "hours": inferred.get("hours", []),
+            "reason": inferred.get("reason", "unknown"),
+            "stats": inferred.get("stats", {}),
+            "window_score": inferred.get("window_score", 0),
+            "profiled_at": now.isoformat(timespec="seconds"),
+        }
+        self.memory_store.set_agent_state("dream.profile", refreshed_profile)
+        return refreshed_profile
+
+    async def _extract_dream_consolidation_payload(
+        self,
+        session: aiohttp.ClientSession,
+        candidates_payload: str,
+        candidate_ids: set[int],
+    ) -> list[dict[str, Any]]:
+        """Generate long-term consolidated memories from short-term memory candidates."""
+        payload = BASE_PAYLOAD.copy()
+        payload["model"] = MODEL_ID
+        payload["temperature"] = 0.2
+        payload["max_tokens"] = 700
+        payload["tools"] = []
+        payload["messages"] = [
+            {
+                "role": "system",
+                "content": (
+                    "You are running an offline memory consolidation pass. "
+                    "Merge related short-term memories into a small set of durable long-term memories. "
+                    "Only keep information likely to matter in future conversations. "
+                    "Output JSON only with schema: "
+                    '{"consolidated": [{"content": string, "significance": number, '
+                    '"topics": string[], "source_memory_ids": number[]}]}'
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Candidate memories:\n"
+                    f"{candidates_payload}\n\n"
+                    "Return at most 6 consolidated memories."
+                ),
+            },
+        ]
+
+        response_data = await api_call_with_retry(
+            session,
+            BASE_URL,
+            payload,
+            {"Authorization": f"Bearer {API_KEY}"},
+        )
+        raw_output = await process_response(
+            response_data,
+            payload["messages"],
+            session,
+            BASE_URL,
+            API_KEY,
+            payload,
+        )
+
+        parsed = self._coerce_json_dict(raw_output)
+        entries = parsed.get("consolidated", [])
+        if not isinstance(entries, list):
+            return []
+
+        consolidated: list[dict[str, Any]] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+
+            content = str(entry.get("content", "")).strip()
+            if len(content) < 25:
+                continue
+
+            significance = max(
+                0.0,
+                min(1.0, self._coerce_float(entry.get("significance"), default=0.5)),
+            )
+
+            topics_raw = entry.get("topics", [])
+            topics: list[str] = []
+            if isinstance(topics_raw, list):
+                for topic_item in topics_raw:
+                    topic = str(topic_item).strip().lower()
+                    if topic and topic not in topics:
+                        topics.append(topic)
+                    if len(topics) >= 6:
+                        break
+
+            source_ids_raw = entry.get("source_memory_ids", [])
+            source_ids: list[int] = []
+            if isinstance(source_ids_raw, list):
+                for item in source_ids_raw:
+                    try:
+                        source_id = int(item)
+                    except (TypeError, ValueError):
+                        continue
+                    if source_id in candidate_ids and source_id not in source_ids:
+                        source_ids.append(source_id)
+
+            if not source_ids:
+                continue
+
+            consolidated.append(
+                {
+                    "content": content,
+                    "significance": significance,
+                    "topics": topics,
+                    "source_memory_ids": source_ids,
+                }
+            )
+
+            if len(consolidated) >= 6:
+                break
+
+        return consolidated
+
+    async def _run_dream_cycle_if_due(self, session: aiohttp.ClientSession):
+        """Run periodic memory consolidation during inferred off-peak hours."""
+        if not DREAM_MODE_ENABLED:
+            return
+
+        profile = self._get_or_refresh_dream_profile()
+        hours = profile.get("hours", [])
+        if not isinstance(hours, list) or not hours:
+            return
+
+        now = datetime.datetime.now()
+        if now.hour not in {int(hour) for hour in hours if isinstance(hour, int)}:
+            return
+
+        last_run_at = self._parse_state_timestamp(
+            self.memory_store.get_agent_state("dream.last_run_at")
+        )
+        if (
+            last_run_at
+            and (now - last_run_at).total_seconds() < DREAM_MIN_INTERVAL_HOURS * 3600
+        ):
+            return
+
+        candidates = self.memory_store.get_memories_for_consolidation(
+            limit=DREAM_CANDIDATE_LIMIT,
+            min_age_hours=DREAM_MIN_AGE_HOURS,
+        )
+        if len(candidates) < DREAM_MIN_CANDIDATES:
+            return
+
+        candidate_ids = {memory.id for memory in candidates if memory.id is not None}
+        candidate_lines: list[str] = []
+        for memory in candidates:
+            if memory.id is None:
+                continue
+            importance = str((memory.metadata or {}).get("importance", "medium"))
+            candidate_lines.append(
+                f"id={memory.id} | importance={importance} | content={memory.content}"
+            )
+
+        consolidated = await self._extract_dream_consolidation_payload(
+            session=session,
+            candidates_payload="\n".join(candidate_lines),
+            candidate_ids=candidate_ids,
+        )
+
+        created_ids: list[int] = []
+        source_significance: dict[int, float] = {}
+        for entry in consolidated:
+            content = entry["content"]
+            if self._is_duplicate_memory(content, session_id=None):
+                continue
+
+            significance = max(0.0, min(1.0, float(entry["significance"])))
+            metadata = {
+                "type": "long_term_memory",
+                "source": "dream_cycle",
+                "long_term": True,
+                "significance": significance,
+                "importance": "high" if significance >= 0.8 else "medium",
+                "source_memory_ids": entry["source_memory_ids"],
+                "dream_hours": hours,
+            }
+
+            new_memory_id = await self.memory_store.add_memory(
+                content=content,
+                metadata=metadata,
+                topics=entry.get("topics", []),
+                generate_embedding=True,
+            )
+            if new_memory_id is not None:
+                created_ids.append(int(new_memory_id))
+
+            for source_id in entry["source_memory_ids"]:
+                source_significance[source_id] = max(
+                    source_significance.get(source_id, 0.0),
+                    significance,
+                )
+
+        for source_id, significance in source_significance.items():
+            self.memory_store.mark_memories_dream_consolidated(
+                [source_id], significance=significance
+            )
+
+        run_timestamp = now.isoformat(timespec="seconds")
+        self.memory_store.set_agent_state("dream.last_run_at", run_timestamp)
+        self.memory_store.set_agent_state(
+            "dream.last_result",
+            {
+                "run_at": run_timestamp,
+                "candidate_count": len(candidates),
+                "consolidated_count": len(created_ids),
+                "created_memory_ids": created_ids,
+            },
+        )
+
+        if created_ids:
+            logger.info(
+                "Dream cycle consolidated %d long-term memories", len(created_ids)
+            )
+
+    async def _run_memory_maintenance(
+        self,
+        session: aiohttp.ClientSession,
+        session_id: Optional[str],
+        user_query: str,
+        assistant_response: str,
+    ):
+        """Run post-response memory upkeep: cadence capture + dream consolidation."""
+        try:
+            await self._auto_capture_memory(
+                session=session,
+                session_id=session_id,
+                user_query=user_query,
+                assistant_response=assistant_response,
+            )
+        except Exception as exc:
+            logger.warning("Auto-memory capture failed: %s", exc)
+
+        try:
+            await self._run_dream_cycle_if_due(session=session)
+        except Exception as exc:
+            logger.warning("Dream-cycle maintenance failed: %s", exc)
+
     def _extract_consortium_vote(
         self, messages: list[dict[str, Any]]
     ) -> dict[str, Any] | None:
@@ -649,6 +1242,7 @@ class AgentHandler:
             "If the user asks you to remember or store something, you MUST use the remember() tool.\n"
             "Use recall() to retrieve past memories.\n"
             "If you need access to current information not available to you, use the web_search() tool.\n"
+            'For readability, you may split a reply into multiple chunks using <message>...</message> blocks. You may also insert <typing seconds="1.2"/> between message blocks to add brief pacing pauses. If you use this format, keep all user-visible text inside those message blocks.\n'
             "IMPORTANT: Do not use markdown formatting, code blocks, or emojis in your responses. Respond in plain text only.\n"
         )
 
@@ -1007,14 +1601,43 @@ class AgentHandler:
         if user_query:
             try:
                 relevant_memories = await self.memory_store.search_memories(
-                    query=user_query, top_k=3, threshold=0.15
+                    query=user_query, top_k=8, threshold=0.15
                 )
                 if relevant_memories:
+                    weighted_memories: list[tuple[Any, float, float, float]] = []
+                    for memory, similarity in relevant_memories:
+                        metadata = memory.metadata or {}
+                        significance = max(
+                            0.0,
+                            min(
+                                1.0,
+                                self._coerce_float(
+                                    metadata.get("significance"), default=0.0
+                                ),
+                            ),
+                        )
+                        if metadata.get("type") == "long_term_memory":
+                            significance = max(significance, 0.6)
+
+                        effective_score = similarity + (0.25 * significance)
+                        weighted_memories.append(
+                            (memory, similarity, significance, effective_score)
+                        )
+
+                    weighted_memories.sort(key=lambda item: item[3], reverse=True)
                     memory_context = (
                         "\n\n[Relevant memories from past conversations]:\n"
                     )
-                    for i, (memory, score) in enumerate(relevant_memories, 1):
-                        memory_context += f"{i}. {memory.content}\n"
+                    for i, (memory, _, significance, _) in enumerate(
+                        weighted_memories[:3], 1
+                    ):
+                        if significance >= 0.75:
+                            memory_context += (
+                                f"{i}. [high significance {significance:.2f}] "
+                                f"{memory.content}\n"
+                            )
+                        else:
+                            memory_context += f"{i}. {memory.content}\n"
             except Exception as e:
                 logger.warning(f"Failed to retrieve memories: {e}")
 
@@ -1088,20 +1711,27 @@ class AgentHandler:
                     memory_context=memory_context,
                 )
 
-            if acknowledgement and not acknowledgement_delivered:
-                content = f"{acknowledgement}\n\n{content}"
+                if acknowledgement and not acknowledgement_delivered:
+                    content = f"{acknowledgement}\n\n{content}"
 
-            if session_id and user_query:
-                self.memory_store.add_conversation_message(
-                    role="user", content=user_query, session_id=session_id
-                )
-            if session_id and acknowledgement_delivered and acknowledgement:
-                self.memory_store.add_conversation_message(
-                    role="assistant", content=acknowledgement, session_id=session_id
-                )
-            if session_id and content:
-                self.memory_store.add_conversation_message(
-                    role="assistant", content=content, session_id=session_id
+                if session_id and user_query:
+                    self.memory_store.add_conversation_message(
+                        role="user", content=user_query, session_id=session_id
+                    )
+                if session_id and acknowledgement_delivered and acknowledgement:
+                    self.memory_store.add_conversation_message(
+                        role="assistant", content=acknowledgement, session_id=session_id
+                    )
+                if session_id and content:
+                    self.memory_store.add_conversation_message(
+                        role="assistant", content=content, session_id=session_id
+                    )
+
+                await self._run_memory_maintenance(
+                    session=session,
+                    session_id=session_id,
+                    user_query=user_query,
+                    assistant_response=content,
                 )
 
             if task and content and not content.startswith("Error:"):
@@ -1155,6 +1785,13 @@ class AgentHandler:
                 self.memory_store.add_conversation_message(
                     role="assistant", content=content, session_id=session_id
                 )
+
+            await self._run_memory_maintenance(
+                session=session,
+                session_id=session_id,
+                user_query=user_query,
+                assistant_response=content,
+            )
 
             # Provide feedback on examples if task was completed
             if task and content and not content.startswith("Error:"):

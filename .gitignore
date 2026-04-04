@@ -57,3 +57,6 @@ Thumbs.db
 *.opus
 *.m4a
 *.caf
+
+# PID files
+*.pid

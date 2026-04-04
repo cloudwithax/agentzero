@@ -7,11 +7,13 @@ An AI assistant with persistent memory and bulletproof tool calling. Tested agai
 AgentZero is designed to be used completely for free using the NVIDIA API, which offers a generous free tier.
 
 1. Install dependencies:
+
 ```bash
 pip install -r requirements.txt
 ```
 
 2. Copy the environment file and add your tokens:
+
 ```bash
 cp .env.example .env
 ```
@@ -32,10 +34,16 @@ cp .env.example .env
      - `qwen/qwen3.5-397b-a17b`
 
 Optional Sendblue reliability settings:
+
 - `SENDBLUE_WEBHOOK_PORT` - Run local webhook server instead of polling.
 - `SENDBLUE_RECEIVE_WEBHOOK_URL` - If set, periodically verifies your Sendblue `receive` webhook and re-adds it if missing using append-only `POST /api/account/webhooks`.
 - `SENDBLUE_TYPING_WEBHOOK_URL` - Optional dedicated URL for Sendblue `typing_indicator` webhook registration. If unset, the bot reuses `SENDBLUE_RECEIVE_WEBHOOK_URL`.
 - `SENDBLUE_WEBHOOK_CHECK_INTERVAL` - Seconds between webhook checks (default: `60`, min enforced: `10`).
+- `SENDBLUE_STARTUP_REPLAY_ENABLED` - On startup, fetch and process recent inbound messages sent while the bot was offline (default: `1`).
+- `SENDBLUE_STARTUP_LOOKBACK_SECONDS` - Startup lookback window for offline message replay (default: `21600`, i.e. 6 hours).
+- `SENDBLUE_STARTUP_UNREAD_ONLY` - When Sendblue read-state fields are present, replay only unread inbound messages (default: `1`).
+- `SENDBLUE_STARTUP_REPLAY_UNKNOWN_READ_STATE` - If read-state is missing, still replay recent inbound messages within lookback window (default: `1`).
+- `SENDBLUE_DEDUP_TTL_SECONDS` - TTL for in-memory Sendblue message-handle dedupe across startup replay + webhook/polling handoff (default: `60`, min enforced: `10`).
 - `SENDBLUE_ATTACHMENT_DEBOUNCE_SECONDS` - Debounce window for attachment-first inbound webhook sequences before sending to the agent (default: `2.0`).
 - `SENDBLUE_TYPING_DEBOUNCE_SECONDS` - Optional debounce extension window for typing webhook events when a sender already has pending queued content (default: attachment debounce value).
 - `SENDBLUE_VOICE_MEMO_TRANSCRIPTION_ENABLED` - Enable/disable voice memo transcription for inbound iMessage audio attachments (default: `1`).
@@ -49,17 +57,42 @@ Optional Sendblue reliability settings:
 For iMessage native `.m4a`/`.caf` voice memo fallback conversion, install `ffmpeg` on the host machine.
 
 Multimodal/NVIDIA asset handling:
+
 - `NVCF_ASSET_UPLOAD_ENABLED` - Upload inbound multimodal image URLs to NVIDIA NVCF Assets before inference and pass `asset_id` references (default: `1`, set `0` to disable).
 - This is enabled by default for supported multimodal models and helps with large/private channel attachment URLs that cannot be fetched reliably by the model endpoint.
+
+Optional Telegram reliability settings:
+
+- `TELEGRAM_REPLAY_PENDING_UPDATES_ON_STARTUP` - Process queued Telegram updates immediately after reconnect and before normal polling starts (default: `1`).
+- `TELEGRAM_PENDING_UPDATES_BATCH_SIZE` - Batch size used when draining startup backlog (default: `100`, max: `100`).
+- `TELEGRAM_PENDING_UPDATES_MAX_BATCHES` - Max startup batches to drain per boot (default: `5`).
+
+Optional memory cadence and consolidation settings:
+
+- `AUTO_MEMORY_ENABLED` - Enable automatic memory extraction from completed turns (default: `1`).
+- `AUTO_MEMORY_MIN_MESSAGES_PER_MEMORY` - Lower bound for cadence gating (default: `10`).
+- `AUTO_MEMORY_TARGET_MESSAGES_PER_MEMORY` - Preferred cadence interval (default: `15`).
+- `AUTO_MEMORY_MAX_MESSAGES_PER_MEMORY` - Upper bound before forced capture (default: `20`).
+- `AUTO_MEMORY_DEDUPE_THRESHOLD` - Similarity threshold for skipping near-duplicate memory candidates (default: `0.90`).
+- `MEMORY_DREAM_ENABLED` - Enable background-style dream consolidation (default: `1`).
+- `MEMORY_DREAM_LOOKBACK_DAYS` - Activity lookback used to infer off-peak hours (default: `21`).
+- `MEMORY_DREAM_MIN_DAYS` - Minimum distinct active days before learned scheduling is considered reliable (default: `14`).
+- `MEMORY_DREAM_OFFPEAK_WINDOW_HOURS` - Width of the inferred off-peak window used for consolidation (default: `6`).
+- `MEMORY_DREAM_MIN_INTERVAL_HOURS` - Minimum spacing between dream runs (default: `24`).
+- `MEMORY_DREAM_MIN_CANDIDATES` - Minimum eligible short-term memories required to run consolidation (default: `4`).
+- `MEMORY_DREAM_CANDIDATE_LIMIT` - Max short-term candidate memories passed into a dream cycle (default: `24`).
+- `MEMORY_DREAM_MIN_AGE_HOURS` - Minimum source-memory age for dream consolidation eligibility (default: `24`).
 
 ## Usage
 
 ### Run the agent:
+
 ```bash
 python main.py
 ```
 
 ### Run the agent as a daemon:
+
 ```bash
 python main.py --daemon
 ```
@@ -67,6 +100,7 @@ python main.py --daemon
 In daemon mode, output is written to `agentzero.out.log` and `agentzero.err.log`.
 
 ### Stop the daemon:
+
 ```bash
 python main.py --stop
 ```
@@ -79,6 +113,7 @@ This will run the agent with both Telegram and iMessage (using SendBlue) channel
 ## Features
 
 - Persistent memory using SQLite and embeddings
+- Cross-channel slash commands (`/start`, `/setprompt`, `/clear`, `/memorystats`; plus `/memorycadence` alias on Telegram and `/memory_stats` + `/memorycadence` aliases on iMessage)
 - File operations (read, write, edit)
 - Shell command execution
 - PDF reading
@@ -87,7 +122,8 @@ This will run the agent with both Telegram and iMessage (using SendBlue) channel
 - Telegram image uploads (single + media group)
 - Sendblue image attachments (single + multiple)
 - Sendblue voice memo transcription with NVIDIA Parakeet CTC 0.6B ASR
-
+- Auto memory extraction with cadence control (default target: ~1 memory per 15 messages)
+- Dream-style long-term memory consolidation during inferred off-peak hours
 
 ## License
 

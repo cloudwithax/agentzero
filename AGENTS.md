@@ -174,7 +174,7 @@ All tools return a consistent dictionary format:
 ### Sendblue Formatting + Test Invocation
 
 - Outbound Sendblue text is normalized in `_format_sendblue_message_content()` before send.
-- `SENDBLUE_FORCE_CARRIAGE_RETURNS=1` (default) converts `\n` to `\r` for iMessage formatting reliability.
+- `SENDBLUE_FORCE_CARRIAGE_RETURNS=1` (default) converts `\n` to `\r\r` for iMessage formatting reliability.
 - Running tests from `tests/` directly can fail imports; use `PYTHONPATH=.`.
 
 ### Error Handling
@@ -196,7 +196,7 @@ All tools return a consistent dictionary format:
 - **Pitfall: iMessage formatting was inconsistent (sometimes single dense paragraph, sometimes line-broken).**
   **Fix:** Normalize outbound Sendblue text right before send in `integrations.py` via `_format_sendblue_message_content()` and route all outbound content through it from `send_imessage()`.
 - **Pitfall: Newline variants arrived mixed (`\\n`, `\\r\\n`, and real newlines), causing unpredictable rendering.**
-  **Fix:** Canonicalize all line endings to `\n`, collapse excessive blank lines, then convert to carriage returns for iMessage delivery.
+  **Fix:** Canonicalize all line endings to `\n`, collapse excessive blank lines, then convert to double carriage returns for iMessage delivery.
 - **Pitfall: Receipt-style key/value outputs were hard to read when model returned one long paragraph.**
   **Fix:** Add deterministic split rules for common labels (`name:`, `order #:`, `date:`, `items:`, `drinks:`, `sauces:`, `restaurant #:`), with sentence splitting fallback.
 - **Pitfall: Behavior needed an operational toggle for rollback/troubleshooting.**
@@ -206,6 +206,24 @@ All tools return a consistent dictionary format:
   `PYTHONPATH=. ../agentzero/.venv/bin/python tests/test_sendblue_debounce.py`
 - **Pitfall: Formatting changes can regress silently if only manual QA is used.**
   **Fix:** Add explicit regression tests that assert Sendblue payload content uses carriage returns and that dense receipt text is split predictably.
+- **Pitfall: Messages sent while the bot was offline were skipped in Sendblue webhook mode and on fresh polling startups.**
+  **Fix:** Add startup replay in `integrations.py` (`_replay_sendblue_startup_backlog`) using configurable lookback + unread detection, then process immediately before entering webhook/polling loops.
+- **Pitfall: Startup replay and live webhooks/polling can double-process the same Sendblue message during handoff.**
+  **Fix:** Seed handle-based in-memory dedupe across replay + runtime (`SENDBLUE_DEDUP_TTL_SECONDS`) and cover behavior in `tests/test_sendblue_debounce.py`.
+- **Pitfall: Telegram queued updates could remain delayed until regular polling stabilized after reconnect.**
+  **Fix:** Drain pending updates first via `_replay_telegram_pending_updates()` before `start_polling()`, controlled by `TELEGRAM_REPLAY_PENDING_UPDATES_ON_STARTUP`.
+- **Pitfall: Conversation logs could grow quickly while persistent memories remained sparse because memory writes depended on explicit `remember()` tool calls.**
+  **Fix:** Add post-response auto-memory cadence capture in `handler.py` with bounded ratio controls (`AUTO_MEMORY_MIN_MESSAGES_PER_MEMORY=10`, `AUTO_MEMORY_TARGET_MESSAGES_PER_MEMORY=15`, `AUTO_MEMORY_MAX_MESSAGES_PER_MEMORY=20`) plus near-duplicate filtering (`AUTO_MEMORY_DEDUPE_THRESHOLD`).
+- **Pitfall: Without consolidation, short-term memories accumulate and retrieval quality drifts over time.**
+  **Fix:** Add dream-cycle consolidation in `handler.py` + `memory.py` that learns off-peak windows from 2-3 weeks of usage (`infer_offpeak_hours` with 21-day lookback / 14-day minimum), writes `long_term_memory` entries with model-assigned significance, and marks source memories as consolidated.
+- **Pitfall: Conversational replies were delivered as one dense outbound text even when the model intended pacing/beat breaks.**
+  **Fix:** Add agent-directed chunk extraction in `integrations.py` (`_split_outbound_message_chunks`) that honors `<message>...</message>` blocks and fan-outs each chunk as a separate outbound Sendblue/Telegram message while preserving attachment delivery on the final chunk.
+- **Pitfall: New chunked-delivery behavior could regress and silently collapse back to single-message sends.**
+  **Fix:** Add regression assertions in `tests/test_sendblue_debounce.py` for explicit chunk extraction and multi-call Sendblue dispatch (`test_split_outbound_message_chunks_prefers_explicit_blocks`, `test_send_imessage_sends_explicit_message_blocks_separately`). Validate with: `PYTHONPATH=. .venv/bin/python tests/test_sendblue_debounce.py`.
+- **Pitfall: Multi-part replies still felt abrupt when chunk boundaries were respected but no pacing cue existed.**
+  **Fix:** Extend outbound parsing in `integrations.py` to support `<typing seconds="..."/>` directives between `<message>` blocks, then emit channel-appropriate typing pauses before the next chunk.
+- **Pitfall: Typing-directive behavior can silently break while basic chunk splitting still passes.**
+  **Fix:** Add regression assertions in `tests/test_sendblue_debounce.py` (`test_split_outbound_message_chunks_ignores_typing_directives`, `test_send_imessage_typing_directive_triggers_indicator`) and validate with: `PYTHONPATH=. .venv/bin/python tests/test_sendblue_debounce.py`.
 
 ## Key Functions Reference
 
@@ -228,6 +246,8 @@ The Telegram bot supports the following slash commands:
 | `/start`     | Initialize interaction with the bot                                                                                                                                                        |
 | `/setprompt` | Change the system prompt. After sending this command, the bot will ask you to provide the new prompt in your next message. The prompt is stored persistently and takes effect immediately. |
 | `/clear`     | Clear conversation history for the current session/chat context.                                                                                                                           |
+| `/memorystats` | Show current memory cadence and dream-profile status for the active session/chat context.                                                                                                |
+| `/memorycadence` | Alias of `/memorystats`.                                                                                                                                                               |
 
 ## Adding New Tools
 

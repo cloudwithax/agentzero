@@ -11,7 +11,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, Optional
 from urllib.parse import urlparse
 
@@ -43,6 +43,7 @@ except Exception:
 
 # Track users who are in the process of setting a system prompt
 pending_prompt_users: Dict[int, bool] = {}
+pending_prompt_phone_numbers: Dict[str, bool] = {}
 pending_telegram_media_groups: Dict[str, dict[str, Any]] = {}
 telegram_media_group_lock = asyncio.Lock()
 
@@ -76,10 +77,25 @@ VOICE_MEMO_CONVERTED_FILENAME = "voice-memo-converted.wav"
 VOICE_MEMO_CONVERTED_CONTENT_TYPE = "audio/wav"
 IMAGE_FFMPEG_BIN_DEFAULT = "ffmpeg"
 IMAGE_MAGICK_BIN_ENV = "SENDBLUE_IMAGE_MAGICK_BIN"
+SENDBLUE_STARTUP_LOOKBACK_SECONDS_DEFAULT = 6 * 60 * 60
+TELEGRAM_PENDING_UPDATES_BATCH_SIZE_DEFAULT = 100
+TELEGRAM_PENDING_UPDATES_MAX_BATCHES_DEFAULT = 5
 IMESSAGE_LABEL_BREAK_PATTERN = re.compile(
     r"\s+(?=(?:name|order(?:\s*#)?|date|items|drinks|sauces|restaurant(?:\s*#)?)\s*:)",
     re.IGNORECASE,
 )
+OUTBOUND_MESSAGE_BLOCK_PATTERN = re.compile(
+    r"<message>\s*(.*?)\s*</message>",
+    re.IGNORECASE | re.DOTALL,
+)
+OUTBOUND_DELIVERY_DIRECTIVE_PATTERN = re.compile(
+    r"<message>\s*(?P<message>.*?)\s*</message>|"
+    r"<typing(?:\s+seconds\s*=\s*['\"]?(?P<seconds>\d+(?:\.\d+)?)['\"]?)?\s*/>",
+    re.IGNORECASE | re.DOTALL,
+)
+OUTBOUND_TYPING_SECONDS_DEFAULT = 1.2
+OUTBOUND_TYPING_SECONDS_MIN = 0.2
+OUTBOUND_TYPING_SECONDS_MAX = 8.0
 VOICE_MEMO_AUDIO_EXTENSIONS = {
     ".aac",
     ".amr",
@@ -124,6 +140,138 @@ def _to_bool(value) -> bool:
     return False
 
 
+def _env_int(
+    name: str,
+    default: int,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    """Parse integer env vars with optional clamping and warning logs."""
+    raw_value = os.environ.get(name, str(default))
+    try:
+        parsed = int(str(raw_value).strip())
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s=%r, defaulting to %s", name, raw_value, default)
+        parsed = default
+
+    if minimum is not None and parsed < minimum:
+        parsed = minimum
+    if maximum is not None and parsed > maximum:
+        parsed = maximum
+
+    return parsed
+
+
+def _extract_text_from_user_content(user_content: str | list[dict[str, Any]]) -> str:
+    """Extract plain text from iMessage user content payloads."""
+    if isinstance(user_content, str):
+        return user_content
+
+    if isinstance(user_content, list):
+        parts: list[str] = []
+        for item in user_content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text" and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+            elif isinstance(item.get("content"), str):
+                parts.append(item["content"])
+        return "\n".join(part for part in parts if part).strip()
+
+    return ""
+
+
+def _parse_slash_command(text: str) -> tuple[str, str]:
+    """Return (command, args) from slash-command text."""
+    normalized = (text or "").strip()
+    if not normalized.startswith("/"):
+        return "", ""
+
+    command_token, _, arg_text = normalized.partition(" ")
+    return command_token.strip().lower(), arg_text.strip()
+
+
+def _format_memory_cadence_stats(handler: Any, session_id: str) -> str:
+    """Build human-readable memory cadence stats for slash-command responses."""
+    try:
+        overall = handler.memory_store.get_memory_stats()
+    except Exception as e:
+        logger.error("Failed to load memory stats: %s", e)
+        return "Unable to read memory stats right now."
+
+    session_messages = 0
+    if hasattr(handler.memory_store, "get_conversation_message_count"):
+        try:
+            session_messages = int(
+                handler.memory_store.get_conversation_message_count(session_id)
+            )
+        except Exception:
+            session_messages = 0
+
+    cadence = {
+        "memory_count": 0,
+        "latest_message_index": None,
+    }
+    if hasattr(handler.memory_store, "get_session_memory_cadence"):
+        try:
+            cadence = handler.memory_store.get_session_memory_cadence(
+                session_id=session_id,
+                memory_types={"explicit_memory", "auto_memory", "long_term_memory"},
+            )
+        except Exception:
+            cadence = {
+                "memory_count": 0,
+                "latest_message_index": None,
+            }
+
+    session_memory_count = int(cadence.get("memory_count", 0) or 0)
+    latest_message_index = cadence.get("latest_message_index")
+    if not isinstance(latest_message_index, int):
+        latest_message_index = None
+
+    if session_memory_count <= 0:
+        ratio_text = "n/a (no session memories yet)"
+    else:
+        ratio_value = session_messages / max(session_memory_count, 1)
+        ratio_text = f"{ratio_value:.1f}"
+
+    if latest_message_index is None:
+        since_last_text = str(session_messages)
+    else:
+        since_last_text = str(max(0, session_messages - latest_message_index))
+
+    dream_text = "not available"
+    if hasattr(handler.memory_store, "get_agent_state"):
+        try:
+            dream_profile = handler.memory_store.get_agent_state("dream.profile", {})
+            if isinstance(dream_profile, dict) and dream_profile.get("hours"):
+                hours = [
+                    int(hour)
+                    for hour in dream_profile.get("hours", [])
+                    if isinstance(hour, int)
+                ]
+                if hours:
+                    dream_text = ", ".join(f"{hour:02d}:00" for hour in hours)
+                else:
+                    dream_text = str(dream_profile.get("reason", "learning"))
+            elif isinstance(dream_profile, dict):
+                dream_text = str(dream_profile.get("reason", "learning"))
+        except Exception:
+            dream_text = "unknown"
+
+    return (
+        "Memory stats:\n"
+        f"- Total memories: {overall.get('total_memories', 0)}\n"
+        f"- Total conversation messages: {overall.get('total_conversations', 0)}\n"
+        f"- Session messages: {session_messages}\n"
+        f"- Session memories: {session_memory_count}\n"
+        f"- Messages per memory: {ratio_text} (target 10-20)\n"
+        f"- Messages since last memory: {since_last_text}\n"
+        f"- Dream off-peak hours: {dream_text}"
+    )
+
+
 def _format_sendblue_message_content(message: str) -> str:
     """Normalize outbound Sendblue text and enforce carriage returns for iMessage."""
     normalized = "" if message is None else str(message)
@@ -155,8 +303,76 @@ def _format_sendblue_message_content(message: str) -> str:
                 normalized = "\n".join(sentence_parts)
 
     if _to_bool(os.environ.get("SENDBLUE_FORCE_CARRIAGE_RETURNS", "1")):
-        return normalized.replace("\n", "\r")
+        return normalized.replace("\n", "\r\r")
     return normalized
+
+
+def _split_outbound_message_chunks(message: str) -> list[str]:
+    """Split outbound assistant text into chunks, honoring <message> blocks."""
+    delivery_plan = _build_outbound_delivery_plan(message)
+    return [
+        str(step.get("text", "")).strip()
+        for step in delivery_plan
+        if step.get("type") == "message" and str(step.get("text", "")).strip()
+    ]
+
+
+def _parse_outbound_typing_seconds(raw_value: Any) -> float:
+    """Parse and clamp explicit typing delays from model output directives."""
+    if raw_value is None:
+        return OUTBOUND_TYPING_SECONDS_DEFAULT
+
+    try:
+        parsed = float(str(raw_value).strip())
+    except (TypeError, ValueError):
+        return OUTBOUND_TYPING_SECONDS_DEFAULT
+
+    if parsed <= 0:
+        return OUTBOUND_TYPING_SECONDS_DEFAULT
+
+    return max(
+        OUTBOUND_TYPING_SECONDS_MIN,
+        min(OUTBOUND_TYPING_SECONDS_MAX, parsed),
+    )
+
+
+def _build_outbound_delivery_plan(message: str) -> list[dict[str, Any]]:
+    """Build ordered outbound steps (message chunks + optional typing pauses)."""
+    normalized = "" if message is None else str(message)
+    if not normalized.strip():
+        return []
+
+    steps: list[dict[str, Any]] = []
+    saw_directive = False
+    saw_message_block = False
+
+    for match in OUTBOUND_DELIVERY_DIRECTIVE_PATTERN.finditer(normalized):
+        saw_directive = True
+        message_block = match.group("message")
+        if isinstance(message_block, str):
+            saw_message_block = True
+            chunk_text = message_block.strip()
+            if chunk_text:
+                steps.append({"type": "message", "text": chunk_text})
+            continue
+
+        steps.append(
+            {
+                "type": "typing",
+                "seconds": _parse_outbound_typing_seconds(match.group("seconds")),
+            }
+        )
+
+    if saw_message_block:
+        return steps
+
+    if saw_directive:
+        # If malformed directives were emitted without <message> blocks,
+        # fall back to plain text behavior instead of dropping content.
+        stripped = OUTBOUND_DELIVERY_DIRECTIVE_PATTERN.sub("", normalized).strip()
+        return [{"type": "message", "text": stripped}] if stripped else []
+
+    return [{"type": "message", "text": normalized.strip()}]
 
 
 def _normalize_attachment_urls(value: Any) -> list[str]:
@@ -705,6 +921,277 @@ def _extract_sendblue_typing_state(payload: dict[str, Any]) -> bool | None:
         return _to_bool(payload.get("typing"))
 
     return None
+
+
+def _extract_sendblue_message_handle(payload: dict[str, Any]) -> str:
+    """Extract a stable message identifier from Sendblue payload shapes."""
+    for key in (
+        "message_handle",
+        "messageHandle",
+        "message_id",
+        "messageId",
+        "handle",
+        "id",
+    ):
+        value = payload.get(key)
+        if value is None:
+            continue
+        normalized = str(value).strip()
+        if normalized:
+            return normalized
+    return ""
+
+
+def _parse_datetime_like(value: Any) -> datetime | None:
+    """Best-effort datetime parser for mixed API date/time payload formats."""
+    if value is None:
+        return None
+
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, (int, float)):
+        timestamp = float(value)
+        if timestamp > 1_000_000_000_000:
+            timestamp /= 1000.0
+        try:
+            parsed = datetime.utcfromtimestamp(timestamp)
+        except (OverflowError, OSError, ValueError):
+            return None
+    elif isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+
+        if re.fullmatch(r"-?\d+(?:\.\d+)?", raw):
+            try:
+                numeric = float(raw)
+                if numeric > 1_000_000_000_000:
+                    numeric /= 1000.0
+                parsed = datetime.utcfromtimestamp(numeric)
+            except (OverflowError, OSError, ValueError):
+                return None
+        else:
+            iso_raw = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+            try:
+                parsed = datetime.fromisoformat(iso_raw)
+            except ValueError:
+                return None
+    else:
+        return None
+
+    if parsed.tzinfo is not None:
+        return parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def _extract_sendblue_message_datetime(payload: dict[str, Any]) -> datetime | None:
+    """Extract message timestamp from common Sendblue payload keys."""
+    for key in (
+        "created_at",
+        "createdAt",
+        "received_at",
+        "receivedAt",
+        "sent_at",
+        "sentAt",
+        "timestamp",
+        "time",
+        "date",
+        "updated_at",
+        "updatedAt",
+    ):
+        parsed = _parse_datetime_like(payload.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _is_sendblue_message_unread(payload: dict[str, Any]) -> bool | None:
+    """Return unread state when detectable; otherwise None."""
+    for key in ("is_read", "read"):
+        if key in payload and payload.get(key) is not None:
+            return not _to_bool(payload.get(key))
+
+    for key in ("read_at", "readAt", "date_read", "dateRead"):
+        if key in payload:
+            value = payload.get(key)
+            if value is None:
+                return True
+            if isinstance(value, str):
+                return value.strip() == ""
+            return False
+
+    status = payload.get("status")
+    if isinstance(status, str):
+        normalized_status = status.strip().lower()
+        if normalized_status:
+            if "read" in normalized_status:
+                return False
+            if normalized_status in {"unread", "received", "delivered", "queued"}:
+                return True
+
+    return None
+
+
+def _sort_sendblue_messages_for_replay(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Sort replay batches by timestamp when available, preserving stable order."""
+    sortable: list[tuple[datetime | None, int, dict[str, Any]]] = []
+    for index, message in enumerate(messages):
+        sortable.append((_extract_sendblue_message_datetime(message), index, message))
+
+    sortable.sort(
+        key=lambda item: (
+            item[0] is None,
+            item[0] or datetime.max,
+            item[1],
+        )
+    )
+    return [item[2] for item in sortable]
+
+
+def _is_sendblue_outbound_message(payload: dict[str, Any], own_number: str) -> bool:
+    """Identify outbound/self-originated Sendblue payloads."""
+    direction = str(payload.get("direction", "")).strip().lower()
+    if direction in {"outgoing", "outbound", "sent"}:
+        return True
+
+    if _to_bool(payload.get("is_outbound")):
+        return True
+
+    sender_number = _extract_sendblue_sender_number(payload)
+    normalized_own_number = (own_number or "").strip()
+    if normalized_own_number and sender_number == normalized_own_number:
+        return True
+
+    from_number = payload.get("from_number")
+    if isinstance(from_number, str):
+        if normalized_own_number and from_number.strip() == normalized_own_number:
+            return True
+
+    return False
+
+
+def _extract_sendblue_message_list(data: Any) -> list[dict[str, Any]]:
+    """Normalize Sendblue API response payloads into a list of message dicts."""
+    if isinstance(data, list):
+        return [entry for entry in data if isinstance(entry, dict)]
+
+    if isinstance(data, dict):
+        for key in ("messages", "data", "results", "items"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return [entry for entry in value if isinstance(entry, dict)]
+
+    return []
+
+
+def _remember_processed_sendblue_handle(
+    processed_handles: set[str],
+    message_handle: str,
+    dedup_ttl_seconds: int,
+) -> None:
+    """Track processed message handles and expire them after a short TTL."""
+    normalized = (message_handle or "").strip()
+    if not normalized:
+        return
+
+    processed_handles.add(normalized)
+    asyncio.get_running_loop().call_later(
+        dedup_ttl_seconds,
+        lambda handle=normalized: processed_handles.discard(handle),
+    )
+
+
+async def _replay_sendblue_startup_backlog(
+    handler: AgentHandler,
+    checkpoint_time: datetime,
+    processed_handles: Optional[set[str]] = None,
+) -> int:
+    """Replay recent inbound Sendblue messages sent while the bot was offline."""
+    if not _to_bool(os.environ.get("SENDBLUE_STARTUP_REPLAY_ENABLED", "1")):
+        return 0
+
+    lookback_seconds = _env_int(
+        "SENDBLUE_STARTUP_LOOKBACK_SECONDS",
+        SENDBLUE_STARTUP_LOOKBACK_SECONDS_DEFAULT,
+        minimum=0,
+    )
+    if lookback_seconds <= 0:
+        return 0
+
+    unread_only = _to_bool(os.environ.get("SENDBLUE_STARTUP_UNREAD_ONLY", "1"))
+    replay_unknown_read_state = _to_bool(
+        os.environ.get("SENDBLUE_STARTUP_REPLAY_UNKNOWN_READ_STATE", "1")
+    )
+    lookback_start = checkpoint_time - timedelta(seconds=lookback_seconds)
+
+    result = await get_imessages(last_check=lookback_start)
+    if not result.get("success"):
+        logger.error(
+            "Failed to fetch Sendblue startup backlog: %s",
+            result.get("error") or result,
+        )
+        return 0
+
+    messages = _extract_sendblue_message_list(result.get("data"))
+    if not messages:
+        return 0
+
+    own_number = os.environ.get("SENDBLUE_NUMBER", "").strip()
+    replayed_count = 0
+
+    for msg in _sort_sendblue_messages_for_replay(messages):
+        if _is_sendblue_outbound_message(msg, own_number):
+            continue
+
+        unread_state = _is_sendblue_message_unread(msg)
+        if unread_only:
+            if unread_state is False:
+                continue
+            if unread_state is None and not replay_unknown_read_state:
+                continue
+
+        message_handle = _extract_sendblue_message_handle(msg)
+        if message_handle and processed_handles is not None:
+            if message_handle in processed_handles:
+                continue
+            processed_handles.add(message_handle)
+
+        sender_number = _extract_sendblue_sender_number(msg)
+        if not sender_number:
+            logger.debug(
+                "Skipping startup replay message without sender number: %s", msg
+            )
+            continue
+
+        content = msg.get("content") or msg.get("message") or msg.get("text") or ""
+        attachments = _extract_sendblue_attachment_urls(msg)
+        normalized_content = content if isinstance(content, str) else str(content)
+        if not normalized_content.strip() and not attachments:
+            continue
+
+        try:
+            user_content = await _build_imessage_user_content(
+                normalized_content,
+                attachments,
+            )
+            await process_imessage_and_reply(handler, sender_number, user_content)
+            replayed_count += 1
+        except Exception as e:
+            logger.error(
+                "Failed to replay Sendblue startup message from %s: %s",
+                sender_number,
+                e,
+            )
+
+    if replayed_count:
+        logger.info(
+            "Processed %s unread Sendblue backlog message(s) after reconnect",
+            replayed_count,
+        )
+
+    return replayed_count
 
 
 def _schedule_sendblue_pending_flush_locked(
@@ -1418,14 +1905,35 @@ async def _send_telegram_response(
     bot: Any, chat_id: int, text: str, attachment_urls: list[str]
 ) -> None:
     """Send text and attachments to Telegram, batching images when possible."""
-    normalized_text = (text or "").strip()
+    delivery_plan = _build_outbound_delivery_plan(text)
     attachments = _normalize_attachment_urls(attachment_urls)
+    remaining_messages = sum(
+        1
+        for step in delivery_plan
+        if step.get("type") == "message" and str(step.get("text", "")).strip()
+    )
+    sent_messages = 0
 
-    if normalized_text:
-        await bot.send_message(chat_id=chat_id, text=normalized_text)
+    for step in delivery_plan:
+        step_type = str(step.get("type", "")).strip().lower()
+        if step_type == "typing":
+            if remaining_messages <= 0:
+                continue
+            await bot.send_chat_action(chat_id=chat_id, action="typing")
+            await asyncio.sleep(
+                float(step.get("seconds", OUTBOUND_TYPING_SECONDS_DEFAULT))
+            )
+            continue
+
+        chunk_text = str(step.get("text", "")).strip()
+        if not chunk_text:
+            continue
+        await bot.send_message(chat_id=chat_id, text=chunk_text)
+        sent_messages += 1
+        remaining_messages = max(0, remaining_messages - 1)
 
     if not attachments:
-        if not normalized_text:
+        if sent_messages == 0:
             await bot.send_message(chat_id=chat_id, text="No response.")
         return
 
@@ -1555,37 +2063,104 @@ async def send_imessage(
         "sb-api-key-id": api_key,
         "sb-api-secret-key": api_secret,
     }
-    formatted_message = _format_sendblue_message_content(message)
-    payload = {
-        "number": phone_number,
-        "from_number": from_number,
-        "content": formatted_message,
-        "send_style": "regular",
-    }
-    payload: dict[str, Any] = payload
+    delivery_plan = _build_outbound_delivery_plan(message)
+    chunk_count = sum(1 for step in delivery_plan if step.get("type") == "message")
+    if chunk_count <= 0:
+        delivery_plan = [{"type": "message", "text": ""}]
+        chunk_count = 1
+
     normalized_media_urls = _normalize_attachment_urls(media_urls)
-    if normalized_media_urls:
-        payload["media_url"] = (
-            normalized_media_urls
-            if len(normalized_media_urls) > 1
-            else normalized_media_urls[0]
-        )
 
     close_session = False
     if session is None:
         session = aiohttp.ClientSession()
         close_session = True
     try:
-        async with session.post(
-            "https://api.sendblue.co/api/send-message", json=payload, headers=headers
-        ) as resp:
-            data = await resp.json()
-            success = 200 <= resp.status < 300
-            if isinstance(data, dict):
-                delivery_status = str(data.get("status", "")).strip().upper()
-                if delivery_status in {"QUEUED", "SENT", "DELIVERED"}:
-                    success = True
-            return {"success": success, "data": data, "status": resp.status}
+        send_results: list[dict[str, Any]] = []
+        remaining_messages = chunk_count
+        sent_message_index = 0
+
+        for step in delivery_plan:
+            step_type = str(step.get("type", "")).strip().lower()
+            if step_type == "typing":
+                if remaining_messages <= 0:
+                    continue
+
+                delay_seconds = float(
+                    step.get("seconds", OUTBOUND_TYPING_SECONDS_DEFAULT)
+                )
+                remaining_delay = max(0.0, delay_seconds)
+                while remaining_delay > 0 and remaining_messages > 0:
+                    typing_res = await send_typing_indicator(
+                        phone_number,
+                        session=session,
+                    )
+                    if not typing_res.get("success"):
+                        logger.debug(
+                            "Typing directive indicator failed for %s: %s",
+                            phone_number,
+                            typing_res,
+                        )
+
+                    sleep_window = min(remaining_delay, 3.8)
+                    await asyncio.sleep(sleep_window)
+                    remaining_delay -= sleep_window
+                continue
+
+            chunk_text = str(step.get("text", ""))
+
+            payload: dict[str, Any] = {
+                "number": phone_number,
+                "from_number": from_number,
+                "content": _format_sendblue_message_content(chunk_text),
+                "send_style": "regular",
+            }
+            if normalized_media_urls and remaining_messages == 1:
+                payload["media_url"] = (
+                    normalized_media_urls
+                    if len(normalized_media_urls) > 1
+                    else normalized_media_urls[0]
+                )
+
+            async with session.post(
+                "https://api.sendblue.co/api/send-message",
+                json=payload,
+                headers=headers,
+            ) as resp:
+                data = await resp.json()
+                success = 200 <= resp.status < 300
+                if isinstance(data, dict):
+                    delivery_status = str(data.get("status", "")).strip().upper()
+                    if delivery_status in {"QUEUED", "SENT", "DELIVERED"}:
+                        success = True
+
+                result = {
+                    "success": success,
+                    "data": data,
+                    "status": resp.status,
+                }
+                send_results.append(result)
+                if not success:
+                    return {
+                        **result,
+                        "chunk_index": sent_message_index,
+                        "chunk_count": chunk_count,
+                    }
+
+            sent_message_index += 1
+            remaining_messages = max(0, remaining_messages - 1)
+
+        final_result = send_results[-1]
+        if chunk_count == 1:
+            return final_result
+
+        return {
+            "success": True,
+            "status": final_result.get("status"),
+            "data": final_result.get("data"),
+            "chunks_sent": chunk_count,
+            "results": send_results,
+        }
     except Exception as e:
         return {"success": False, "error": str(e)}
     finally:
@@ -1944,11 +2519,56 @@ async def handle_imessage(
     interim_response_callback: Optional[Callable[[str], Awaitable[None]]] = None,
 ) -> str:
     """Process an incoming iMessage."""
-    session_id = f"imessage_{phone_number}"
-    text = user_content if isinstance(user_content, str) else ""
+    normalized_phone_number = (phone_number or "").strip()
+    session_id = f"imessage_{normalized_phone_number}"
+    text = _extract_text_from_user_content(user_content)
+    command, _ = _parse_slash_command(text)
+
+    if command == "/setprompt":
+        pending_prompt_phone_numbers[normalized_phone_number] = True
+        return (
+            "Please send your new system prompt in the next message. "
+            "It will replace the current system prompt and be used for all future conversations. "
+            "Send /cancel to abort."
+        )
+
+    if normalized_phone_number in pending_prompt_phone_numbers:
+        if command == "/cancel":
+            del pending_prompt_phone_numbers[normalized_phone_number]
+            return "System prompt update cancelled."
+
+        if command:
+            return (
+                "You are currently updating the system prompt. "
+                "Send the new prompt text, or /cancel to abort."
+            )
+
+        del pending_prompt_phone_numbers[normalized_phone_number]
+        new_prompt = text.strip()
+        if not new_prompt:
+            return "Prompt cannot be empty. Cancelled."
+
+        try:
+            handler.memory_store.set_system_prompt(new_prompt)
+            return (
+                "System prompt updated successfully. "
+                "The new prompt will be used immediately."
+            )
+        except Exception as e:
+            logger.error("Failed to set system prompt from iMessage: %s", e)
+            return f"Failed to update system prompt: {str(e)}"
+
+    if command == "/start":
+        return (
+            "Hello! I'm AgentZero. "
+            "Available commands: /start, /setprompt, /clear, /memorystats."
+        )
+
+    if command in {"/memorystats", "/memory_stats", "/memorycadence"}:
+        return _format_memory_cadence_stats(handler, session_id)
 
     # Check for /clear command
-    if text.strip().lower() == "/clear":
+    if command == "/clear":
         try:
             deleted_count = handler.memory_store.clear_conversation_history(session_id)
             return f"✅ Conversation cleared! Started fresh. ({deleted_count} messages removed)"
@@ -2070,12 +2690,27 @@ async def process_imessage_and_reply(
             logger.error("Failed to send Sendblue reply: %s", send_res)
 
 
-async def start_sendblue_webhook_server(handler: AgentHandler, port: int):
+async def start_sendblue_webhook_server(
+    handler: AgentHandler,
+    port: int,
+    initial_processed_handles: Optional[set[str]] = None,
+):
     """Start a webhook server for Sendblue."""
     app = web.Application()
     own_number = os.environ.get("SENDBLUE_NUMBER")
-    processed_handles = set()
-    dedup_ttl_seconds = 60
+    processed_handles = set(initial_processed_handles or set())
+    dedup_ttl_seconds = _env_int(
+        "SENDBLUE_DEDUP_TTL_SECONDS",
+        60,
+        minimum=10,
+    )
+    for existing_handle in list(processed_handles):
+        _remember_processed_sendblue_handle(
+            processed_handles,
+            existing_handle,
+            dedup_ttl_seconds,
+        )
+
     pending_sendblue_messages: dict[str, dict[str, Any]] = {}
     pending_sendblue_lock = asyncio.Lock()
 
@@ -2124,11 +2759,14 @@ async def start_sendblue_webhook_server(handler: AgentHandler, port: int):
                 data = dict(form_data)
 
             sender_number = _extract_sendblue_sender_number(data)
-            content = data.get("content") or data.get("message") or data.get("text", "")
+            raw_content = (
+                data.get("content") or data.get("message") or data.get("text", "")
+            )
+            content = raw_content if isinstance(raw_content, str) else str(raw_content)
             attachments = _extract_sendblue_attachment_urls(data)
             direction = str(data.get("direction", "")).lower()
             is_outbound = _to_bool(data.get("is_outbound"))
-            message_handle = data.get("message_handle")
+            message_handle = _extract_sendblue_message_handle(data)
 
             if message_handle:
                 if message_handle in processed_handles:
@@ -2136,10 +2774,10 @@ async def start_sendblue_webhook_server(handler: AgentHandler, port: int):
                         "Ignoring duplicate Sendblue webhook: %s", message_handle
                     )
                     return web.Response(status=200, text="OK")
-                processed_handles.add(message_handle)
-                asyncio.get_running_loop().call_later(
+                _remember_processed_sendblue_handle(
+                    processed_handles,
+                    message_handle,
                     dedup_ttl_seconds,
-                    lambda: processed_handles.discard(message_handle),
                 )
 
             # Process asynchronously so we can quickly return 200 OK
@@ -2268,6 +2906,17 @@ async def start_sendblue_bot(handler: AgentHandler):
     monitor_tasks: list[asyncio.Task] = []
     receive_webhook_url = os.environ.get("SENDBLUE_RECEIVE_WEBHOOK_URL", "").strip()
     typing_webhook_url = os.environ.get("SENDBLUE_TYPING_WEBHOOK_URL", "").strip()
+    processed_handles: set[str] = set()
+
+    startup_checkpoint = datetime.utcnow()
+    try:
+        await _replay_sendblue_startup_backlog(
+            handler,
+            checkpoint_time=startup_checkpoint,
+            processed_handles=processed_handles,
+        )
+    except Exception as e:
+        logger.error("Sendblue startup replay failed: %s", e)
 
     if receive_webhook_url:
         monitor_tasks.append(asyncio.create_task(monitor_sendblue_receive_webhook()))
@@ -2282,7 +2931,11 @@ async def start_sendblue_bot(handler: AgentHandler):
     webhook_port = os.environ.get("SENDBLUE_WEBHOOK_PORT")
     if webhook_port:
         try:
-            await start_sendblue_webhook_server(handler, int(webhook_port))
+            await start_sendblue_webhook_server(
+                handler,
+                int(webhook_port),
+                initial_processed_handles=processed_handles,
+            )
         finally:
             for monitor_task in monitor_tasks:
                 monitor_task.cancel()
@@ -2290,7 +2943,19 @@ async def start_sendblue_bot(handler: AgentHandler):
 
     # Polling fallback
     interval = int(os.environ.get("SENDBLUE_POLL_INTERVAL", "10"))
-    last_check = datetime.utcnow()
+    last_check = startup_checkpoint
+    dedup_ttl_seconds = _env_int(
+        "SENDBLUE_DEDUP_TTL_SECONDS",
+        60,
+        minimum=10,
+    )
+    for startup_handle in list(processed_handles):
+        _remember_processed_sendblue_handle(
+            processed_handles,
+            startup_handle,
+            dedup_ttl_seconds,
+        )
+
     logger.info(f"iMessage bot started (interval: {interval}s)")
     while True:
         try:
@@ -2307,18 +2972,38 @@ async def start_sendblue_bot(handler: AgentHandler):
                     else res["data"].get("messages", [])
                 )
                 for msg in messages:
-                    if msg.get("direction") == "outgoing" or msg.get("is_outbound"):
+                    message_handle = _extract_sendblue_message_handle(msg)
+                    if message_handle and message_handle in processed_handles:
                         continue
-                    num = msg.get("from_number") or msg.get("number")
+
+                    if _is_sendblue_outbound_message(
+                        msg, os.environ.get("SENDBLUE_NUMBER", "")
+                    ):
+                        continue
+
+                    num = _extract_sendblue_sender_number(msg)
                     if not num:
                         logger.warning(f"Skipping message with no sender number: {msg}")
                         continue
-                    content = (
+                    raw_content = (
                         msg.get("content") or msg.get("message") or msg.get("text", "")
+                    )
+                    content = (
+                        raw_content
+                        if isinstance(raw_content, str)
+                        else str(raw_content)
                     )
                     attachments = _extract_sendblue_attachment_urls(msg)
                     if not content.strip() and not attachments:
                         continue
+
+                    if message_handle:
+                        _remember_processed_sendblue_handle(
+                            processed_handles,
+                            message_handle,
+                            dedup_ttl_seconds,
+                        )
+
                     user_content = await _build_imessage_user_content(
                         content,
                         attachments,
@@ -2377,6 +3062,18 @@ async def telegram_clear(
     except Exception as e:
         logger.error(f"Failed to clear conversation: {e}")
         await update.message.reply_text(f"❌ Failed to clear conversation: {str(e)}")
+
+
+async def telegram_memory_stats(
+    handler: AgentHandler, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
+):
+    """Handle /memorystats command - show memory cadence and dream profile status."""
+    if update.message is None or update.effective_user is None:
+        return
+
+    user_id = update.effective_user.id
+    session_id = f"tg_{user_id}"
+    await update.message.reply_text(_format_memory_cadence_stats(handler, session_id))
 
 
 async def telegram_handle_msg(
@@ -2473,6 +3170,18 @@ def run_telegram_bot(handler: AgentHandler):
         )
     )
     app.add_handler(
+        CommandHandler(
+            "memorystats",
+            lambda update, context: telegram_memory_stats(handler, update, context),
+        )
+    )
+    app.add_handler(
+        CommandHandler(
+            "memorycadence",
+            lambda update, context: telegram_memory_stats(handler, update, context),
+        )
+    )
+    app.add_handler(
         MessageHandler(
             (filters.TEXT | filters.PHOTO | filters.Document.IMAGE) & ~filters.COMMAND,
             lambda update, context: telegram_handle_msg(handler, update, context),
@@ -2481,7 +3190,84 @@ def run_telegram_bot(handler: AgentHandler):
     # Add error handler to catch polling errors gracefully
     app.add_error_handler(telegram_error_handler)
     logger.info("Telegram bot starting...")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=False)
+
+
+async def _replay_telegram_pending_updates(app: Any) -> int:
+    """Process queued Telegram updates that arrived while polling was offline."""
+    if not _to_bool(os.environ.get("TELEGRAM_REPLAY_PENDING_UPDATES_ON_STARTUP", "1")):
+        return 0
+
+    batch_size = _env_int(
+        "TELEGRAM_PENDING_UPDATES_BATCH_SIZE",
+        TELEGRAM_PENDING_UPDATES_BATCH_SIZE_DEFAULT,
+        minimum=1,
+        maximum=100,
+    )
+    max_batches = _env_int(
+        "TELEGRAM_PENDING_UPDATES_MAX_BATCHES",
+        TELEGRAM_PENDING_UPDATES_MAX_BATCHES_DEFAULT,
+        minimum=1,
+        maximum=100,
+    )
+
+    processed_count = 0
+    next_offset: int | None = None
+    reached_batch_limit = True
+
+    for _ in range(max_batches):
+        updates = await app.bot.get_updates(
+            offset=next_offset,
+            timeout=0,
+            limit=batch_size,
+            allowed_updates=["message"],
+        )
+        if not updates:
+            reached_batch_limit = False
+            break
+
+        for update in updates:
+            try:
+                await app.process_update(update)
+                processed_count += 1
+            except Exception as e:
+                logger.error(
+                    "Failed to process pending Telegram update %s: %s",
+                    getattr(update, "update_id", "unknown"),
+                    e,
+                )
+
+        last_update_id = getattr(updates[-1], "update_id", None)
+        if not isinstance(last_update_id, int):
+            reached_batch_limit = False
+            break
+        next_offset = last_update_id + 1
+
+    if reached_batch_limit:
+        logger.warning(
+            "Telegram startup replay hit batch limit (%s x %s); older updates may remain queued",
+            max_batches,
+            batch_size,
+        )
+
+    if next_offset is not None:
+        try:
+            await app.bot.get_updates(
+                offset=next_offset,
+                timeout=0,
+                limit=1,
+                allowed_updates=["message"],
+            )
+        except Exception as e:
+            logger.debug("Failed to acknowledge pending Telegram updates: %s", e)
+
+    if processed_count:
+        logger.info(
+            "Processed %s pending Telegram update(s) after reconnect",
+            processed_count,
+        )
+
+    return processed_count
 
 
 async def run_telegram_bot_async(handler: AgentHandler):
@@ -2508,6 +3294,18 @@ async def run_telegram_bot_async(handler: AgentHandler):
         )
     )
     app.add_handler(
+        CommandHandler(
+            "memorystats",
+            lambda update, context: telegram_memory_stats(handler, update, context),
+        )
+    )
+    app.add_handler(
+        CommandHandler(
+            "memorycadence",
+            lambda update, context: telegram_memory_stats(handler, update, context),
+        )
+    )
+    app.add_handler(
         MessageHandler(
             (filters.TEXT | filters.PHOTO | filters.Document.IMAGE) & ~filters.COMMAND,
             lambda update, context: telegram_handle_msg(handler, update, context),
@@ -2519,7 +3317,11 @@ async def run_telegram_bot_async(handler: AgentHandler):
     assert app.updater is not None, "Updater should not be None"
     async with app:
         await app.start()
-        await app.updater.start_polling(error_callback=telegram_polling_error_handler)
+        await _replay_telegram_pending_updates(app)
+        await app.updater.start_polling(
+            error_callback=telegram_polling_error_handler,
+            drop_pending_updates=False,
+        )
         # Keep running until cancelled
         try:
             while True:
