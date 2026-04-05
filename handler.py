@@ -2988,12 +2988,16 @@ class AgentHandler:
             if current_tokens + msg_tokens > available_tokens:
                 break
 
-            selected_history.append(
-                {
-                    "role": msg["role"],
-                    "content": msg["content"],
-                }
-            )
+            base_msg = {
+                "role": msg["role"],
+                "content": msg["content"],
+            }
+            # Preserve tool call and tool result fields
+            if "tool_calls" in msg:
+                base_msg["tool_calls"] = msg["tool_calls"]
+            if "tool_call_id" in msg:
+                base_msg["tool_call_id"] = msg["tool_call_id"]
+            selected_history.append(base_msg)
             current_tokens += msg_tokens
 
         # Combine: system + history + current messages
