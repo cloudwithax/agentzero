@@ -14,10 +14,17 @@ from tools import (
 )
 
 
-def _build_scheduler(ai_runner=None, delivery_callback=None) -> ReminderScheduler:
-    temp_db = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
-    temp_db.close()
-    memory_store = EnhancedMemoryStore(db_path=temp_db.name, api_key="test_key")
+def _build_scheduler(
+    ai_runner=None,
+    delivery_callback=None,
+    db_path: str | None = None,
+) -> ReminderScheduler:
+    if db_path is None:
+        temp_db = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+        temp_db.close()
+        db_path = temp_db.name
+
+    memory_store = EnhancedMemoryStore(db_path=db_path, api_key="test_key")
     return ReminderScheduler(
         memory_store=memory_store,
         ai_runner=ai_runner,
@@ -131,10 +138,40 @@ async def test_invalid_cron_rejected() -> None:
     assert "invalid cron" in created["error"].lower()
 
 
+async def test_reminders_persist_to_db_and_reload_on_startup() -> None:
+    """Reminder tasks should persist in SQLite and reload into memory on startup."""
+    temp_db = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+    temp_db.close()
+
+    first_scheduler = _build_scheduler(db_path=temp_db.name)
+    created = await first_scheduler.create_task(
+        cron="0 9 * * 1-5",
+        message="weekday reminder",
+        task_id="persisted_task",
+        session_id="tg_999",
+    )
+    assert created["success"], created
+
+    stored_rows = first_scheduler.memory_store.get_reminder_tasks()
+    assert any(row["task_id"] == "persisted_task" for row in stored_rows), stored_rows
+
+    second_scheduler = _build_scheduler(db_path=temp_db.name)
+    await second_scheduler.start()
+
+    status = await second_scheduler.get_task_status("persisted_task")
+    assert status["success"], status
+    task = status["task"]
+    assert task["task_id"] == "persisted_task", task
+    assert task["message"] == "weekday reminder", task
+    assert task["session_id"] == "tg_999", task
+    assert task["enabled"] is True, task
+
+
 if __name__ == "__main__":
     test_cron_expression_parser()
     asyncio.run(test_one_off_task_completes())
     asyncio.run(test_recurring_ai_task_runs())
     asyncio.run(test_reminder_create_tool_uses_runtime_session())
     asyncio.run(test_invalid_cron_rejected())
+    asyncio.run(test_reminders_persist_to_db_and_reload_on_startup())
     print("Reminder scheduler tests passed")

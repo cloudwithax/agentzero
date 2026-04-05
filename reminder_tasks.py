@@ -617,8 +617,56 @@ class ReminderScheduler:
             task["updated_at"] = _utc_now().isoformat(timespec="seconds")
             self._persist_locked()
 
+    def _load_tasks_from_items(
+        self,
+        raw_tasks: list[dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        """Normalize persisted task payloads into in-memory scheduler state."""
+        loaded_tasks: dict[str, dict[str, Any]] = {}
+
+        if not isinstance(raw_tasks, list):
+            return loaded_tasks
+
+        for item in raw_tasks:
+            if not isinstance(item, dict):
+                continue
+            task_id = self._normalize_task_id(item.get("task_id"))
+            cron = str(item.get("cron", "")).strip()
+            if not task_id or not cron:
+                continue
+
+            try:
+                CronExpression(cron)
+            except Exception:
+                continue
+
+            loaded_tasks[task_id] = {
+                "task_id": task_id,
+                "name": str(item.get("name", "")).strip(),
+                "cron": cron,
+                "message": str(item.get("message", "")).strip(),
+                "session_id": str(item.get("session_id", "")).strip() or None,
+                "one_off": bool(item.get("one_off", False)),
+                "run_ai": bool(item.get("run_ai", False)),
+                "ai_prompt": str(item.get("ai_prompt", "")).strip(),
+                "status": str(item.get("status", "active")),
+                "enabled": bool(item.get("enabled", True)),
+                "run_count": int(item.get("run_count", 0) or 0),
+                "last_run_at": item.get("last_run_at"),
+                "next_run_at": item.get("next_run_at"),
+                "last_result": str(item.get("last_result", "")),
+                "last_error": str(item.get("last_error", "")),
+                "created_at": item.get("created_at")
+                or _utc_now().isoformat(timespec="seconds"),
+                "updated_at": item.get("updated_at")
+                or _utc_now().isoformat(timespec="seconds"),
+                "max_runs": int(item.get("max_runs", 0) or 0),
+            }
+
+        return loaded_tasks
+
     async def _load_if_needed(self) -> None:
-        """Load persisted tasks from agent state exactly once."""
+        """Load persisted tasks from the reminders table exactly once."""
         if self._loaded:
             return
 
@@ -626,54 +674,23 @@ class ReminderScheduler:
             if self._loaded:
                 return
 
-            raw_state = self.memory_store.get_agent_state(self.STATE_KEY, default={})
-            state = raw_state if isinstance(raw_state, dict) else {}
-            raw_tasks = state.get("tasks", []) if isinstance(state, dict) else []
-            loaded_tasks: dict[str, dict[str, Any]] = {}
+            persisted_tasks = self.memory_store.get_reminder_tasks()
+            loaded_tasks = self._load_tasks_from_items(persisted_tasks)
 
-            if isinstance(raw_tasks, list):
-                for item in raw_tasks:
-                    if not isinstance(item, dict):
-                        continue
-                    task_id = self._normalize_task_id(item.get("task_id"))
-                    cron = str(item.get("cron", "")).strip()
-                    if not task_id or not cron:
-                        continue
-
-                    try:
-                        CronExpression(cron)
-                    except Exception:
-                        continue
-
-                    loaded_tasks[task_id] = {
-                        "task_id": task_id,
-                        "name": str(item.get("name", "")).strip(),
-                        "cron": cron,
-                        "message": str(item.get("message", "")).strip(),
-                        "session_id": str(item.get("session_id", "")).strip() or None,
-                        "one_off": bool(item.get("one_off", False)),
-                        "run_ai": bool(item.get("run_ai", False)),
-                        "ai_prompt": str(item.get("ai_prompt", "")).strip(),
-                        "status": str(item.get("status", "active")),
-                        "enabled": bool(item.get("enabled", True)),
-                        "run_count": int(item.get("run_count", 0) or 0),
-                        "last_run_at": item.get("last_run_at"),
-                        "next_run_at": item.get("next_run_at"),
-                        "last_result": str(item.get("last_result", "")),
-                        "last_error": str(item.get("last_error", "")),
-                        "created_at": item.get("created_at")
-                        or _utc_now().isoformat(timespec="seconds"),
-                        "updated_at": item.get("updated_at")
-                        or _utc_now().isoformat(timespec="seconds"),
-                        "max_runs": int(item.get("max_runs", 0) or 0),
-                    }
+            if not loaded_tasks:
+                raw_state = self.memory_store.get_agent_state(
+                    self.STATE_KEY, default={}
+                )
+                state = raw_state if isinstance(raw_state, dict) else {}
+                legacy_tasks = state.get("tasks", []) if isinstance(state, dict) else []
+                loaded_tasks = self._load_tasks_from_items(legacy_tasks)
 
             self._tasks = loaded_tasks
             self._loaded = True
             self._persist_locked()
 
     def _persist_locked(self) -> None:
-        """Persist in-memory tasks to agent state (lock must be held)."""
+        """Persist in-memory tasks to the reminders table (lock must be held)."""
         serializable = []
         for task in self._tasks.values():
             serializable.append(
@@ -699,15 +716,8 @@ class ReminderScheduler:
                 }
             )
 
-        self.memory_store.set_agent_state(
-            self.STATE_KEY,
-            {
-                "version": 1,
-                "tasks": sorted(
-                    serializable, key=lambda item: item.get("created_at") or ""
-                ),
-            },
-        )
+        serializable.sort(key=lambda item: item.get("created_at") or "")
+        self.memory_store.replace_reminder_tasks(serializable)
 
     @staticmethod
     def _normalize_task_id(task_id: Any) -> str:

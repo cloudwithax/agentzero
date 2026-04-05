@@ -118,6 +118,44 @@ class MemoryStore:
         """
         )
 
+        # Reminder tasks table for durable scheduled task persistence.
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reminders (
+                task_id TEXT PRIMARY KEY,
+                name TEXT,
+                cron TEXT NOT NULL,
+                message TEXT,
+                session_id TEXT,
+                one_off INTEGER DEFAULT 0,
+                run_ai INTEGER DEFAULT 0,
+                ai_prompt TEXT,
+                status TEXT,
+                enabled INTEGER DEFAULT 1,
+                run_count INTEGER DEFAULT 0,
+                last_run_at TEXT,
+                next_run_at TEXT,
+                last_result TEXT,
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                max_runs INTEGER DEFAULT 0
+            )
+        """
+        )
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_reminders_next_run
+            ON reminders(enabled, next_run_at)
+        """
+        )
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_reminders_created_at
+            ON reminders(created_at)
+        """
+        )
+
         conn.commit()
         conn.close()
 
@@ -834,6 +872,123 @@ class MemoryStore:
             return json.loads(row[0])
         except Exception:
             return default
+
+    def replace_reminder_tasks(self, tasks: list[dict[str, Any]]) -> None:
+        """Replace all persisted reminder tasks with the provided snapshot."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM reminders")
+
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+
+            cursor.execute(
+                """
+                INSERT INTO reminders (
+                    task_id,
+                    name,
+                    cron,
+                    message,
+                    session_id,
+                    one_off,
+                    run_ai,
+                    ai_prompt,
+                    status,
+                    enabled,
+                    run_count,
+                    last_run_at,
+                    next_run_at,
+                    last_result,
+                    last_error,
+                    created_at,
+                    updated_at,
+                    max_runs
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+                (
+                    str(task.get("task_id", "")).strip(),
+                    str(task.get("name", "")),
+                    str(task.get("cron", "")).strip(),
+                    str(task.get("message", "")),
+                    str(task.get("session_id", "")).strip() or None,
+                    1 if bool(task.get("one_off", False)) else 0,
+                    1 if bool(task.get("run_ai", False)) else 0,
+                    str(task.get("ai_prompt", "")),
+                    str(task.get("status", "active")),
+                    1 if bool(task.get("enabled", False)) else 0,
+                    int(task.get("run_count", 0) or 0),
+                    task.get("last_run_at"),
+                    task.get("next_run_at"),
+                    str(task.get("last_result", "")),
+                    str(task.get("last_error", "")),
+                    str(task.get("created_at", "")),
+                    str(task.get("updated_at", "")),
+                    int(task.get("max_runs", 0) or 0),
+                ),
+            )
+
+        conn.commit()
+        conn.close()
+
+    def get_reminder_tasks(self) -> list[dict[str, Any]]:
+        """Return all persisted reminder tasks from the database."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT
+                task_id,
+                name,
+                cron,
+                message,
+                session_id,
+                one_off,
+                run_ai,
+                ai_prompt,
+                status,
+                enabled,
+                run_count,
+                last_run_at,
+                next_run_at,
+                last_result,
+                last_error,
+                created_at,
+                updated_at,
+                max_runs
+            FROM reminders
+            ORDER BY created_at ASC
+        """
+        )
+        rows = cursor.fetchall()
+        conn.close()
+
+        reminders: list[dict[str, Any]] = []
+        for row in rows:
+            reminders.append(
+                {
+                    "task_id": row[0],
+                    "name": row[1] or "",
+                    "cron": row[2] or "",
+                    "message": row[3] or "",
+                    "session_id": row[4],
+                    "one_off": bool(row[5]),
+                    "run_ai": bool(row[6]),
+                    "ai_prompt": row[7] or "",
+                    "status": row[8] or "active",
+                    "enabled": bool(row[9]),
+                    "run_count": int(row[10] or 0),
+                    "last_run_at": row[11],
+                    "next_run_at": row[12],
+                    "last_result": row[13] or "",
+                    "last_error": row[14] or "",
+                    "created_at": row[15],
+                    "updated_at": row[16],
+                    "max_runs": int(row[17] or 0),
+                }
+            )
+
+        return reminders
 
     def get_memories_for_consolidation(
         self,

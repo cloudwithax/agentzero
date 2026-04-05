@@ -252,6 +252,8 @@ All tools return a consistent dictionary format:
   **Fix:** Add integration-side session delivery target registration in `integrations.py`, expose `deliver_scheduled_session_output(session_id, output)`, and wire `ReminderScheduler` to use a delivery callback from `handler.py` after each run. Validate with: `PYTHONPATH=. .venv/bin/python tests/test_reminder_tasks.py`.
 - **Pitfall: The model could create reminder tasks without an explicit `session_id`, causing scheduled outputs to lose their return path even when delivery plumbing existed.**
   **Fix:** Default `reminder_create_tool()` in `tools.py` to the active tool runtime session (`_runtime_session_id`) when `session_id` is omitted, and add regression coverage in `tests/test_reminder_tasks.py`. Validate with: `PYTHONPATH=. .venv/bin/python tests/test_reminder_tasks.py`.
+- **Pitfall: Reminder persistence stored all scheduled tasks inside one `agent_state` JSON blob, which made reminders less durable/inspectable and tied startup loading to one serialized state object.**
+  **Fix:** Add a first-class `reminders` SQLite table in `memory.py`, persist scheduler state there by default, and have `ReminderScheduler` load from that table on startup with a fallback migration path from legacy `agent_state`. Validate with: `PYTHONPATH=. .venv/bin/python tests/test_reminder_tasks.py` and `PYTHONPATH=. .venv/bin/python tests/test_simple.py`.
 
 ## Key Functions Reference
 
