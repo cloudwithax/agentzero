@@ -11,6 +11,7 @@ tests = [
     "tests/test_sendblue_voice_memo.py",
     "tests/test_memory_maintenance.py",
     "tests/test_consortium_mode.py",
+    "tests/test_skills.py",
 ]
 for t in tests:
     subprocess.run(["python3", t], env={"PYTHONPATH": "."})

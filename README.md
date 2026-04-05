@@ -75,6 +75,22 @@ Optional memory cadence and consolidation settings:
 - `MEMORY_DREAM_CANDIDATE_LIMIT` - Max short-term candidate memories passed into a dream cycle (default: `24`).
 - `MEMORY_DREAM_MIN_AGE_HOURS` - Minimum source-memory age for dream consolidation eligibility (default: `24`).
 
+Optional Agent Skills settings:
+
+- `AGENTZERO_SKILLS_ENABLED` - Enable Agent Skills discovery/activation support (default: `1`).
+- `AGENTZERO_TRUST_PROJECT_SKILLS` - Allow loading project-level skills from the current repository (default: `1`).
+- `AGENTZERO_ENABLE_USER_SKILLS` - Allow loading user-level skills from the home directory (default: `1`).
+- `AGENTZERO_ENABLE_BUILTIN_SKILLS` - Allow loading built-in packaged skills (default: `1`).
+- `AGENTZERO_BUILTIN_SKILLS_DIR` - Optional absolute path override for built-in skills root.
+- `AGENTZERO_SCAN_CLAUDE_SKILLS` - Also scan `.claude/skills/` compatibility paths (default: `1`).
+- `AGENTZERO_DISABLED_SKILLS` - Comma-separated skill names to disable.
+
+Skill discovery paths:
+
+- Project scope: `./.agentzero/skills/`, `./.agents/skills/` (and `./.claude/skills/` if enabled)
+- User scope: `~/.agentzero/skills/`, `~/.agents/skills/` (and `~/.claude/skills/` if enabled)
+- Built-in scope: `<agentzero>/.agentzero/skills/` (includes default `skill-creator`)
+
 ## Usage
 
 ### Run the agent:
@@ -106,6 +122,8 @@ This will run the agent with both Telegram and iMessage (using SendBlue) channel
 
 - Persistent memory using SQLite and embeddings
 - Cross-channel slash commands (`/start`, `/setprompt`, `/clear`, `/memorystats`; plus `/memorycadence` alias on Telegram and `/memory_stats` + `/memorycadence` aliases on iMessage)
+- Skill commands (`/skills`, plus explicit activation via `/skill-name` or `$skill-name`)
+- Default built-in `skill-creator` skill for scaffolding new skills to disk
 - File operations (read, write, edit)
 - Shell command execution
 - PDF reading
@@ -116,6 +134,7 @@ This will run the agent with both Telegram and iMessage (using SendBlue) channel
 - Sendblue voice memo transcription with NVIDIA Parakeet CTC 0.6B ASR
 - Auto memory extraction with cadence control (default target: ~1 memory per 15 messages)
 - Dream-style long-term memory consolidation during inferred off-peak hours
+- Agent Skills catalog + on-demand `activate_skill` tool with per-session active-skill persistence
 
 ## License
 

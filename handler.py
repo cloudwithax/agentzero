@@ -16,7 +16,12 @@ from capabilities import CapabilityProfile, AdaptiveFormatter
 from examples import AdaptiveFewShotManager
 from planning import TaskType, TaskPlanner, TaskAnalyzer
 from api import api_call_with_retry, process_response
-from tools import set_consortium_controller
+from skills import SkillRegistry
+from tools import (
+    reset_tool_runtime_session,
+    set_consortium_controller,
+    set_tool_runtime_session,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -634,6 +639,7 @@ class AgentHandler:
         task_planner: TaskPlanner,
         task_analyzer: TaskAnalyzer,
         adaptive_formatter: AdaptiveFormatter,
+        skill_registry: Optional[SkillRegistry] = None,
     ):
         self.memory_store = memory_store
         self.capability_profile = capability_profile
@@ -641,9 +647,69 @@ class AgentHandler:
         self.task_planner = task_planner
         self.task_analyzer = task_analyzer
         self.adaptive_formatter = adaptive_formatter
+        self.skill_registry = skill_registry
         self._consortium_tasks: dict[str, dict[str, Any]] = {}
         self._consortium_tasks_lock = asyncio.Lock()
         set_consortium_controller(self)
+
+    def _build_request_payload_template(self) -> dict[str, Any]:
+        """Build base payload with dynamic tool registration (including skills)."""
+        payload = BASE_PAYLOAD.copy()
+        payload["tools"] = list(BASE_PAYLOAD.get("tools", []))
+
+        if self.skill_registry:
+            try:
+                tool_schema = self.skill_registry.build_activation_tool_schema()
+                if tool_schema:
+                    payload["tools"].append(tool_schema)
+            except Exception:
+                logger.exception("Failed to append activate_skill tool schema")
+
+        return payload
+
+    def get_available_skills_summary(self) -> list[dict[str, str]]:
+        """Return discovered skills for user-facing listings."""
+        if not self.skill_registry:
+            return []
+
+        try:
+            self.skill_registry.refresh_if_due()
+            return [
+                {"name": skill.name, "description": skill.description}
+                for skill in self.skill_registry.list_skills(include_model_hidden=True)
+            ]
+        except Exception:
+            logger.exception("Failed to list available skills")
+            return []
+
+    def activate_skill_for_session(
+        self,
+        session_id: Optional[str],
+        skill_name: str,
+        source: str = "user",
+    ) -> dict[str, Any]:
+        """Activate a skill explicitly for the current session."""
+        if not self.skill_registry:
+            return {"success": False, "error": "Skill support is not configured"}
+
+        try:
+            return self.skill_registry.activate_skill(
+                name=skill_name,
+                session_id=session_id,
+                source=source,
+            )
+        except Exception as exc:
+            logger.exception("Failed to activate skill %s", skill_name)
+            return {"success": False, "error": str(exc)}
+
+    def clear_session_skills(self, session_id: Optional[str]) -> None:
+        """Clear per-session activated skill cache."""
+        if not self.skill_registry:
+            return
+        try:
+            self.skill_registry.clear_session_active_skills(session_id)
+        except Exception:
+            logger.exception("Failed clearing session skills for %s", session_id)
 
     def _utc_timestamp(self) -> str:
         """Return UTC timestamp with second precision."""
@@ -1879,6 +1945,8 @@ class AgentHandler:
         memory_context: str,
         plan_context: str,
         example_context: str,
+        skills_catalog_context: str = "",
+        active_skills_context: str = "",
         session_prompt_suffix: str = "",
         request_freshness_token: Optional[str] = None,
     ) -> str:
@@ -1892,6 +1960,8 @@ class AgentHandler:
             "Use recall() to retrieve past memories.\n"
             "If you need access to current information not available to you, use the web_search() tool.\n"
             "Use consortium_start() to launch a consortium task, consortium_status() to check progress/results, and consortium_stop() to cancel an active consortium task.\n"
+            "If skills are listed in <available_skills>, call activate_skill(name) before executing specialized workflows.\n"
+            "Users can also explicitly activate skills with /skill-name or $skill-name. Treat that as a harness-level activation signal.\n"
             'For readability, you may split a reply into multiple chunks using <message>...</message> blocks. You may also insert <typing seconds="1.2"/> between message blocks to add brief pacing pauses. If you use this format, keep all user-visible text inside those message blocks.\n'
             "IMPORTANT: Do not use markdown formatting, code blocks, or emojis in your responses. Respond in plain text only.\n"
         )
@@ -1912,11 +1982,16 @@ class AgentHandler:
                 + memory_context
                 + plan_context
                 + example_context
+                + (f"\n\n{skills_catalog_context}" if skills_catalog_context else "")
+                + (f"\n\n{active_skills_context}" if active_skills_context else "")
             )
 
+        skills_catalog_suffix = f"\n\n{skills_catalog_context}" if skills_catalog_context else ""
+        active_skills_suffix = f"\n\n{active_skills_context}" if active_skills_context else ""
         return (
             "You are a helpful AI assistant with persistent memory."
             f"{universal_instructions}{session_suffix}{memory_context}{plan_context}{example_context}"
+            f"{skills_catalog_suffix}{active_skills_suffix}"
         )
 
     def _build_request_freshness_token(self) -> str:
@@ -2019,6 +2094,8 @@ class AgentHandler:
         round_number: int,
         custom_prompt: str,
         memory_context: str,
+        skills_catalog_context: str,
+        active_skills_context: str,
         session_prompt_suffix: str,
         request_freshness_token: str = "",
     ) -> tuple[str, dict[str, Any] | None]:
@@ -2055,6 +2132,10 @@ class AgentHandler:
 
         if memory_context:
             system_parts.append(memory_context.strip())
+        if skills_catalog_context:
+            system_parts.append(skills_catalog_context.strip())
+        if active_skills_context:
+            system_parts.append(active_skills_context.strip())
 
         if request_freshness_token:
             system_parts.append(REQUEST_FRESHNESS_INSTRUCTION)
@@ -2114,6 +2195,8 @@ class AgentHandler:
         session: aiohttp.ClientSession,
         custom_prompt: str = "",
         memory_context: str = "",
+        skills_catalog_context: str = "",
+        active_skills_context: str = "",
         session_prompt_suffix: str = "",
         request_freshness_token: str = "",
     ) -> str:
@@ -2144,6 +2227,8 @@ class AgentHandler:
                         round_number=round_number,
                         custom_prompt=custom_prompt,
                         memory_context=memory_context,
+                        skills_catalog_context=skills_catalog_context,
+                        active_skills_context=active_skills_context,
                         session_prompt_suffix=session_prompt_suffix,
                         request_freshness_token=request_freshness_token,
                     )
@@ -2191,6 +2276,10 @@ class AgentHandler:
             judge_system_parts.append(session_prompt_suffix)
         if memory_context:
             judge_system_parts.append(memory_context.strip())
+        if skills_catalog_context:
+            judge_system_parts.append(skills_catalog_context.strip())
+        if active_skills_context:
+            judge_system_parts.append(active_skills_context.strip())
         if request_freshness_token:
             judge_system_parts.append(REQUEST_FRESHNESS_INSTRUCTION)
             judge_system_parts.append(f"[Freshness Token]: {request_freshness_token}")
@@ -2367,6 +2456,20 @@ class AgentHandler:
         # Build system prompt with adaptive formatting
         custom_prompt = self.memory_store.get_system_prompt() or ""
         session_prompt_suffix = self._get_session_prompt_suffix(session_id)
+        skills_catalog_context = ""
+        active_skills_context = ""
+
+        if self.skill_registry:
+            try:
+                self.skill_registry.refresh_if_due()
+                skills_catalog_context = (
+                    self.skill_registry.build_available_skills_catalog()
+                )
+                active_skills_context = self.skill_registry.build_active_skills_context(
+                    session_id
+                )
+            except Exception:
+                logger.exception("Failed building skills context")
 
         # Add task plan context if available
         plan_context = ""
@@ -2391,6 +2494,8 @@ class AgentHandler:
             memory_context=memory_context,
             plan_context=plan_context,
             example_context=example_context,
+            skills_catalog_context=skills_catalog_context,
+            active_skills_context=active_skills_context,
             session_prompt_suffix=session_prompt_suffix,
             request_freshness_token=request_freshness_token,
         )
@@ -2423,14 +2528,20 @@ class AgentHandler:
                             "Failed to deliver interim consortium acknowledgement"
                         )
 
-                content = await self._run_consortium_mode(
-                    user_query=user_query,
-                    session=session,
-                    custom_prompt=custom_prompt,
-                    memory_context=memory_context,
-                    session_prompt_suffix=session_prompt_suffix,
-                    request_freshness_token=request_freshness_token,
-                )
+                session_token = set_tool_runtime_session(session_id)
+                try:
+                    content = await self._run_consortium_mode(
+                        user_query=user_query,
+                        session=session,
+                        custom_prompt=custom_prompt,
+                        memory_context=memory_context,
+                        skills_catalog_context=skills_catalog_context,
+                        active_skills_context=active_skills_context,
+                        session_prompt_suffix=session_prompt_suffix,
+                        request_freshness_token=request_freshness_token,
+                    )
+                finally:
+                    reset_tool_runtime_session(session_token)
 
                 if acknowledgement and not acknowledgement_delivered:
                     content = f"{acknowledgement}\n\n{content}"
@@ -2479,7 +2590,8 @@ class AgentHandler:
         )
 
         # Create a fresh payload for this request (avoid global mutation)
-        current_payload = BASE_PAYLOAD.copy()
+        payload_template = self._build_request_payload_template()
+        current_payload = payload_template.copy()
         current_payload["messages"] = messages
 
         async with aiohttp.ClientSession() as session:
@@ -2491,14 +2603,18 @@ class AgentHandler:
                 {"Authorization": f"Bearer {API_KEY}"},
             )
 
-            content = await process_response(
-                response_data,
-                current_payload["messages"],
-                session,
-                BASE_URL,
-                API_KEY,
-                BASE_PAYLOAD,
-            )
+            session_token = set_tool_runtime_session(session_id)
+            try:
+                content = await process_response(
+                    response_data,
+                    current_payload["messages"],
+                    session,
+                    BASE_URL,
+                    API_KEY,
+                    payload_template,
+                )
+            finally:
+                reset_tool_runtime_session(session_token)
 
             # Store conversation in memory
             if session_id and user_query:

@@ -249,6 +249,106 @@ def _parse_slash_command(text: str) -> tuple[str, str]:
     return command_token.strip().lower(), arg_text.strip()
 
 
+SKILL_INVOCATION_PATTERN = re.compile(
+    r"^\s*(?:/|\$)(?P<name>[a-z0-9]+(?:-[a-z0-9]+)*)\b(?:\s+(?P<rest>.*))?$",
+    re.DOTALL,
+)
+BUILTIN_SESSION_COMMANDS = {
+    "/start",
+    "/setprompt",
+    "/cancel",
+    "/clear",
+    "/memorystats",
+    "/memory_stats",
+    "/memorycadence",
+    "/skills",
+}
+
+
+def _parse_skill_invocation(text: str) -> tuple[str, str]:
+    """Extract explicit skill activation syntax from message text.
+
+    Supports `/skill-name ...` and `$skill-name ...`.
+    Returns `(skill_name, remaining_text)`.
+    """
+    candidate = (text or "").strip()
+    if not candidate:
+        return "", ""
+
+    match = SKILL_INVOCATION_PATTERN.match(candidate)
+    if not match:
+        return "", ""
+
+    name = (match.group("name") or "").strip()
+    rest = (match.group("rest") or "").strip()
+    if not name:
+        return "", ""
+
+    if candidate.startswith("/") and f"/{name}" in BUILTIN_SESSION_COMMANDS:
+        return "", ""
+
+    return name, rest
+
+
+def _apply_text_remainder_to_user_content(
+    user_content: str | list[dict[str, Any]],
+    new_text: str,
+) -> str | list[dict[str, Any]]:
+    """Preserve non-text blocks while swapping text after skill invocation."""
+    if isinstance(user_content, str):
+        return new_text
+
+    if not isinstance(user_content, list):
+        return new_text
+
+    blocks: list[dict[str, Any]] = []
+    text_inserted = False
+    normalized_text = (new_text or "").strip()
+
+    if normalized_text:
+        blocks.append({"type": "text", "text": normalized_text})
+        text_inserted = True
+
+    for item in user_content:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "text":
+            if not text_inserted and normalized_text:
+                blocks.append({"type": "text", "text": normalized_text})
+                text_inserted = True
+            continue
+        blocks.append(item)
+
+    if not blocks and normalized_text:
+        return normalized_text
+    return blocks
+
+
+def _format_available_skills(handler: Any) -> str:
+    """Render available skills for `/skills` command responses."""
+    if not hasattr(handler, "get_available_skills_summary"):
+        return "Skill support is not configured."
+
+    try:
+        skills = handler.get_available_skills_summary()
+    except Exception as e:
+        logger.error("Failed to load skills summary: %s", e)
+        return "Unable to list skills right now."
+
+    if not skills:
+        return "No skills are currently available."
+
+    lines = ["Available skills:"]
+    for skill in skills:
+        name = str(skill.get("name", "")).strip()
+        desc = str(skill.get("description", "")).strip()
+        if not name:
+            continue
+        lines.append(f"- {name}: {desc}")
+    lines.append("Activate with /<skill-name> or $<skill-name>.")
+    return "\n".join(lines)
+
+
 def _format_memory_cadence_stats(handler: Any, session_id: str) -> str:
     """Build human-readable memory cadence stats for slash-command responses."""
     try:
@@ -2253,7 +2353,49 @@ async def _process_telegram_message(
     bot: Any,
 ) -> None:
     """Process a Telegram user message and send text/media reply."""
-    user_content = await _build_user_message_content_async(text, attachment_urls)
+    session_id = f"tg_{user_id}"
+    normalized_text = (text or "").strip()
+    invocation_skill_name, remaining_text = _parse_skill_invocation(normalized_text)
+    if invocation_skill_name and hasattr(handler, "activate_skill_for_session"):
+        activation = handler.activate_skill_for_session(
+            session_id=session_id,
+            skill_name=invocation_skill_name,
+            source="user",
+        )
+        if not activation.get("success"):
+            await _send_telegram_response(
+                bot,
+                chat_id,
+                f"Skill activation failed: {activation.get('error', 'unknown error')}",
+                [],
+            )
+            return
+
+        normalized_text = remaining_text
+        if not normalized_text and not attachment_urls:
+            if activation.get("already_active"):
+                await _send_telegram_response(
+                    bot,
+                    chat_id,
+                    f"Skill '{invocation_skill_name}' is already active.",
+                    [],
+                )
+            else:
+                await _send_telegram_response(
+                    bot,
+                    chat_id,
+                    (
+                        f"Activated skill '{invocation_skill_name}'. "
+                        "Send your request now, or include it after the skill name."
+                    ),
+                    [],
+                )
+            return
+
+    user_content = await _build_user_message_content_async(
+        normalized_text,
+        attachment_urls,
+    )
 
     async def _send_interim_response(interim_response: str) -> None:
         interim_text, interim_attachments = _extract_agent_response_payload(
@@ -2265,7 +2407,7 @@ async def _process_telegram_message(
 
     response = await handler.handle(
         {"messages": [{"role": "user", "content": user_content}]},
-        session_id=f"tg_{user_id}",
+        session_id=session_id,
         interim_response_callback=_send_interim_response,
     )
     response_text, response_attachments = _extract_agent_response_payload(response)
@@ -3006,20 +3148,49 @@ async def handle_imessage(
     if command == "/start":
         return (
             "Hello! I'm AgentZero. "
-            "Available commands: /start, /setprompt, /clear, /memorystats."
+            "Available commands: /start, /setprompt, /clear, /memorystats, /skills."
         )
 
     if command in {"/memorystats", "/memory_stats", "/memorycadence"}:
         return _format_memory_cadence_stats(handler, session_id)
 
+    if command == "/skills":
+        return _format_available_skills(handler)
+
     # Check for /clear command
     if command == "/clear":
         try:
             deleted_count = handler.memory_store.clear_conversation_history(session_id)
+            if hasattr(handler, "clear_session_skills"):
+                handler.clear_session_skills(session_id)
             return f"✅ Conversation cleared! Started fresh. ({deleted_count} messages removed)"
         except Exception as e:
             logger.error(f"Failed to clear conversation: {e}")
             return f"❌ Failed to clear conversation: {str(e)}"
+
+    invocation_skill_name, remaining_text = _parse_skill_invocation(text)
+    if invocation_skill_name:
+        activation = (
+            handler.activate_skill_for_session(
+                session_id=session_id,
+                skill_name=invocation_skill_name,
+                source="user",
+            )
+            if hasattr(handler, "activate_skill_for_session")
+            else {"success": False, "error": "Skill support is not configured"}
+        )
+        if not activation.get("success"):
+            return f"Skill activation failed: {activation.get('error', 'unknown error')}"
+
+        if not remaining_text:
+            if activation.get("already_active"):
+                return f"Skill '{invocation_skill_name}' is already active."
+            return (
+                f"Activated skill '{invocation_skill_name}'. "
+                "Send your request now, or include it after the skill name."
+            )
+
+        user_content = _apply_text_remainder_to_user_content(user_content, remaining_text)
 
     try:
         request_metadata: dict[str, Any] = {}
@@ -3523,6 +3694,8 @@ async def telegram_clear(
 
     try:
         deleted_count = handler.memory_store.clear_conversation_history(session_id)
+        if hasattr(handler, "clear_session_skills"):
+            handler.clear_session_skills(session_id)
         await update.message.reply_text(
             f"✅ Conversation cleared! Started fresh. ({deleted_count} messages removed)"
         )
@@ -3541,6 +3714,77 @@ async def telegram_memory_stats(
     user_id = update.effective_user.id
     session_id = f"tg_{user_id}"
     await update.message.reply_text(_format_memory_cadence_stats(handler, session_id))
+
+
+async def telegram_skills(
+    handler: AgentHandler, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
+):
+    """Handle /skills command - list discovered skills."""
+    if update.message is None:
+        return
+    await update.message.reply_text(_format_available_skills(handler))
+
+
+async def telegram_unknown_command(
+    handler: AgentHandler,
+    update: "Update",
+    context: "ContextTypes.DEFAULT_TYPE",
+):
+    """Handle command-shaped messages not matched by built-in command handlers."""
+    if (
+        update.message is None
+        or update.effective_user is None
+        or update.effective_chat is None
+    ):
+        return
+
+    text = (update.message.text or "").strip()
+    invocation_skill_name, remaining_text = _parse_skill_invocation(text)
+    if not invocation_skill_name:
+        await update.message.reply_text(
+            "Unknown command. Use /skills to list available skills."
+        )
+        return
+
+    session_id = f"tg_{update.effective_user.id}"
+    if not hasattr(handler, "activate_skill_for_session"):
+        await update.message.reply_text("Skill support is not configured.")
+        return
+
+    activation = handler.activate_skill_for_session(
+        session_id=session_id,
+        skill_name=invocation_skill_name,
+        source="user",
+    )
+    if not activation.get("success"):
+        await update.message.reply_text(
+            f"Skill activation failed: {activation.get('error', 'unknown error')}"
+        )
+        return
+
+    if not remaining_text:
+        if activation.get("already_active"):
+            await update.message.reply_text(
+                f"Skill '{invocation_skill_name}' is already active."
+            )
+        else:
+            await update.message.reply_text(
+                (
+                    f"Activated skill '{invocation_skill_name}'. "
+                    "Send your request now, or include it after the skill name."
+                )
+            )
+        return
+
+    await update.message.chat.send_action(action="typing")
+    await _process_telegram_message(
+        handler,
+        user_id=update.effective_user.id,
+        chat_id=update.effective_chat.id,
+        text=remaining_text,
+        attachment_urls=[],
+        bot=context.bot,
+    )
 
 
 async def telegram_handle_msg(
@@ -3649,9 +3893,21 @@ def run_telegram_bot(handler: AgentHandler):
         )
     )
     app.add_handler(
+        CommandHandler(
+            "skills",
+            lambda update, context: telegram_skills(handler, update, context),
+        )
+    )
+    app.add_handler(
         MessageHandler(
             (filters.TEXT | filters.PHOTO | filters.Document.IMAGE) & ~filters.COMMAND,
             lambda update, context: telegram_handle_msg(handler, update, context),
+        )
+    )
+    app.add_handler(
+        MessageHandler(
+            filters.COMMAND,
+            lambda update, context: telegram_unknown_command(handler, update, context),
         )
     )
     # Add error handler to catch polling errors gracefully
@@ -3696,9 +3952,21 @@ async def run_telegram_bot_async(handler: AgentHandler):
         )
     )
     app.add_handler(
+        CommandHandler(
+            "skills",
+            lambda update, context: telegram_skills(handler, update, context),
+        )
+    )
+    app.add_handler(
         MessageHandler(
             (filters.TEXT | filters.PHOTO | filters.Document.IMAGE) & ~filters.COMMAND,
             lambda update, context: telegram_handle_msg(handler, update, context),
+        )
+    )
+    app.add_handler(
+        MessageHandler(
+            filters.COMMAND,
+            lambda update, context: telegram_unknown_command(handler, update, context),
         )
     )
     # Add error handler to catch polling errors gracefully

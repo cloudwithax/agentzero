@@ -17,7 +17,8 @@ from memory import EnhancedMemoryStore  # noqa: E402
 from capabilities import Capability, CapabilityProfile, AdaptiveFormatter  # noqa: E402
 from examples import ExampleBank, AdaptiveFewShotManager  # noqa: E402
 from planning import TaskPlanner, TaskAnalyzer  # noqa: E402
-from tools import set_memory_store  # noqa: E402
+from skills import SkillRegistry  # noqa: E402
+from tools import set_memory_store, set_skill_registry  # noqa: E402
 from handler import AgentHandler  # noqa: E402
 from integrations import run_telegram_bot_async, start_sendblue_bot  # noqa: E402
 
@@ -251,6 +252,10 @@ def initialize_agent() -> AgentHandler:
     # Set memory store for tools
     set_memory_store(memory_store)
 
+    # Initialize Agent Skills registry
+    skill_registry = SkillRegistry(project_root=os.getcwd())
+    set_skill_registry(skill_registry)
+
     # Initialize capability profile for the model
     # Using known profile for Kimi K2 which supports all major capabilities
     capability_profile = CapabilityProfile(
@@ -288,6 +293,7 @@ def initialize_agent() -> AgentHandler:
         task_planner=task_planner,
         task_analyzer=task_analyzer,
         adaptive_formatter=adaptive_formatter,
+        skill_registry=skill_registry,
     )
 
     return handler

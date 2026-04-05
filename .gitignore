@@ -3,6 +3,7 @@
 
 # Python
 __pycache__/
+*.pyc
 *.py[cod]
 *$py.class
 *.so
@@ -60,3 +61,15 @@ Thumbs.db
 
 # PID files
 *.pid
+
+# Agent persistent workspace
+workspace/
+
+# Keep current default skills tracked, ignore new skill dirs added later.
+.agentzero/skills/*
+!.agentzero/skills/skill-creator/
+!.agentzero/skills/skill-creator/**
+!.agentzero/skills/coding-agent/
+!.agentzero/skills/coding-agent/**
+!.agentzero/skills/prompt-injection-defense/
+!.agentzero/skills/prompt-injection-defense/**

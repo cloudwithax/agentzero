@@ -1,6 +1,7 @@
 """Tool functions and registry for the agent."""
 
 import asyncio
+import contextvars
 import glob
 import json
 import os
@@ -17,6 +18,11 @@ from memory import EnhancedMemoryStore
 # Initialize memory store (will be set from main module)
 memory_store: Optional[EnhancedMemoryStore] = None
 consortium_controller: Any = None
+skill_registry: Any = None
+_runtime_session_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "runtime_session_id",
+    default=None,
+)
 
 
 def set_memory_store(store: EnhancedMemoryStore):
@@ -29,6 +35,23 @@ def set_consortium_controller(controller: Any):
     """Set the consortium task controller used by consortium tools."""
     global consortium_controller
     consortium_controller = controller
+
+
+def set_skill_registry(registry: Any):
+    """Set the skill registry used by skill activation tools."""
+    global skill_registry
+    skill_registry = registry
+
+
+def set_tool_runtime_session(session_id: Optional[str]):
+    """Bind session context for tool execution during one model turn."""
+    normalized = str(session_id or "").strip() or None
+    return _runtime_session_id.set(normalized)
+
+
+def reset_tool_runtime_session(token: contextvars.Token):
+    """Restore previous tool runtime session context."""
+    _runtime_session_id.reset(token)
 
 
 # File tools
@@ -603,6 +626,22 @@ async def web_search_tool(
         return {"success": False, "error": str(e)}
 
 
+async def activate_skill_tool(name: str):
+    """Activate a discovered skill and return its wrapped instructions."""
+    if skill_registry is None:
+        return {"success": False, "error": "Skill registry is not configured"}
+
+    try:
+        session_id = _runtime_session_id.get()
+        return skill_registry.activate_skill(
+            name=str(name or "").strip(),
+            session_id=session_id,
+            source="model",
+        )
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 async def send_tapback_tool(
     message_handle: str,
     reaction: str,
@@ -666,6 +705,7 @@ TOOLS = {
     "forget": forget_tool,
     "memory_stats": memory_stats_tool,
     "web_search": web_search_tool,
+    "activate_skill": activate_skill_tool,
     "send_tapback": send_tapback_tool,
     "send_reaction": send_tapback_tool,  # Alias for clarity
     "consortium_start": consortium_start_tool,
@@ -699,6 +739,7 @@ def validate_tool_args(func_name: str, func_args: dict) -> tuple:
         "recall": ["query"],
         "forget": ["memory_id"],
         "web_search": ["query"],
+        "activate_skill": ["name"],
         "send_tapback": ["message_handle", "reaction"],
         "send_reaction": ["message_handle", "reaction"],
         "consortium_start": ["task"],
