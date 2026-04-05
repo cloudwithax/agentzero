@@ -128,19 +128,19 @@ def test_sendblue_message_formatting_prefers_carriage_returns() -> None:
 
 
 def test_split_outbound_message_chunks_prefers_explicit_blocks() -> None:
-    """Explicit <message> blocks should define outbound chunk boundaries."""
+    """Explicit <message> blocks should collapse into one sanitized outbound chunk."""
     chunks = _split_outbound_message_chunks(
         "<message>first</message>\nrecalling memories...\n<message>second</message>"
     )
-    assert chunks == ["first", "second"]
+    assert chunks == ["first\n\nsecond"]
 
 
 def test_split_outbound_message_chunks_ignores_typing_directives() -> None:
-    """Typing directives should not be emitted as visible message chunks."""
+    """Typing directives should be removed from the single outbound chunk."""
     chunks = _split_outbound_message_chunks(
         '<message>first</message><typing seconds="1.5"/><message>second</message>'
     )
-    assert chunks == ["first", "second"]
+    assert chunks == ["first\n\nsecond"]
 
 
 async def test_send_imessage_normalizes_content_before_send() -> None:
@@ -419,7 +419,7 @@ async def test_auto_tapback_sends_when_relevant_and_random_passes() -> None:
 
 
 async def test_send_imessage_sends_explicit_message_blocks_separately() -> None:
-    """Explicit message blocks should fan out to one Sendblue API call per chunk."""
+    """Explicit message blocks should be collapsed into one Sendblue API call."""
 
     class _FakeResponse:
         status = 200
@@ -481,16 +481,16 @@ async def test_send_imessage_sends_explicit_message_blocks_separately() -> None:
             os.environ["SENDBLUE_FORCE_CARRIAGE_RETURNS"] = previous_force_cr
 
     assert result.get("success") is True
-    assert result.get("chunks_sent") == 2
-    assert len(fake_session.payloads) == 2
-    assert fake_session.payloads[0].get("content") == "chunk one"
-    assert "media_url" not in fake_session.payloads[0]
-    assert fake_session.payloads[1].get("content") == "chunk two"
-    assert fake_session.payloads[1].get("media_url") == "https://img.example/final.png"
+    assert len(fake_session.payloads) == 1
+    outbound_payload = fake_session.payloads[0]
+    assert "<message>" not in str(outbound_payload.get("content", ""))
+    assert "chunk one" in str(outbound_payload.get("content", ""))
+    assert "chunk two" in str(outbound_payload.get("content", ""))
+    assert outbound_payload.get("media_url") == "https://img.example/final.png"
 
 
-async def test_send_imessage_typing_directive_triggers_indicator() -> None:
-    """Typing directives should emit typing indicators between message chunks."""
+async def test_send_imessage_typing_directive_is_ignored() -> None:
+    """Typing directives should be ignored in favor of one plain outbound send."""
 
     class _FakeResponse:
         status = 200
@@ -524,13 +524,10 @@ async def test_send_imessage_typing_directive_triggers_indicator() -> None:
 
     fake_session = _FakeSession()
     try:
-        with (
-            patch(
-                "integrations.send_typing_indicator",
-                new=AsyncMock(return_value={"success": True}),
-            ) as typing_mock,
-            patch("integrations.asyncio.sleep", new=AsyncMock()) as sleep_mock,
-        ):
+        with patch(
+            "integrations.send_typing_indicator",
+            new=AsyncMock(return_value={"success": True}),
+        ) as typing_mock:
             result = await send_imessage(
                 "+15551234567",
                 '<message>chunk one</message><typing seconds="1.4"/><message>chunk two</message>',
@@ -558,10 +555,9 @@ async def test_send_imessage_typing_directive_triggers_indicator() -> None:
             os.environ["SENDBLUE_FORCE_CARRIAGE_RETURNS"] = previous_force_cr
 
     assert result.get("success") is True
-    assert result.get("chunks_sent") == 2
-    assert len(fake_session.payloads) == 2
-    assert typing_mock.await_count >= 1
-    assert sleep_mock.await_count >= 1
+    assert len(fake_session.payloads) == 1
+    assert "<typing" not in str(fake_session.payloads[0].get("content", ""))
+    assert typing_mock.await_count == 0
 
 
 async def test_imessage_start_and_setprompt_flow() -> None:
@@ -902,7 +898,7 @@ async def main() -> int:
     await test_send_reaction_posts_expected_payload()
     await test_auto_tapback_sends_when_relevant_and_random_passes()
     await test_send_imessage_sends_explicit_message_blocks_separately()
-    await test_send_imessage_typing_directive_triggers_indicator()
+    await test_send_imessage_typing_directive_is_ignored()
     await test_imessage_start_and_setprompt_flow()
     await test_imessage_memory_stats_command()
     await test_handle_imessage_passes_request_metadata_to_handler()

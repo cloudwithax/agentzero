@@ -9,6 +9,7 @@ sys.path.insert(0, "/home/clxud/Documents/github/agentzero")
 from api import (
     _apply_cache_busting_headers,
     _extract_nvcf_asset_ids,
+    api_call_with_retry,
     execute_tool_calls,
     process_response,
 )
@@ -67,6 +68,159 @@ def test_extract_nvcf_asset_ids_from_messages() -> None:
         "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
         "ffffffff-1111-2222-3333-444444444444",
     ], f"Unexpected asset IDs: {asset_ids}"
+    print("  ✓ Passed")
+
+
+class MockStreamingContent:
+    def __init__(self, lines):
+        self._lines = [line.encode("utf-8") for line in lines]
+
+    def __aiter__(self):
+        self._iter = iter(self._lines)
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._iter)
+        except StopIteration as exc:
+            raise StopAsyncIteration from exc
+
+
+async def test_api_call_with_retry_streams_text_deltas():
+    """Streaming API calls should emit text deltas and assemble final content."""
+    print("Test 0b: Streaming text deltas")
+
+    class MockResponse:
+        status = 200
+        content_type = "text/event-stream"
+
+        def __init__(self):
+            self.content = MockStreamingContent(
+                [
+                    'data: {"choices":[{"delta":{"role":"assistant"}}]}\n',
+                    'data: {"choices":[{"delta":{"content":"Hel"}}]}\n',
+                    'data: {"choices":[{"delta":{"content":"lo"}}]}\n',
+                    "data: [DONE]\n",
+                ]
+            )
+
+    class MockPostCM:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return MockResponse()
+
+        async def __aexit__(self, *args):
+            return False
+
+    collected_chunks: list[str] = []
+
+    async def collect_chunk(chunk: str) -> None:
+        collected_chunks.append(chunk)
+
+    mock_session = AsyncMock()
+    mock_session.post = MockPostCM
+
+    response_data = await api_call_with_retry(
+        mock_session,
+        BASE_URL,
+        {"model": "test-model", "messages": []},
+        {"Authorization": "Bearer test"},
+        stream=True,
+        stream_chunk_callback=collect_chunk,
+    )
+
+    message = response_data["choices"][0]["message"]
+    assert message["content"] == "Hello", f"Unexpected streamed content: {message}"
+    assert collected_chunks == ["Hel", "lo"], f"Unexpected chunks: {collected_chunks}"
+    print("  ✓ Passed")
+
+
+async def test_api_call_with_retry_streams_tool_calls():
+    """Streaming API calls should assemble tool call names and arguments correctly."""
+    print("Test 0c: Streaming tool-call assembly")
+
+    first_chunk = json.dumps({"choices": [{"delta": {"role": "assistant"}}]})
+    second_chunk = json.dumps(
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_stream",
+                                "type": "function",
+                                "function": {"name": "ba"},
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+    )
+    third_chunk = json.dumps(
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "function": {
+                                    "name": "sh",
+                                    "arguments": '{"command": "echo hi"}',
+                                },
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+    )
+
+    class MockResponse:
+        status = 200
+        content_type = "text/event-stream"
+
+        def __init__(self):
+            self.content = MockStreamingContent(
+                [
+                    f"data: {first_chunk}\n",
+                    f"data: {second_chunk}\n",
+                    f"data: {third_chunk}\n",
+                    "data: [DONE]\n",
+                ]
+            )
+
+    class MockPostCM:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return MockResponse()
+
+        async def __aexit__(self, *args):
+            return False
+
+    mock_session = AsyncMock()
+    mock_session.post = MockPostCM
+
+    response_data = await api_call_with_retry(
+        mock_session,
+        BASE_URL,
+        {"model": "test-model", "messages": []},
+        {"Authorization": "Bearer test"},
+        stream=True,
+    )
+
+    tool_calls = response_data["choices"][0]["message"].get("tool_calls") or []
+    assert len(tool_calls) == 1, f"Unexpected tool calls: {tool_calls}"
+    assert (
+        tool_calls[0]["function"]["name"] == "bash"
+    ), f"Unexpected tool call: {tool_calls[0]}"
+    assert tool_calls[0]["function"]["arguments"] == '{"command": "echo hi"}'
     print("  ✓ Passed")
 
 
@@ -634,6 +788,8 @@ async def main():
     test_cache_busting_headers_are_applied()
     test_extract_nvcf_asset_ids_from_messages()
 
+    await test_api_call_with_retry_streams_text_deltas()
+    await test_api_call_with_retry_streams_tool_calls()
     await test_regular_response()
     await test_empty_content()
     await test_missing_content_key()

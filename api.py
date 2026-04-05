@@ -5,7 +5,7 @@ import json
 import logging
 import re
 import uuid
-from typing import Any
+from typing import Any, Awaitable, Callable, Optional
 
 import aiohttp
 import strip_markdown
@@ -265,6 +265,168 @@ def _extract_allowed_tool_names(payload: dict[str, Any]) -> set[str]:
     return allowed
 
 
+def _coerce_stream_delta_text(content: Any) -> str:
+    """Extract text content from a streamed delta payload."""
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            text_value = item.get("text")
+            if isinstance(text_value, str):
+                parts.append(text_value)
+                continue
+            if item.get("type") == "text" and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        return "".join(parts)
+
+    return ""
+
+
+def _merge_stream_delta(
+    assembled_message: dict[str, Any], delta: dict[str, Any]
+) -> str:
+    """Merge a chat-completions SSE delta into an assembled assistant message."""
+    role = delta.get("role")
+    if isinstance(role, str) and role:
+        assembled_message["role"] = role
+
+    content_delta = _coerce_stream_delta_text(delta.get("content"))
+    if content_delta:
+        assembled_message["content"] = (
+            assembled_message.get("content", "") + content_delta
+        )
+
+    tool_call_deltas = delta.get("tool_calls")
+    if isinstance(tool_call_deltas, list):
+        tool_calls = assembled_message.setdefault("tool_calls", [])
+        for tool_call_delta in tool_call_deltas:
+            if not isinstance(tool_call_delta, dict):
+                continue
+
+            index = tool_call_delta.get("index", len(tool_calls))
+            if not isinstance(index, int) or index < 0:
+                index = len(tool_calls)
+
+            while len(tool_calls) <= index:
+                tool_calls.append(
+                    {
+                        "id": "",
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    }
+                )
+
+            current_tool_call = tool_calls[index]
+            tool_call_id = tool_call_delta.get("id")
+            if isinstance(tool_call_id, str) and tool_call_id:
+                current_tool_call["id"] = tool_call_id
+
+            tool_call_type = tool_call_delta.get("type")
+            if isinstance(tool_call_type, str) and tool_call_type:
+                current_tool_call["type"] = tool_call_type
+
+            function_delta = tool_call_delta.get("function")
+            if not isinstance(function_delta, dict):
+                continue
+
+            current_function = current_tool_call.setdefault(
+                "function", {"name": "", "arguments": ""}
+            )
+            function_name = function_delta.get("name")
+            if isinstance(function_name, str) and function_name:
+                current_function["name"] += function_name
+
+            function_arguments = function_delta.get("arguments")
+            if isinstance(function_arguments, str) and function_arguments:
+                current_function["arguments"] += function_arguments
+
+    return content_delta
+
+
+def _finalize_stream_message(assembled_message: dict[str, Any]) -> dict[str, Any]:
+    """Normalize the assembled streamed assistant message to standard shape."""
+    finalized_message = {
+        "role": assembled_message.get("role", "assistant"),
+        "content": assembled_message.get("content", "") or None,
+    }
+
+    tool_calls = assembled_message.get("tool_calls") or []
+    normalized_tool_calls: list[dict[str, Any]] = []
+    for index, tool_call in enumerate(tool_calls, start=1):
+        if not isinstance(tool_call, dict):
+            continue
+        function_obj = tool_call.get("function") or {}
+        if not isinstance(function_obj, dict):
+            function_obj = {}
+
+        function_name = function_obj.get("name") or ""
+        arguments = function_obj.get("arguments") or "{}"
+        if not function_name:
+            continue
+
+        normalized_tool_calls.append(
+            {
+                "id": tool_call.get("id") or f"stream_call_{index}",
+                "type": tool_call.get("type") or "function",
+                "function": {
+                    "name": function_name,
+                    "arguments": arguments,
+                },
+            }
+        )
+
+    if normalized_tool_calls:
+        finalized_message["tool_calls"] = normalized_tool_calls
+
+    return finalized_message
+
+
+async def _read_streaming_chat_response(
+    resp: aiohttp.ClientResponse,
+    stream_chunk_callback: Optional[Callable[[str], Awaitable[None]]] = None,
+) -> dict[str, Any]:
+    """Read an SSE chat-completions response and assemble a standard response payload."""
+    assembled_message: dict[str, Any] = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [],
+    }
+
+    async for raw_line in resp.content:
+        line = raw_line.decode("utf-8").strip()
+        if not line or not line.startswith("data:"):
+            continue
+
+        payload = line[5:].strip()
+        if not payload:
+            continue
+        if payload == "[DONE]":
+            break
+
+        chunk = json.loads(payload)
+        choices = chunk.get("choices")
+        if not isinstance(choices, list) or not choices:
+            continue
+
+        choice = choices[0]
+        if not isinstance(choice, dict):
+            continue
+
+        delta = choice.get("delta")
+        if not isinstance(delta, dict):
+            continue
+
+        content_delta = _merge_stream_delta(assembled_message, delta)
+        if content_delta and stream_chunk_callback:
+            await stream_chunk_callback(content_delta)
+
+    return {"choices": [{"message": _finalize_stream_message(assembled_message)}]}
+
+
 async def api_call_with_retry(
     session: aiohttp.ClientSession,
     url: str,
@@ -272,23 +434,50 @@ async def api_call_with_retry(
     headers: dict[str, str],
     max_retries: int = 3,
     backoff: float = 2.0,
+    stream: bool = False,
+    stream_chunk_callback: Optional[Callable[[str], Awaitable[None]]] = None,
 ) -> dict[str, Any]:
     """Make an API call with retry logic for transient errors."""
     request_headers = _apply_cache_busting_headers(headers)
+    request_headers["Accept"] = (
+        "text/event-stream"
+        if stream
+        else request_headers.get("Accept", "application/json")
+    )
+    request_payload = json_data.copy()
+    request_payload["stream"] = stream
+
     has_asset_header = any(
         key.lower() == "nvcf-input-asset-references" for key in request_headers
     )
     if not has_asset_header:
-        asset_ids = _extract_nvcf_asset_ids(json_data.get("messages"))
+        asset_ids = _extract_nvcf_asset_ids(request_payload.get("messages"))
         if asset_ids:
             request_headers["NVCF-INPUT-ASSET-REFERENCES"] = ",".join(asset_ids)
 
     for attempt in range(max_retries):
         try:
             async with session.post(
-                url, json=json_data, headers=request_headers
+                url, json=request_payload, headers=request_headers
             ) as resp:
-                response_data = await resp.json()
+                if stream:
+                    if resp.status >= 400:
+                        try:
+                            response_data = await resp.json(content_type=None)
+                        except Exception:
+                            error_text = await resp.text()
+                            response_data = {
+                                "error": {"message": error_text or str(resp.status)}
+                            }
+                    elif resp.content_type != "text/event-stream":
+                        response_data = await resp.json(content_type=None)
+                    else:
+                        response_data = await _read_streaming_chat_response(
+                            resp,
+                            stream_chunk_callback=stream_chunk_callback,
+                        )
+                else:
+                    response_data = await resp.json()
 
                 # Check for rate limiting or server errors
                 if "error" in response_data:
@@ -396,6 +585,7 @@ async def process_response(
     api_key: str,
     base_payload: dict[str, Any],
     max_tool_leak_retries: int = 1,
+    stream_chunk_callback: Optional[Callable[[str], Awaitable[None]]] = None,
 ) -> str:
     """Process API response. Handles multiple rounds of tool calls."""
     tool_leak_retry_count = 0
@@ -445,6 +635,8 @@ async def process_response(
                 base_url,
                 current_payload,
                 {"Authorization": f"Bearer {api_key}"},
+                stream=stream_chunk_callback is not None,
+                stream_chunk_callback=stream_chunk_callback,
             )
 
             # Handle errors in follow-up call
@@ -487,6 +679,8 @@ async def process_response(
                     base_url,
                     current_payload,
                     {"Authorization": f"Bearer {api_key}"},
+                    stream=stream_chunk_callback is not None,
+                    stream_chunk_callback=stream_chunk_callback,
                 )
                 continue
 

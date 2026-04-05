@@ -33,6 +33,14 @@ cp .env.example .env
      - `nvidia/llama-3.1-nemotron-nano-vl-8b-v1`
      - `qwen/qwen3.5-397b-a17b`
 
+  Optional OpenAI-compatible server settings:
+
+  - `OPENAI_COMPAT_ENABLED` - Set to `1` to run an OpenAI-compatible HTTP API.
+  - `OPENAI_COMPAT_API_KEY` - Required bearer token for all OpenAI-compatible endpoints.
+  - `OPENAI_COMPAT_HOST` - Bind address for the OpenAI-compatible server (default: `0.0.0.0`).
+  - `OPENAI_COMPAT_PORT` - Port for the OpenAI-compatible server (default: `8001`).
+  - `OPENAI_COMPAT_MODEL` - Public model name exposed by `/v1/models` (default: `agentzero-main`).
+
 Optional Sendblue reliability settings:
 
 - `SENDBLUE_WEBHOOK_PORT` - Run local webhook server instead of polling.
@@ -117,6 +125,29 @@ Daemon mode uses `agentzero.pid` to track the running background process.
 If the PID file is missing or stale, `--stop` will also try to find and stop orphaned `main.py --daemon` processes.
 
 This will run the agent with both Telegram and iMessage (using SendBlue) channels enabled. You can interact with the agent through either platform. The bot will refuse to start if the required API keys are not set.
+
+### OpenAI-compatible API (optional)
+
+If `OPENAI_COMPAT_ENABLED=1`, AgentZero also exposes:
+
+- `GET /v1/models`
+- `POST /v1/chat/completions`
+
+The server requires an `Authorization: Bearer <OPENAI_COMPAT_API_KEY>` header.
+
+Example:
+
+```bash
+curl http://localhost:8001/v1/chat/completions \
+  -H "Authorization: Bearer $OPENAI_COMPAT_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "agentzero-main",
+    "messages": [
+      {"role": "user", "content": "Give me a one-line status update."}
+    ]
+  }'
+```
 
 ## Features
 

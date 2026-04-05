@@ -117,17 +117,14 @@ SENDBLUE_TAPBACK_EMPHASIZE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 OUTBOUND_MESSAGE_BLOCK_PATTERN = re.compile(
-    r"<message>\s*(.*?)\s*</message>",
+    r"<message>\s*(?P<message>.*?)\s*</message>",
     re.IGNORECASE | re.DOTALL,
 )
-OUTBOUND_DELIVERY_DIRECTIVE_PATTERN = re.compile(
-    r"<message>\s*(?P<message>.*?)\s*</message>|"
-    r"<typing(?:\s+seconds\s*=\s*['\"]?(?P<seconds>\d+(?:\.\d+)?)['\"]?)?\s*/>",
-    re.IGNORECASE | re.DOTALL,
+OUTBOUND_TYPING_DIRECTIVE_PATTERN = re.compile(
+    r"<typing(?:\s+seconds\s*=\s*['\"]?\d+(?:\.\d+)?['\"]?)?\s*/>",
+    re.IGNORECASE,
 )
-OUTBOUND_TYPING_SECONDS_DEFAULT = 1.2
-OUTBOUND_TYPING_SECONDS_MIN = 0.2
-OUTBOUND_TYPING_SECONDS_MAX = 8.0
+OUTBOUND_MESSAGE_TAG_PATTERN = re.compile(r"</?message>", re.IGNORECASE)
 VOICE_MEMO_AUDIO_EXTENSIONS = {
     ".aac",
     ".amr",
@@ -432,7 +429,7 @@ def _format_memory_cadence_stats(handler: Any, session_id: str) -> str:
 
 def _format_sendblue_message_content(message: str) -> str:
     """Normalize outbound Sendblue text and enforce carriage returns for iMessage."""
-    normalized = "" if message is None else str(message)
+    normalized = _sanitize_outbound_delivery_text(message)
 
     # Normalize mixed/native line ending forms plus literal escaped newline sequences.
     normalized = (
@@ -465,8 +462,27 @@ def _format_sendblue_message_content(message: str) -> str:
     return normalized
 
 
+def _sanitize_outbound_delivery_text(message: str) -> str:
+    """Strip outbound chunking directives and collapse message blocks to plain text."""
+    normalized = "" if message is None else str(message)
+    if not normalized.strip():
+        return ""
+
+    message_chunks = [
+        match.group("message").strip()
+        for match in OUTBOUND_MESSAGE_BLOCK_PATTERN.finditer(normalized)
+        if isinstance(match.group("message"), str) and match.group("message").strip()
+    ]
+    if message_chunks:
+        return "\n\n".join(message_chunks).strip()
+
+    sanitized = OUTBOUND_TYPING_DIRECTIVE_PATTERN.sub("", normalized)
+    sanitized = OUTBOUND_MESSAGE_TAG_PATTERN.sub("", sanitized)
+    return sanitized.strip()
+
+
 def _split_outbound_message_chunks(message: str) -> list[str]:
-    """Split outbound assistant text into chunks, honoring <message> blocks."""
+    """Return a single sanitized outbound chunk for compatibility."""
     delivery_plan = _build_outbound_delivery_plan(message)
     return [
         str(step.get("text", "")).strip()
@@ -475,62 +491,12 @@ def _split_outbound_message_chunks(message: str) -> list[str]:
     ]
 
 
-def _parse_outbound_typing_seconds(raw_value: Any) -> float:
-    """Parse and clamp explicit typing delays from model output directives."""
-    if raw_value is None:
-        return OUTBOUND_TYPING_SECONDS_DEFAULT
-
-    try:
-        parsed = float(str(raw_value).strip())
-    except (TypeError, ValueError):
-        return OUTBOUND_TYPING_SECONDS_DEFAULT
-
-    if parsed <= 0:
-        return OUTBOUND_TYPING_SECONDS_DEFAULT
-
-    return max(
-        OUTBOUND_TYPING_SECONDS_MIN,
-        min(OUTBOUND_TYPING_SECONDS_MAX, parsed),
-    )
-
-
 def _build_outbound_delivery_plan(message: str) -> list[dict[str, Any]]:
-    """Build ordered outbound steps (message chunks + optional typing pauses)."""
-    normalized = "" if message is None else str(message)
-    if not normalized.strip():
+    """Build outbound delivery steps as one sanitized message (chunking disabled)."""
+    normalized = _sanitize_outbound_delivery_text(message)
+    if not normalized:
         return []
-
-    steps: list[dict[str, Any]] = []
-    saw_directive = False
-    saw_message_block = False
-
-    for match in OUTBOUND_DELIVERY_DIRECTIVE_PATTERN.finditer(normalized):
-        saw_directive = True
-        message_block = match.group("message")
-        if isinstance(message_block, str):
-            saw_message_block = True
-            chunk_text = message_block.strip()
-            if chunk_text:
-                steps.append({"type": "message", "text": chunk_text})
-            continue
-
-        steps.append(
-            {
-                "type": "typing",
-                "seconds": _parse_outbound_typing_seconds(match.group("seconds")),
-            }
-        )
-
-    if saw_message_block:
-        return steps
-
-    if saw_directive:
-        # If malformed directives were emitted without <message> blocks,
-        # fall back to plain text behavior instead of dropping content.
-        stripped = OUTBOUND_DELIVERY_DIRECTIVE_PATTERN.sub("", normalized).strip()
-        return [{"type": "message", "text": stripped}] if stripped else []
-
-    return [{"type": "message", "text": normalized.strip()}]
+    return [{"type": "message", "text": normalized}]
 
 
 def _normalize_attachment_urls(value: Any) -> list[str]:
@@ -2383,36 +2349,18 @@ async def _extract_telegram_attachment_urls(message: Any, bot: Any) -> list[str]
 async def _send_telegram_response(
     bot: Any, chat_id: int, text: str, attachment_urls: list[str]
 ) -> None:
-    """Send text and attachments to Telegram, batching images when possible."""
+    """Send one text response plus optional attachments to Telegram."""
     delivery_plan = _build_outbound_delivery_plan(text)
     attachments = _normalize_attachment_urls(attachment_urls)
-    remaining_messages = sum(
-        1
-        for step in delivery_plan
-        if step.get("type") == "message" and str(step.get("text", "")).strip()
-    )
-    sent_messages = 0
+    message_text = ""
+    if delivery_plan:
+        message_text = str(delivery_plan[0].get("text", "")).strip()
 
-    for step in delivery_plan:
-        step_type = str(step.get("type", "")).strip().lower()
-        if step_type == "typing":
-            if remaining_messages <= 0:
-                continue
-            await bot.send_chat_action(chat_id=chat_id, action="typing")
-            await asyncio.sleep(
-                float(step.get("seconds", OUTBOUND_TYPING_SECONDS_DEFAULT))
-            )
-            continue
-
-        chunk_text = str(step.get("text", "")).strip()
-        if not chunk_text:
-            continue
-        await bot.send_message(chat_id=chat_id, text=chunk_text)
-        sent_messages += 1
-        remaining_messages = max(0, remaining_messages - 1)
+    if message_text:
+        await bot.send_message(chat_id=chat_id, text=message_text)
 
     if not attachments:
-        if sent_messages == 0:
+        if not message_text:
             await bot.send_message(chat_id=chat_id, text="No response.")
         return
 
@@ -2594,10 +2542,9 @@ async def send_imessage(
         "sb-api-secret-key": api_secret,
     }
     delivery_plan = _build_outbound_delivery_plan(message)
-    chunk_count = sum(1 for step in delivery_plan if step.get("type") == "message")
-    if chunk_count <= 0:
+    if not delivery_plan:
         delivery_plan = [{"type": "message", "text": ""}]
-        chunk_count = 1
+    message_text = str(delivery_plan[0].get("text", ""))
 
     normalized_media_urls = _normalize_attachment_urls(media_urls)
 
@@ -2606,91 +2553,36 @@ async def send_imessage(
         session = aiohttp.ClientSession()
         close_session = True
     try:
-        send_results: list[dict[str, Any]] = []
-        remaining_messages = chunk_count
-        sent_message_index = 0
-
-        for step in delivery_plan:
-            step_type = str(step.get("type", "")).strip().lower()
-            if step_type == "typing":
-                if remaining_messages <= 0:
-                    continue
-
-                delay_seconds = float(
-                    step.get("seconds", OUTBOUND_TYPING_SECONDS_DEFAULT)
-                )
-                remaining_delay = max(0.0, delay_seconds)
-                while remaining_delay > 0 and remaining_messages > 0:
-                    typing_res = await send_typing_indicator(
-                        phone_number,
-                        session=session,
-                    )
-                    if not typing_res.get("success"):
-                        logger.debug(
-                            "Typing directive indicator failed for %s: %s",
-                            phone_number,
-                            typing_res,
-                        )
-
-                    sleep_window = min(remaining_delay, 3.8)
-                    await asyncio.sleep(sleep_window)
-                    remaining_delay -= sleep_window
-                continue
-
-            chunk_text = str(step.get("text", ""))
-
-            payload: dict[str, Any] = {
-                "number": phone_number,
-                "from_number": from_number,
-                "content": _format_sendblue_message_content(chunk_text),
-                "send_style": "regular",
-            }
-            if normalized_media_urls and remaining_messages == 1:
-                payload["media_url"] = (
-                    normalized_media_urls
-                    if len(normalized_media_urls) > 1
-                    else normalized_media_urls[0]
-                )
-
-            async with session.post(
-                "https://api.sendblue.co/api/send-message",
-                json=payload,
-                headers=headers,
-            ) as resp:
-                data = await resp.json()
-                success = 200 <= resp.status < 300
-                if isinstance(data, dict):
-                    delivery_status = str(data.get("status", "")).strip().upper()
-                    if delivery_status in {"QUEUED", "SENT", "DELIVERED"}:
-                        success = True
-
-                result = {
-                    "success": success,
-                    "data": data,
-                    "status": resp.status,
-                }
-                send_results.append(result)
-                if not success:
-                    return {
-                        **result,
-                        "chunk_index": sent_message_index,
-                        "chunk_count": chunk_count,
-                    }
-
-            sent_message_index += 1
-            remaining_messages = max(0, remaining_messages - 1)
-
-        final_result = send_results[-1]
-        if chunk_count == 1:
-            return final_result
-
-        return {
-            "success": True,
-            "status": final_result.get("status"),
-            "data": final_result.get("data"),
-            "chunks_sent": chunk_count,
-            "results": send_results,
+        payload: dict[str, Any] = {
+            "number": phone_number,
+            "from_number": from_number,
+            "content": _format_sendblue_message_content(message_text),
+            "send_style": "regular",
         }
+        if normalized_media_urls:
+            payload["media_url"] = (
+                normalized_media_urls
+                if len(normalized_media_urls) > 1
+                else normalized_media_urls[0]
+            )
+
+        async with session.post(
+            "https://api.sendblue.co/api/send-message",
+            json=payload,
+            headers=headers,
+        ) as resp:
+            data = await resp.json()
+            success = 200 <= resp.status < 300
+            if isinstance(data, dict):
+                delivery_status = str(data.get("status", "")).strip().upper()
+                if delivery_status in {"QUEUED", "SENT", "DELIVERED"}:
+                    success = True
+
+            return {
+                "success": success,
+                "data": data,
+                "status": resp.status,
+            }
     except Exception as e:
         return {"success": False, "error": str(e)}
     finally:

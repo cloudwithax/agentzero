@@ -256,6 +256,10 @@ All tools return a consistent dictionary format:
   **Fix:** Add a first-class `reminders` SQLite table in `memory.py`, persist scheduler state there by default, and have `ReminderScheduler` load from that table on startup with a fallback migration path from legacy `agent_state`. Validate with: `PYTHONPATH=. .venv/bin/python tests/test_reminder_tasks.py` and `PYTHONPATH=. .venv/bin/python tests/test_simple.py`.
 - **Pitfall: One-off reminders that explicitly targeted today could silently roll into a later weekly/monthly cron match after the requested same-day time had already passed.**
   **Fix:** Add a simpler same-day resolution path in `reminder_tasks.py` for one-off tasks: prefer the next matching time within the current day first, and if the cron expression explicitly targets today but no same-day slot remains, fail with a clear error instead of rolling forward. Validate with: `PYTHONPATH=. .venv/bin/python tests/test_reminder_tasks.py` and `PYTHONPATH=. .venv/bin/python tests/test_simple.py`.
+- **Pitfall: Exposing a local OpenAI-compatible endpoint without strict bearer auth and explicit opt-in could accidentally open unauthenticated access.**
+  **Fix:** Add a dedicated `openai_compat_server.py` with required bearer-key validation for `/v1/models` and `/v1/chat/completions`, and gate startup in `main.py` behind `OPENAI_COMPAT_ENABLED=1` plus mandatory `OPENAI_COMPAT_API_KEY`. Validate with: `PYTHONPATH=. .venv/bin/python tests/test_openai_compat_server.py`.
+- **Pitfall: Model-authored outbound `<message>`/`<typing .../>` directives were often malformed, causing visible tag leakage and fragmented multi-send behavior.**
+  **Fix:** Remove outbound chunk fan-out and typing-directive pacing in `integrations.py`, collapse tagged outputs into one sanitized message, and strip delivery directives in `handler.py`/`openai_compat_server.py` before returning visible text. Validate with: `PYTHONPATH=. .venv/bin/python tests/test_sendblue_debounce.py`, `PYTHONPATH=. .venv/bin/python tests/test_memory_maintenance.py`, and `PYTHONPATH=. .venv/bin/python tests/test_openai_compat_server.py`.
 
 ## Key Functions Reference
 

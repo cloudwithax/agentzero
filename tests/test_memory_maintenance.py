@@ -387,7 +387,7 @@ async def test_cross_channel_recall_is_injected_into_handle_context() -> None:
 
         captured_payload: dict[str, object] = {}
 
-        async def _fake_api_call(_session, _url, payload, _headers):
+        async def _fake_api_call(_session, _url, payload, _headers, **_kwargs):
             captured_payload["messages"] = payload.get("messages", [])
             return {"id": "fake", "choices": [{"message": {"role": "assistant"}}]}
 
@@ -433,7 +433,7 @@ async def test_imessage_session_injects_mobile_prompt_defaults() -> None:
 
         captured_payload: dict[str, object] = {}
 
-        async def _fake_api_call(_session, _url, payload, _headers):
+        async def _fake_api_call(_session, _url, payload, _headers, **_kwargs):
             captured_payload["messages"] = payload.get("messages", [])
             return {"id": "fake", "choices": [{"message": {"role": "assistant"}}]}
 
@@ -490,7 +490,7 @@ async def test_imessage_handle_ids_are_injected_and_persisted() -> None:
 
         captured_payload: dict[str, object] = {}
 
-        async def _fake_api_call(_session, _url, payload, _headers):
+        async def _fake_api_call(_session, _url, payload, _headers, **_kwargs):
             captured_payload["messages"] = payload.get("messages", [])
             return {"id": "fake", "choices": [{"message": {"role": "assistant"}}]}
 
@@ -550,7 +550,7 @@ async def test_handle_injects_request_freshness_token() -> None:
 
         captured_payload: dict[str, object] = {}
 
-        async def _fake_api_call(_session, _url, payload, _headers):
+        async def _fake_api_call(_session, _url, payload, _headers, **_kwargs):
             captured_payload["messages"] = payload.get("messages", [])
             return {"id": "fake", "choices": [{"message": {"role": "assistant"}}]}
 
@@ -580,6 +580,57 @@ async def test_handle_injects_request_freshness_token() -> None:
             os.remove(tmp.name)
 
 
+async def test_handle_strips_delivery_directives_from_response() -> None:
+    print("=== Test: handle strips outbound delivery directives ===")
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+    tmp.close()
+
+    try:
+        _, handler = _create_store_and_handler(tmp.name)
+
+        tagged_response = (
+            '<typing seconds="1.2"/>'
+            "<message>first reply</message>"
+            "<message>second reply</message>"
+        )
+
+        with (
+            patch.object(
+                handler.memory_store, "search_memories", new=AsyncMock(return_value=[])
+            ),
+            patch(
+                "handler.api_call_with_retry",
+                new=AsyncMock(
+                    return_value={
+                        "id": "fake",
+                        "choices": [{"message": {"role": "assistant"}}],
+                    }
+                ),
+            ),
+            patch(
+                "handler.process_response", new=AsyncMock(return_value=tagged_response)
+            ),
+        ):
+            result = await handler.handle(
+                {"messages": [{"role": "user", "content": "Respond briefly"}]},
+                session_id="tg_999",
+            )
+
+        assert result == "first reply\n\nsecond reply"
+
+        history = handler.memory_store.get_conversation_history(
+            session_id="tg_999",
+            limit=5,
+        )
+        assistant_rows = [row for row in history if row.get("role") == "assistant"]
+        assert assistant_rows
+        assert assistant_rows[0].get("content") == "first reply\n\nsecond reply"
+        print("✓ delivery directives are removed from visible responses and memory")
+    finally:
+        if os.path.exists(tmp.name):
+            os.remove(tmp.name)
+
+
 async def main() -> int:
     await test_auto_memory_cadence_bounds()
     await test_dream_profile_and_consolidation_helpers()
@@ -589,6 +640,7 @@ async def main() -> int:
     await test_imessage_session_injects_mobile_prompt_defaults()
     await test_imessage_handle_ids_are_injected_and_persisted()
     await test_handle_injects_request_freshness_token()
+    await test_handle_strips_delivery_directives_from_response()
     print("\nAll memory-maintenance tests passed")
     return 0
 

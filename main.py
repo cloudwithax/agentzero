@@ -21,6 +21,7 @@ from skills import SkillRegistry  # noqa: E402
 from tools import set_memory_store, set_skill_registry  # noqa: E402
 from handler import AgentHandler  # noqa: E402
 from integrations import run_telegram_bot_async, start_sendblue_bot  # noqa: E402
+from openai_compat_server import start_openai_compatible_server  # noqa: E402
 
 # Setup logging
 requested_log_level = os.environ.get("LOG_LEVEL", "INFO").strip().upper()
@@ -40,6 +41,29 @@ if requested_log_level and not isinstance(
 API_KEY = os.environ.get("NVIDIA_API_KEY", "")
 MODEL_ID = os.environ.get("MODEL_ID", "moonshotai/kimi-k2-instruct-0905")
 PID_FILE = "agentzero.pid"
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Parse boolean-like environment values."""
+    fallback = "1" if default else "0"
+    raw_value = os.environ.get(name, fallback)
+    return str(raw_value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_port(name: str, default: int) -> int:
+    """Parse a TCP port from environment with fallback logging."""
+    raw_value = os.environ.get(name, str(default)).strip()
+    try:
+        parsed = int(raw_value)
+    except ValueError:
+        logger.warning("Invalid %s=%r, defaulting to %s", name, raw_value, default)
+        return default
+
+    if parsed <= 0 or parsed > 65535:
+        logger.warning("Out-of-range %s=%r, defaulting to %s", name, raw_value, default)
+        return default
+
+    return parsed
 
 
 def daemonize() -> None:
@@ -326,9 +350,9 @@ if __name__ == "__main__":
     # Initialize the agent
     handler = initialize_agent()
 
-    # Run both bots simultaneously
+    # Run integrations/server tasks simultaneously
     async def run_bots():
-        """Run both Telegram and Sendblue bots concurrently."""
+        """Run configured integrations and servers concurrently."""
         tasks = []
 
         try:
@@ -336,6 +360,39 @@ if __name__ == "__main__":
             logging.info("Starting reminder scheduler...")
         except Exception as e:
             logging.error(f"Failed to start reminder scheduler: {e}")
+
+        if _env_bool("OPENAI_COMPAT_ENABLED", default=False):
+            openai_api_key = os.environ.get("OPENAI_COMPAT_API_KEY", "").strip()
+            if not openai_api_key:
+                logging.error(
+                    "OPENAI_COMPAT_ENABLED is set but OPENAI_COMPAT_API_KEY is missing. "
+                    "OpenAI-compatible server will not start."
+                )
+            else:
+                openai_host = (
+                    os.environ.get("OPENAI_COMPAT_HOST", "0.0.0.0").strip() or "0.0.0.0"
+                )
+                openai_port = _env_port("OPENAI_COMPAT_PORT", 8001)
+                openai_model_alias = (
+                    os.environ.get("OPENAI_COMPAT_MODEL", "agentzero-main").strip()
+                    or "agentzero-main"
+                )
+                openai_task = asyncio.create_task(
+                    start_openai_compatible_server(
+                        handler,
+                        host=openai_host,
+                        port=openai_port,
+                        api_key=openai_api_key,
+                        model_alias=openai_model_alias,
+                    )
+                )
+                tasks.append(openai_task)
+                logging.info(
+                    "Starting OpenAI-compatible server on %s:%s (model alias: %s)...",
+                    openai_host,
+                    openai_port,
+                    openai_model_alias,
+                )
 
         # Start Telegram bot if token is available
         try:

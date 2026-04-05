@@ -32,6 +32,15 @@ REQUEST_FRESHNESS_INSTRUCTION = (
     "[Request Freshness]: This turn includes a one-time freshness token to discourage "
     "cache reuse and repeated phrasing. Treat the request as new and answer independently."
 )
+DELIVERY_MESSAGE_BLOCK_PATTERN = re.compile(
+    r"<message>\s*(?P<message>.*?)\s*</message>",
+    re.IGNORECASE | re.DOTALL,
+)
+DELIVERY_TYPING_DIRECTIVE_PATTERN = re.compile(
+    r"<typing(?:\s+seconds\s*=\s*['\"]?\d+(?:\.\d+)?['\"]?)?\s*/>",
+    re.IGNORECASE,
+)
+DELIVERY_MESSAGE_TAG_PATTERN = re.compile(r"</?message>", re.IGNORECASE)
 
 
 def _content_to_text(content: Any) -> str:
@@ -51,6 +60,25 @@ def _content_to_text(content: Any) -> str:
         return "\n".join(part for part in parts if part).strip()
 
     return "" if content is None else str(content)
+
+
+def _strip_delivery_directives(content: Any) -> str:
+    """Remove integration-only delivery wrappers from plain assistant text."""
+    normalized = "" if content is None else str(content)
+    if not normalized.strip():
+        return ""
+
+    message_chunks = [
+        match.group("message").strip()
+        for match in DELIVERY_MESSAGE_BLOCK_PATTERN.finditer(normalized)
+        if isinstance(match.group("message"), str) and match.group("message").strip()
+    ]
+    if message_chunks:
+        return "\n\n".join(message_chunks).strip()
+
+    sanitized = DELIVERY_TYPING_DIRECTIVE_PATTERN.sub("", normalized)
+    sanitized = DELIVERY_MESSAGE_TAG_PATTERN.sub("", sanitized)
+    return sanitized.strip()
 
 
 def _build_consortium_agree_tool_schema() -> dict[str, Any]:
@@ -887,6 +915,13 @@ class AgentHandler:
             session_id=session_id,
             output=output,
         )
+
+    def _finalize_visible_response(
+        self, content: Any, session_id: Optional[str]
+    ) -> str:
+        """Return text safe for visible responses with delivery directives removed."""
+        normalized = "" if content is None else str(content)
+        return _strip_delivery_directives(normalized)
 
     def _build_request_payload_template(self) -> dict[str, Any]:
         """Build base payload with dynamic tool registration (including skills)."""
@@ -2596,6 +2631,7 @@ class AgentHandler:
         request,
         session_id: Optional[str] = None,
         interim_response_callback: Optional[Callable[[str], Awaitable[None]]] = None,
+        response_chunk_callback: Optional[Callable[[str], Awaitable[None]]] = None,
         request_metadata: Optional[dict[str, Any]] = None,
     ):
         """Handle a request and return the response content."""
@@ -2789,6 +2825,8 @@ class AgentHandler:
                 if acknowledgement and not acknowledgement_delivered:
                     content = f"{acknowledgement}\n\n{content}"
 
+                content = self._finalize_visible_response(content, session_id)
+
                 if session_id and user_query:
                     self.memory_store.add_conversation_message(
                         role="user",
@@ -2844,6 +2882,8 @@ class AgentHandler:
                 BASE_URL,
                 current_payload,
                 {"Authorization": f"Bearer {API_KEY}"},
+                stream=response_chunk_callback is not None,
+                stream_chunk_callback=response_chunk_callback,
             )
 
             session_token = set_tool_runtime_session(session_id)
@@ -2855,9 +2895,12 @@ class AgentHandler:
                     BASE_URL,
                     API_KEY,
                     payload_template,
+                    stream_chunk_callback=response_chunk_callback,
                 )
             finally:
                 reset_tool_runtime_session(session_token)
+
+            content = self._finalize_visible_response(content, session_id)
 
             # Store conversation in memory
             if session_id and user_query:
