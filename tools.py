@@ -20,6 +20,7 @@ memory_store: Optional[EnhancedMemoryStore] = None
 consortium_controller: Any = None
 reminder_controller: Any = None
 skill_registry: Any = None
+acp_agent: Any = None
 _runtime_session_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "runtime_session_id",
     default=None,
@@ -48,6 +49,12 @@ def set_skill_registry(registry: Any):
     """Set the skill registry used by skill activation tools."""
     global skill_registry
     skill_registry = registry
+
+
+def set_acp_agent(agent: Any):
+    """Set the ACP agent instance for tools to use."""
+    global acp_agent
+    acp_agent = agent
 
 
 def set_tool_runtime_session(session_id: Optional[str]):
@@ -769,6 +776,138 @@ async def send_tapback_tool(
         return {"success": False, "error": str(e)}
 
 
+async def acp_register_service_tool(
+    service_name: str,
+    capabilities: str,
+    description: str,
+    endpoint: str,
+) -> dict[str, Any]:
+    """Register capabilities with the ACP network."""
+    if not acp_agent:
+        return {"success": False, "error": "ACP agent not initialized"}
+
+    try:
+        capabilities_list = [c.strip() for c in capabilities.split(",") if c.strip()]
+        await acp_agent.register_capabilities(capabilities_list)
+
+        return {
+            "success": True,
+            "message": f"Service '{service_name}' registered with capabilities: {capabilities_list}",
+            "service_name": service_name,
+            "capabilities": capabilities_list,
+            "endpoint": endpoint,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+async def acp_discover_peers_tool(
+    query_type: str = "all",
+    query_value: Optional[str] = None,
+) -> dict[str, Any]:
+    """Discover peers in the ACP network."""
+    if not acp_agent:
+        return {"success": False, "error": "ACP agent not initialized"}
+
+    try:
+        peers = await acp_agent.discover_peers(
+            query_type=query_type,
+            query_value=query_value,
+        )
+
+        profiles = []
+        for peer in peers:
+            profiles.append({
+                "agent_id": peer.agent_id,
+                "agent_name": peer.agent_name,
+                "capabilities": peer.capabilities,
+                "endpoints": peer.endpoints,
+                "supported_protocols": peer.supported_protocols,
+            })
+
+        return {
+            "success": True,
+            "peers_found": len(peers),
+            "peers": profiles,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+async def acp_send_message_tool(
+    recipient_id: str,
+    message: str,
+    payload: Optional[str] = None,
+    secure: bool = True,
+) -> dict[str, Any]:
+    """Send a message to another agent via ACP."""
+    if not acp_agent:
+        return {"success": False, "error": "ACP agent not initialized"}
+
+    try:
+        message_data = {
+            "text": message,
+        }
+        if payload:
+            message_data["payload"] = payload
+
+        success = await acp_agent.send_message(
+            recipient_id=recipient_id,
+            payload=message_data,
+            secure=secure,
+        )
+
+        if success:
+            return {
+                "success": True,
+                "message": f"Message sent to {recipient_id}",
+                "recipient_id": recipient_id,
+            }
+        else:
+            return {"success": False, "error": "Failed to send message"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+async def acp_get_registry_tool() -> dict[str, Any]:
+    """Get the current ACP registry status."""
+    if not acp_agent:
+        return {"success": False, "error": "ACP agent not initialized"}
+
+    try:
+        status = await acp_agent.get_registry_status()
+        return {
+            "success": True,
+            **status,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+async def acp_list_peers_tool() -> dict[str, Any]:
+    """List all known peers in the ACP network."""
+    if not acp_agent:
+        return {"success": False, "error": "ACP agent not initialized"}
+
+    try:
+        peers = await acp_agent.discover_peers()
+        return {
+            "success": True,
+            "peers_found": len(peers),
+            "peers": [
+                {
+                    "agent_id": peer.agent_id,
+                    "agent_name": peer.agent_name,
+                    "capabilities": peer.capabilities,
+                    "endpoints": peer.endpoints,
+                }
+                for peer in peers
+            ],
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 # Tool registry for easy access - defined before handle() to avoid NameError
 # Includes aliases for compatibility with benchmark grading
 TOOLS = {
@@ -798,12 +937,18 @@ TOOLS = {
     "consortium_start": consortium_start_tool,
     "consortium_stop": consortium_stop_tool,
     "consortium_status": consortium_status_tool,
-    "reminder_create": reminder_create_tool,
+"reminder_create": reminder_create_tool,
     "reminder_list": reminder_list_tool,
     "reminder_status": reminder_status_tool,
     "reminder_cancel": reminder_cancel_tool,
     "reminder_run_now": reminder_run_now_tool,
     "consortium_agree": consortium_agree_tool,
+    # ACP tools
+    "acp_register_service": acp_register_service_tool,
+    "acp_discover_peers": acp_discover_peers_tool,
+    "acp_send_message": acp_send_message_tool,
+    "acp_get_registry": acp_get_registry_tool,
+    "acp_list_peers": acp_list_peers_tool,
 }
 
 
@@ -843,6 +988,11 @@ def validate_tool_args(func_name: str, func_args: dict) -> tuple:
         "reminder_cancel": ["task_id"],
         "reminder_run_now": ["task_id"],
         "consortium_agree": [],
+        "acp_register_service": ["service_name", "capabilities", "description", "endpoint"],
+        "acp_discover_peers": [],
+        "acp_send_message": ["recipient_id", "message"],
+        "acp_get_registry": [],
+        "acp_list_peers": [],
     }
 
     if func_name in required_params:

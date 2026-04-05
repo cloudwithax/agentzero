@@ -23,7 +23,9 @@ from tools import (
     set_consortium_controller,
     set_reminder_controller,
     set_tool_runtime_session,
+    set_acp_agent,
 )
+from acp import ACPAgent
 
 logger = logging.getLogger(__name__)
 
@@ -662,6 +664,108 @@ BASE_PAYLOAD = {
                 },
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "acp_register_service",
+                "description": "Register capabilities with the ACP network for service discovery",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "service_name": {
+                            "type": "string",
+                            "description": "Name of the service to register",
+                        },
+                        "capabilities": {
+                            "type": "string",
+                            "description": "Comma-separated list of capabilities (e.g., 'memory_access,web_search,tool_execution')",
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Description of the service",
+                        },
+                        "endpoint": {
+                            "type": "string",
+                            "description": "Service endpoint address",
+                        },
+                    },
+                    "required": ["service_name", "capabilities", "description", "endpoint"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "acp_discover_peers",
+                "description": "Discover peers in the ACP network by capability or name",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query_type": {
+                            "type": "string",
+                            "enum": ["all", "capability", "name"],
+                            "description": "Type of query: 'all', 'capability', or 'name'",
+                        },
+                        "query_value": {
+                            "type": "string",
+                            "description": "Optional capability or name pattern to search for",
+                        },
+                    },
+                    "required": [],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "acp_send_message",
+                "description": "Send a message to another agent via ACP",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "recipient_id": {
+                            "type": "string",
+                            "description": "Target agent ID",
+                        },
+                        "message": {
+                            "type": "string",
+                            "description": "Message content",
+                        },
+                        "payload": {
+                            "type": "string",
+                            "description": "Optional structured payload data",
+                        },
+                        "secure": {
+                            "type": "boolean",
+                            "description": "Whether to encrypt and sign the message (default: true)",
+                        },
+                    },
+                    "required": ["recipient_id", "message"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "acp_get_registry",
+                "description": "Get the current ACP registry status and all registered services",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "acp_list_peers",
+                "description": "List all known peers in the ACP network",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                },
+            },
+        },
     ],
 }
 
@@ -786,6 +890,7 @@ class AgentHandler:
         task_analyzer: TaskAnalyzer,
         adaptive_formatter: AdaptiveFormatter,
         skill_registry: Optional[SkillRegistry] = None,
+        acp_agent: Optional[ACPAgent] = None,
     ):
         self.memory_store = memory_store
         self.capability_profile = capability_profile
@@ -794,6 +899,7 @@ class AgentHandler:
         self.task_analyzer = task_analyzer
         self.adaptive_formatter = adaptive_formatter
         self.skill_registry = skill_registry
+        self.acp_agent = acp_agent
         self._consortium_tasks: dict[str, dict[str, Any]] = {}
         self._consortium_tasks_lock = asyncio.Lock()
         self.reminder_scheduler = ReminderScheduler(
@@ -803,6 +909,7 @@ class AgentHandler:
         )
         set_consortium_controller(self)
         set_reminder_controller(self)
+        set_acp_agent(acp_agent)
 
     async def start_reminder_scheduler(self) -> None:
         """Start the reminder scheduler background loop."""

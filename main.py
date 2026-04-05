@@ -18,10 +18,11 @@ from capabilities import Capability, CapabilityProfile, AdaptiveFormatter  # noq
 from examples import ExampleBank, AdaptiveFewShotManager  # noqa: E402
 from planning import TaskPlanner, TaskAnalyzer  # noqa: E402
 from skills import SkillRegistry  # noqa: E402
-from tools import set_memory_store, set_skill_registry  # noqa: E402
+from tools import set_memory_store, set_skill_registry, set_acp_agent  # noqa: E402
 from handler import AgentHandler  # noqa: E402
 from integrations import run_telegram_bot_async, start_sendblue_bot  # noqa: E402
 from openai_compat_server import start_openai_compatible_server  # noqa: E402
+from acp import ACPAgent  # noqa: E402
 
 # Setup logging
 requested_log_level = os.environ.get("LOG_LEVEL", "INFO").strip().upper()
@@ -265,8 +266,8 @@ def stop_daemon() -> int:
     return 0
 
 
-def initialize_agent() -> AgentHandler:
-    """Initialize all agent components and return the handler."""
+def initialize_agent() -> tuple[AgentHandler, ACPAgent]:
+    """Initialize all agent components and return the handler and ACP agent."""
     # Initialize memory store
     memory_store = EnhancedMemoryStore(
         db_path="agent_memory.db",
@@ -320,7 +321,17 @@ def initialize_agent() -> AgentHandler:
         skill_registry=skill_registry,
     )
 
-    return handler
+    # Initialize ACP agent for inter-agent communication
+    acp_agent = ACPAgent(
+        agent_id=f"agent_{os.getpid()}",
+        agent_name=f"AgentZero-{os.getpid()}",
+        host="0.0.0.0",
+        port=8765,
+        protocol="tcp",
+    )
+    set_acp_agent(acp_agent)
+
+    return handler, acp_agent
 
 
 if __name__ == "__main__":
@@ -348,7 +359,7 @@ if __name__ == "__main__":
         write_pid_file()
 
     # Initialize the agent
-    handler = initialize_agent()
+    handler, acp_agent = initialize_agent()
 
     # Run integrations/server tasks simultaneously
     async def run_bots():

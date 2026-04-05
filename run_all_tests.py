@@ -5,6 +5,9 @@ tests = [
     "tests/test_tools.py",
     "tests/test_openai_compat_server.py",
     "tests/test_process_response.py",
+    "tests/test_acp.py",
+    "tests/test_acp_core_tool_flow.py",
+    "tests/test_acp_remote_http.py",
     # "tests/test_tool_calling_flow.py", # mock is currently broken out of scope
     "tests/test_setprompt_command.py",
     "tests/test_multimodal_integrations.py",
