@@ -2,8 +2,10 @@
 """Tests for cron-based reminder scheduler."""
 
 import asyncio
+import datetime
 import tempfile
 
+import reminder_tasks as reminder_module
 from memory import EnhancedMemoryStore
 from reminder_tasks import CronExpression, ReminderScheduler
 from tools import (
@@ -138,6 +140,48 @@ async def test_invalid_cron_rejected() -> None:
     assert "invalid cron" in created["error"].lower()
 
 
+async def test_one_off_same_day_prefers_today() -> None:
+    """One-off same-day schedules should resolve to the remaining time today."""
+    scheduler = _build_scheduler()
+    original_utc_now = reminder_module._utc_now
+    frozen_now = datetime.datetime(2026, 4, 4, 10, 15, tzinfo=datetime.timezone.utc)
+
+    reminder_module._utc_now = lambda: frozen_now
+    try:
+        created = await scheduler.create_task(
+            cron="30 10 4 4 6",
+            message="same day reminder",
+            one_off=True,
+            task_id="same_day_task",
+        )
+    finally:
+        reminder_module._utc_now = original_utc_now
+
+    assert created["success"], created
+    assert created["task"]["next_run_at"] == "2026-04-04T10:30:00+00:00", created
+
+
+async def test_one_off_same_day_past_time_is_rejected() -> None:
+    """One-off schedules pinned to today should not roll over after the time has passed."""
+    scheduler = _build_scheduler()
+    original_utc_now = reminder_module._utc_now
+    frozen_now = datetime.datetime(2026, 4, 4, 10, 31, tzinfo=datetime.timezone.utc)
+
+    reminder_module._utc_now = lambda: frozen_now
+    try:
+        created = await scheduler.create_task(
+            cron="30 10 4 4 6",
+            message="too late",
+            one_off=True,
+            task_id="past_same_day_task",
+        )
+    finally:
+        reminder_module._utc_now = original_utc_now
+
+    assert created["success"] is False, created
+    assert "same-day reminder time has already passed" in created["error"], created
+
+
 async def test_reminders_persist_to_db_and_reload_on_startup() -> None:
     """Reminder tasks should persist in SQLite and reload into memory on startup."""
     temp_db = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
@@ -173,5 +217,7 @@ if __name__ == "__main__":
     asyncio.run(test_recurring_ai_task_runs())
     asyncio.run(test_reminder_create_tool_uses_runtime_session())
     asyncio.run(test_invalid_cron_rejected())
+    asyncio.run(test_one_off_same_day_prefers_today())
+    asyncio.run(test_one_off_same_day_past_time_is_rejected())
     asyncio.run(test_reminders_persist_to_db_and_reload_on_startup())
     print("Reminder scheduler tests passed")

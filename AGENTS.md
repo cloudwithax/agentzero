@@ -254,6 +254,8 @@ All tools return a consistent dictionary format:
   **Fix:** Default `reminder_create_tool()` in `tools.py` to the active tool runtime session (`_runtime_session_id`) when `session_id` is omitted, and add regression coverage in `tests/test_reminder_tasks.py`. Validate with: `PYTHONPATH=. .venv/bin/python tests/test_reminder_tasks.py`.
 - **Pitfall: Reminder persistence stored all scheduled tasks inside one `agent_state` JSON blob, which made reminders less durable/inspectable and tied startup loading to one serialized state object.**
   **Fix:** Add a first-class `reminders` SQLite table in `memory.py`, persist scheduler state there by default, and have `ReminderScheduler` load from that table on startup with a fallback migration path from legacy `agent_state`. Validate with: `PYTHONPATH=. .venv/bin/python tests/test_reminder_tasks.py` and `PYTHONPATH=. .venv/bin/python tests/test_simple.py`.
+- **Pitfall: One-off reminders that explicitly targeted today could silently roll into a later weekly/monthly cron match after the requested same-day time had already passed.**
+  **Fix:** Add a simpler same-day resolution path in `reminder_tasks.py` for one-off tasks: prefer the next matching time within the current day first, and if the cron expression explicitly targets today but no same-day slot remains, fail with a clear error instead of rolling forward. Validate with: `PYTHONPATH=. .venv/bin/python tests/test_reminder_tasks.py` and `PYTHONPATH=. .venv/bin/python tests/test_simple.py`.
 
 ## Key Functions Reference
 

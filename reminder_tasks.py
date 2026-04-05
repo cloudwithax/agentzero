@@ -40,6 +40,16 @@ def _to_cron_dow(dt_value: datetime.datetime) -> int:
     return (dt_value.weekday() + 1) % 7
 
 
+def _calendar_day_window(
+    dt_value: datetime.datetime,
+) -> tuple[datetime.datetime, datetime.datetime]:
+    """Return UTC start/end minute boundaries for one calendar day."""
+    normalized = dt_value.astimezone(datetime.timezone.utc)
+    start = normalized.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = normalized.replace(hour=23, minute=59, second=0, microsecond=0)
+    return start, end
+
+
 class CronExpression:
     """Minimal cron parser/evaluator for 5-field expressions."""
 
@@ -76,6 +86,7 @@ class CronExpression:
             )
 
         minute, hour, day, month, weekday = parts
+        self.months_any = month.strip() == "*"
         self.minutes = self._parse_field(minute, 0, 59)
         self.hours = self._parse_field(hour, 0, 23)
         self.days = self._parse_field(day, 1, 31)
@@ -197,6 +208,10 @@ class CronExpression:
             return False
         if dt_value.hour not in self.hours:
             return False
+        return self.matches_calendar_day(dt_value)
+
+    def matches_calendar_day(self, dt_value: datetime.datetime) -> bool:
+        """Return True if month/day/weekday constraints match a date."""
         if dt_value.month not in self.months:
             return False
 
@@ -212,6 +227,30 @@ class CronExpression:
 
         # Cron semantics: if both DOM and DOW are restricted, either can match.
         return day_match or weekday_match
+
+    def explicitly_targets_current_day(self, dt_value: datetime.datetime) -> bool:
+        """Return True when the cron expression explicitly constrains the current day."""
+        if not self.matches_calendar_day(dt_value):
+            return False
+
+        return (not self.months_any) or (not self.days_any) or (not self.weekdays_any)
+
+    def next_on_same_day(
+        self,
+        after_dt: datetime.datetime,
+    ) -> Optional[datetime.datetime]:
+        """Find the next matching datetime later on the same UTC day."""
+        normalized_after = after_dt.astimezone(datetime.timezone.utc)
+        _, day_end = _calendar_day_window(normalized_after)
+        current = normalized_after.replace(second=0, microsecond=0)
+        candidate = current + datetime.timedelta(minutes=1)
+
+        while candidate <= day_end:
+            if self.matches(candidate):
+                return candidate
+            candidate += datetime.timedelta(minutes=1)
+
+        return None
 
     def next_after(
         self,
@@ -332,9 +371,16 @@ class ReminderScheduler:
             normalized_task_id = self._generate_task_id()
 
         now = _utc_now()
-        next_run = parser.next_after(now - datetime.timedelta(minutes=1))
+        next_run, next_run_error = self._resolve_initial_next_run(
+            parser=parser,
+            now=now,
+            one_off=bool(one_off),
+        )
         if next_run is None:
-            return {"success": False, "error": "unable to compute next run time"}
+            return {
+                "success": False,
+                "error": next_run_error or "unable to compute next run time",
+            }
 
         async with self._lock:
             if normalized_task_id in self._tasks:
@@ -372,6 +418,29 @@ class ReminderScheduler:
             "message": f"Created reminder task {normalized_task_id}",
             "task": self._snapshot(task),
         }
+
+    def _resolve_initial_next_run(
+        self,
+        parser: CronExpression,
+        now: datetime.datetime,
+        one_off: bool,
+    ) -> tuple[Optional[datetime.datetime], str]:
+        """Resolve the first execution time, preferring simpler same-day logic for one-offs."""
+        reference_time = now - datetime.timedelta(minutes=1)
+
+        if one_off:
+            same_day_run = parser.next_on_same_day(reference_time)
+            if same_day_run is not None:
+                return same_day_run, ""
+
+            if parser.explicitly_targets_current_day(now):
+                return None, "same-day reminder time has already passed"
+
+        next_run = parser.next_after(reference_time)
+        if next_run is None:
+            return None, "unable to compute next run time"
+
+        return next_run, ""
 
     async def list_tasks(self, include_disabled: bool = True) -> dict[str, Any]:
         """List reminder tasks in reverse chronological order."""
