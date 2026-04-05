@@ -3281,7 +3281,9 @@ async def handle_imessage(
             else {"success": False, "error": "Skill support is not configured"}
         )
         if not activation.get("success"):
-            return f"Skill activation failed: {activation.get('error', 'unknown error')}"
+            return (
+                f"Skill activation failed: {activation.get('error', 'unknown error')}"
+            )
 
         if not remaining_text:
             if activation.get("already_active"):
@@ -3291,7 +3293,9 @@ async def handle_imessage(
                 "Send your request now, or include it after the skill name."
             )
 
-        user_content = _apply_text_remainder_to_user_content(user_content, remaining_text)
+        user_content = _apply_text_remainder_to_user_content(
+            user_content, remaining_text
+        )
 
     try:
         request_metadata: dict[str, Any] = {}
