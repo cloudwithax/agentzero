@@ -47,6 +47,7 @@ pending_prompt_users: Dict[int, bool] = {}
 pending_prompt_phone_numbers: Dict[str, bool] = {}
 pending_telegram_media_groups: Dict[str, dict[str, Any]] = {}
 telegram_media_group_lock = asyncio.Lock()
+session_delivery_targets: Dict[str, dict[str, Any]] = {}
 
 # Valid multimodal models for image inputs.
 MULTIMODAL_MODEL_IDS = {
@@ -2260,6 +2261,90 @@ def _extract_agent_response_payload(response: str) -> tuple[str, list[str]]:
     return response, []
 
 
+def register_session_delivery_target(session_id: str, target: dict[str, Any]) -> None:
+    """Register the latest known outbound delivery target for a session."""
+    normalized_session_id = str(session_id or "").strip()
+    if not normalized_session_id or not isinstance(target, dict):
+        return
+
+    session_delivery_targets[normalized_session_id] = dict(target)
+
+
+async def _build_fallback_telegram_bot() -> Any | None:
+    """Build a Telegram bot from env for scheduled sends when no live bot is cached."""
+    if not TELEGRAM_AVAILABLE:
+        return None
+
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token:
+        return None
+
+    try:
+        from telegram import Bot
+    except Exception:
+        return None
+
+    return Bot(token=token)
+
+
+async def deliver_scheduled_session_output(
+    session_id: str,
+    output: str,
+) -> dict[str, Any]:
+    """Send scheduled task output back to the chat channel associated with a session."""
+    normalized_session_id = str(session_id or "").strip()
+    if not normalized_session_id:
+        return {"success": False, "error": "session_id is required"}
+
+    response_text, response_attachments = _extract_agent_response_payload(output)
+    target = dict(session_delivery_targets.get(normalized_session_id) or {})
+
+    if normalized_session_id.startswith("imessage_"):
+        phone_number = str(
+            target.get("phone_number") or normalized_session_id[len("imessage_") :]
+        ).strip()
+        if not phone_number:
+            return {"success": False, "error": "No iMessage phone number available"}
+
+        async with aiohttp.ClientSession() as session:
+            send_res = await send_imessage(
+                phone_number,
+                response_text,
+                media_urls=response_attachments,
+                session=session,
+            )
+        return send_res
+
+    if normalized_session_id.startswith("tg_"):
+        chat_id = target.get("chat_id")
+        if chat_id is None:
+            suffix = normalized_session_id[len("tg_") :].strip()
+            if suffix.lstrip("-").isdigit():
+                chat_id = int(suffix)
+
+        if chat_id is None:
+            return {"success": False, "error": "No Telegram chat_id available"}
+
+        bot = target.get("bot")
+        if bot is None:
+            bot = await _build_fallback_telegram_bot()
+        if bot is None:
+            return {"success": False, "error": "No Telegram bot available"}
+
+        await _send_telegram_response(
+            bot,
+            int(chat_id),
+            response_text,
+            response_attachments,
+        )
+        return {"success": True, "channel": "telegram", "chat_id": int(chat_id)}
+
+    return {
+        "success": False,
+        "error": f"Unsupported reminder delivery session: {normalized_session_id}",
+    }
+
+
 async def _telegram_file_url(bot: Any, file_id: str) -> str | None:
     """Build direct Telegram file download URL for a file_id."""
     if not file_id:
@@ -2354,6 +2439,15 @@ async def _process_telegram_message(
 ) -> None:
     """Process a Telegram user message and send text/media reply."""
     session_id = f"tg_{user_id}"
+    register_session_delivery_target(
+        session_id,
+        {
+            "channel": "telegram",
+            "chat_id": chat_id,
+            "bot": bot,
+            "user_id": user_id,
+        },
+    )
     normalized_text = (text or "").strip()
     invocation_skill_name, remaining_text = _parse_skill_invocation(normalized_text)
     if invocation_skill_name and hasattr(handler, "activate_skill_for_session"):
@@ -3108,6 +3202,13 @@ async def handle_imessage(
     """Process an incoming iMessage."""
     normalized_phone_number = (phone_number or "").strip()
     session_id = f"imessage_{normalized_phone_number}"
+    register_session_delivery_target(
+        session_id,
+        {
+            "channel": "imessage",
+            "phone_number": normalized_phone_number,
+        },
+    )
     text = _extract_text_from_user_content(user_content)
     command, _ = _parse_slash_command(text)
 

@@ -471,10 +471,12 @@ async def reminder_create_tool(
         if reminder_controller is None:
             return {"success": False, "error": "Reminder controller not initialized"}
 
+        bound_session_id = str(session_id or "").strip() or _runtime_session_id.get()
+
         return await reminder_controller.create_reminder_task(
             cron=cron,
             message=message,
-            session_id=session_id,
+            session_id=bound_session_id,
             one_off=one_off,
             run_ai=run_ai,
             ai_prompt=ai_prompt,

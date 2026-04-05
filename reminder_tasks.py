@@ -242,10 +242,14 @@ class ReminderScheduler:
         self,
         memory_store: EnhancedMemoryStore,
         ai_runner: Optional[Callable[[str, str], Awaitable[str]]] = None,
+        delivery_callback: Optional[
+            Callable[[str, str], Awaitable[dict[str, Any]]]
+        ] = None,
         poll_seconds: int = 20,
     ):
         self.memory_store = memory_store
         self.ai_runner = ai_runner
+        self.delivery_callback = delivery_callback
         self.poll_seconds = max(5, int(poll_seconds))
         self._tasks: dict[str, dict[str, Any]] = {}
         self._lock = asyncio.Lock()
@@ -538,6 +542,14 @@ class ReminderScheduler:
             run_error = str(exc)
             logger.exception("Reminder task execution failed for %s", task_id)
 
+        delivery_text = output
+        if not delivery_text and run_error:
+            delivery_text = f"Scheduled task {task_id} failed: {run_error}"
+        elif not delivery_text:
+            delivery_text = (
+                f"Scheduled task {task_id} completed, but no output was generated."
+            )
+
         if session_id and output:
             self.memory_store.add_conversation_message(
                 role="assistant",
@@ -549,6 +561,18 @@ class ReminderScheduler:
                     "trigger": trigger,
                 },
             )
+
+        if session_id and self.delivery_callback and delivery_text:
+            try:
+                await self.delivery_callback(str(session_id), delivery_text)
+            except Exception as exc:
+                logger.exception(
+                    "Reminder task delivery failed for %s to %s",
+                    task_id,
+                    session_id,
+                )
+                if not run_error:
+                    run_error = f"delivery failed: {exc}"
 
         async with self._lock:
             task = self._tasks.get(task_id)

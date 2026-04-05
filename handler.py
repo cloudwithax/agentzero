@@ -771,6 +771,7 @@ class AgentHandler:
         self.reminder_scheduler = ReminderScheduler(
             memory_store=self.memory_store,
             ai_runner=self._run_direct_ai_inference,
+            delivery_callback=self._deliver_reminder_output,
         )
         set_consortium_controller(self)
         set_reminder_controller(self)
@@ -867,6 +868,25 @@ class AgentHandler:
             )
 
         return (output or "").strip()
+
+    async def _deliver_reminder_output(
+        self,
+        session_id: str,
+        output: str,
+    ) -> dict[str, Any]:
+        """Deliver scheduled task output back through the active integration channel."""
+        try:
+            from integrations import deliver_scheduled_session_output
+        except Exception as exc:
+            return {
+                "success": False,
+                "error": f"Scheduled delivery integration unavailable: {exc}",
+            }
+
+        return await deliver_scheduled_session_output(
+            session_id=session_id,
+            output=output,
+        )
 
     def _build_request_payload_template(self) -> dict[str, Any]:
         """Build base payload with dynamic tool registration (including skills)."""

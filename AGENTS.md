@@ -248,6 +248,10 @@ All tools return a consistent dictionary format:
   **Fix:** Start reminder scheduler during runtime bootstrap in `main.py` (`await handler.start_reminder_scheduler()`) and also guard with idempotent startup inside `AgentHandler.handle()`. Validate with: `PYTHONPATH=. .venv/bin/python tests/test_simple.py` and `PYTHONPATH=. .venv/bin/python tests/test_reminder_tasks.py`.
 - **Pitfall: Scheduled tasks that required model output could accidentally invoke normal tool loops instead of direct inference.**
   **Fix:** Route reminder AI execution through a dedicated direct-inference path in `handler.py` (`_run_direct_ai_inference`) with `tools=[]`, then persist outputs via `ReminderScheduler` state and optional session message logging. Validate with: `PYTHONPATH=. .venv/bin/python tests/test_reminder_tasks.py`.
+- **Pitfall: Reminder tasks could run successfully but never reach the user because execution only wrote to conversation history and did not route back through Telegram/iMessage delivery.**
+  **Fix:** Add integration-side session delivery target registration in `integrations.py`, expose `deliver_scheduled_session_output(session_id, output)`, and wire `ReminderScheduler` to use a delivery callback from `handler.py` after each run. Validate with: `PYTHONPATH=. .venv/bin/python tests/test_reminder_tasks.py`.
+- **Pitfall: The model could create reminder tasks without an explicit `session_id`, causing scheduled outputs to lose their return path even when delivery plumbing existed.**
+  **Fix:** Default `reminder_create_tool()` in `tools.py` to the active tool runtime session (`_runtime_session_id`) when `session_id` is omitted, and add regression coverage in `tests/test_reminder_tasks.py`. Validate with: `PYTHONPATH=. .venv/bin/python tests/test_reminder_tasks.py`.
 
 ## Key Functions Reference
 

@@ -73,3 +73,6 @@ workspace/
 !.agentzero/skills/coding-agent/**
 !.agentzero/skills/prompt-injection-defense/
 !.agentzero/skills/prompt-injection-defense/**
+
+# nohup output
+nohup.out
