@@ -17,9 +17,11 @@ from examples import AdaptiveFewShotManager
 from planning import TaskType, TaskPlanner, TaskAnalyzer
 from api import api_call_with_retry, process_response
 from skills import SkillRegistry
+from reminder_tasks import ReminderScheduler
 from tools import (
     reset_tool_runtime_session,
     set_consortium_controller,
+    set_reminder_controller,
     set_tool_runtime_session,
 )
 
@@ -482,6 +484,122 @@ BASE_PAYLOAD = {
         {
             "type": "function",
             "function": {
+                "name": "reminder_create",
+                "description": "Create a cron-based reminder task (one-off or recurring), with optional direct AI output generation",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "cron": {
+                            "type": "string",
+                            "description": "Cron schedule with 5 fields: minute hour day month weekday",
+                        },
+                        "message": {
+                            "type": "string",
+                            "description": "Reminder text to deliver when run_ai is false",
+                        },
+                        "session_id": {
+                            "type": "string",
+                            "description": "Optional session ID to write scheduled outputs into conversation history",
+                        },
+                        "one_off": {
+                            "type": "boolean",
+                            "description": "If true, task executes once at the next cron match",
+                        },
+                        "run_ai": {
+                            "type": "boolean",
+                            "description": "If true, run direct AI inference using ai_prompt",
+                        },
+                        "ai_prompt": {
+                            "type": "string",
+                            "description": "Prompt used for direct AI inference when run_ai is true",
+                        },
+                        "task_id": {
+                            "type": "string",
+                            "description": "Optional custom task ID",
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": "Optional human-friendly task name",
+                        },
+                    },
+                    "required": ["cron"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "reminder_list",
+                "description": "List scheduled reminder tasks",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "include_disabled": {
+                            "type": "boolean",
+                            "description": "Include completed/cancelled tasks",
+                        }
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "reminder_status",
+                "description": "Get status for one reminder task",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {
+                            "type": "string",
+                            "description": "Reminder task identifier",
+                        }
+                    },
+                    "required": ["task_id"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "reminder_cancel",
+                "description": "Cancel a reminder task",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {
+                            "type": "string",
+                            "description": "Reminder task identifier",
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "Optional cancellation reason",
+                        },
+                    },
+                    "required": ["task_id"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "reminder_run_now",
+                "description": "Run a reminder task immediately",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {
+                            "type": "string",
+                            "description": "Reminder task identifier",
+                        }
+                    },
+                    "required": ["task_id"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "consortium_stop",
                 "description": "Stop a running consortium-mode task",
                 "parameters": {
@@ -650,7 +768,105 @@ class AgentHandler:
         self.skill_registry = skill_registry
         self._consortium_tasks: dict[str, dict[str, Any]] = {}
         self._consortium_tasks_lock = asyncio.Lock()
+        self.reminder_scheduler = ReminderScheduler(
+            memory_store=self.memory_store,
+            ai_runner=self._run_direct_ai_inference,
+        )
         set_consortium_controller(self)
+        set_reminder_controller(self)
+
+    async def start_reminder_scheduler(self) -> None:
+        """Start the reminder scheduler background loop."""
+        await self.reminder_scheduler.start()
+
+    async def create_reminder_task(
+        self,
+        cron: str,
+        message: str = "",
+        session_id: Optional[str] = None,
+        one_off: bool = False,
+        run_ai: bool = False,
+        ai_prompt: str = "",
+        task_id: Optional[str] = None,
+        name: str = "",
+    ) -> dict[str, Any]:
+        """Create one reminder task."""
+        return await self.reminder_scheduler.create_task(
+            cron=cron,
+            message=message,
+            session_id=session_id,
+            one_off=one_off,
+            run_ai=run_ai,
+            ai_prompt=ai_prompt,
+            task_id=task_id,
+            name=name,
+        )
+
+    async def list_reminder_tasks(
+        self, include_disabled: bool = True
+    ) -> dict[str, Any]:
+        """List reminder tasks."""
+        return await self.reminder_scheduler.list_tasks(
+            include_disabled=include_disabled,
+        )
+
+    async def get_reminder_task_status(self, task_id: str) -> dict[str, Any]:
+        """Get reminder task status."""
+        return await self.reminder_scheduler.get_task_status(task_id=task_id)
+
+    async def cancel_reminder_task(
+        self, task_id: str, reason: str = ""
+    ) -> dict[str, Any]:
+        """Cancel a reminder task."""
+        return await self.reminder_scheduler.cancel_task(
+            task_id=task_id,
+            reason=reason,
+        )
+
+    async def run_reminder_task_now(self, task_id: str) -> dict[str, Any]:
+        """Run one reminder task immediately."""
+        return await self.reminder_scheduler.run_task_now(task_id=task_id)
+
+    async def _run_direct_ai_inference(self, prompt: str, task_id: str) -> str:
+        """Run direct AI inference for reminder tasks with tools disabled."""
+        prompt_text = str(prompt or "").strip()
+        if not prompt_text:
+            return ""
+
+        payload = BASE_PAYLOAD.copy()
+        payload["model"] = MODEL_ID
+        payload["tools"] = []
+        payload["messages"] = [
+            {
+                "role": "system",
+                "content": (
+                    "You are executing a scheduled task. "
+                    "Return only the requested result in plain text."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Scheduled task {task_id}:\n{prompt_text}",
+            },
+        ]
+
+        async with aiohttp.ClientSession() as session:
+            response_data = await api_call_with_retry(
+                session,
+                BASE_URL,
+                payload,
+                {"Authorization": f"Bearer {API_KEY}"},
+            )
+            output = await process_response(
+                response_data,
+                payload["messages"],
+                session,
+                BASE_URL,
+                API_KEY,
+                payload,
+            )
+
+        return (output or "").strip()
 
     def _build_request_payload_template(self) -> dict[str, Any]:
         """Build base payload with dynamic tool registration (including skills)."""
@@ -1960,6 +2176,7 @@ class AgentHandler:
             "Use recall() to retrieve past memories.\n"
             "If you need access to current information not available to you, use the web_search() tool.\n"
             "Use consortium_start() to launch a consortium task, consortium_status() to check progress/results, and consortium_stop() to cancel an active consortium task.\n"
+            "Use reminder_create() with cron syntax for one-off or recurring tasks. Use reminder_list(), reminder_status(), reminder_cancel(), and reminder_run_now() to manage reminder tasks.\n"
             "If skills are listed in <available_skills>, call activate_skill(name) before executing specialized workflows.\n"
             "Users can also explicitly activate skills with /skill-name or $skill-name. Treat that as a harness-level activation signal.\n"
             'For readability, you may split a reply into multiple chunks using <message>...</message> blocks. You may also insert <typing seconds="1.2"/> between message blocks to add brief pacing pauses. If you use this format, keep all user-visible text inside those message blocks.\n'
@@ -1986,8 +2203,12 @@ class AgentHandler:
                 + (f"\n\n{active_skills_context}" if active_skills_context else "")
             )
 
-        skills_catalog_suffix = f"\n\n{skills_catalog_context}" if skills_catalog_context else ""
-        active_skills_suffix = f"\n\n{active_skills_context}" if active_skills_context else ""
+        skills_catalog_suffix = (
+            f"\n\n{skills_catalog_context}" if skills_catalog_context else ""
+        )
+        active_skills_suffix = (
+            f"\n\n{active_skills_context}" if active_skills_context else ""
+        )
         return (
             "You are a helpful AI assistant with persistent memory."
             f"{universal_instructions}{session_suffix}{memory_context}{plan_context}{example_context}"
@@ -2360,6 +2581,8 @@ class AgentHandler:
         """Handle a request and return the response content."""
         data = request
         normalized_request_metadata = self._normalize_request_metadata(request_metadata)
+
+        await self.start_reminder_scheduler()
 
         # Get the user's message for memory retrieval
         user_messages = [m for m in data["messages"] if m.get("role") == "user"]

@@ -331,6 +331,12 @@ if __name__ == "__main__":
         """Run both Telegram and Sendblue bots concurrently."""
         tasks = []
 
+        try:
+            await handler.start_reminder_scheduler()
+            logging.info("Starting reminder scheduler...")
+        except Exception as e:
+            logging.error(f"Failed to start reminder scheduler: {e}")
+
         # Start Telegram bot if token is available
         try:
             telegram_task = asyncio.create_task(run_telegram_bot_async(handler))

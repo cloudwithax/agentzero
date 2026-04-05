@@ -18,6 +18,7 @@ from memory import EnhancedMemoryStore
 # Initialize memory store (will be set from main module)
 memory_store: Optional[EnhancedMemoryStore] = None
 consortium_controller: Any = None
+reminder_controller: Any = None
 skill_registry: Any = None
 _runtime_session_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "runtime_session_id",
@@ -35,6 +36,12 @@ def set_consortium_controller(controller: Any):
     """Set the consortium task controller used by consortium tools."""
     global consortium_controller
     consortium_controller = controller
+
+
+def set_reminder_controller(controller: Any):
+    """Set the reminder task controller used by reminder tools."""
+    global reminder_controller
+    reminder_controller = controller
 
 
 def set_skill_registry(registry: Any):
@@ -449,6 +456,84 @@ async def consortium_status_tool(task_id: Optional[str] = None):
         return {"success": False, "error": str(e)}
 
 
+async def reminder_create_tool(
+    cron: str,
+    message: str = "",
+    session_id: Optional[str] = None,
+    one_off: bool = False,
+    run_ai: bool = False,
+    ai_prompt: str = "",
+    task_id: Optional[str] = None,
+    name: str = "",
+):
+    """Create a cron-based reminder task (one-off or recurring)."""
+    try:
+        if reminder_controller is None:
+            return {"success": False, "error": "Reminder controller not initialized"}
+
+        return await reminder_controller.create_reminder_task(
+            cron=cron,
+            message=message,
+            session_id=session_id,
+            one_off=one_off,
+            run_ai=run_ai,
+            ai_prompt=ai_prompt,
+            task_id=task_id,
+            name=name,
+        )
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+async def reminder_list_tool(include_disabled: bool = True):
+    """List reminder tasks."""
+    try:
+        if reminder_controller is None:
+            return {"success": False, "error": "Reminder controller not initialized"}
+
+        return await reminder_controller.list_reminder_tasks(
+            include_disabled=include_disabled,
+        )
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+async def reminder_status_tool(task_id: str):
+    """Get status for one reminder task."""
+    try:
+        if reminder_controller is None:
+            return {"success": False, "error": "Reminder controller not initialized"}
+
+        return await reminder_controller.get_reminder_task_status(task_id=task_id)
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+async def reminder_cancel_tool(task_id: str, reason: str = ""):
+    """Cancel a reminder task."""
+    try:
+        if reminder_controller is None:
+            return {"success": False, "error": "Reminder controller not initialized"}
+
+        return await reminder_controller.cancel_reminder_task(
+            task_id=task_id,
+            reason=reason,
+        )
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+async def reminder_run_now_tool(task_id: str):
+    """Run a reminder task immediately."""
+    try:
+        if reminder_controller is None:
+            return {"success": False, "error": "Reminder controller not initialized"}
+
+        return await reminder_controller.run_reminder_task_now(task_id=task_id)
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 async def consortium_agree_tool(
     verdict: str = "",
     rationale: str = "",
@@ -711,6 +796,11 @@ TOOLS = {
     "consortium_start": consortium_start_tool,
     "consortium_stop": consortium_stop_tool,
     "consortium_status": consortium_status_tool,
+    "reminder_create": reminder_create_tool,
+    "reminder_list": reminder_list_tool,
+    "reminder_status": reminder_status_tool,
+    "reminder_cancel": reminder_cancel_tool,
+    "reminder_run_now": reminder_run_now_tool,
     "consortium_agree": consortium_agree_tool,
 }
 
@@ -745,6 +835,11 @@ def validate_tool_args(func_name: str, func_args: dict) -> tuple:
         "consortium_start": ["task"],
         "consortium_stop": ["task_id"],
         "consortium_status": [],
+        "reminder_create": ["cron"],
+        "reminder_list": [],
+        "reminder_status": ["task_id"],
+        "reminder_cancel": ["task_id"],
+        "reminder_run_now": ["task_id"],
         "consortium_agree": [],
     }
 

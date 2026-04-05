@@ -189,7 +189,7 @@ All tools return a consistent dictionary format:
 - Retries up to 3 times with exponential backoff
 - Checks for `"rate limit"` in error messages
 
-### Session Pitfalls + Fixes (2026-04-03)
+### Session Pitfalls + Fixes
 
 - **Guideline for future sessions:** Keep appending newly discovered pitfalls and their fixes to this section (or a new date-stamped section), instead of replacing old entries. Include a concrete remediation and, when applicable, the exact validation command/test used.
 
@@ -244,6 +244,10 @@ All tools return a consistent dictionary format:
   **Fix:** Remove Sendblue startup backlog replay and Telegram pending-update replay from `integrations.py`, keep only live webhook/polling handling, and drop the related env knobs/tests/docs. Validate with: `PYTHONPATH=. .venv/bin/python tests/test_sendblue_debounce.py`.
 - **Pitfall: Repeated top-level user turns could arrive with nearly identical request bodies, making upstream cache reuse or repeated phrasing more likely.**
   **Fix:** Add per-request no-cache headers plus a unique `X-Request-Id` in `api.py`, and inject a one-time freshness token into the main visible-response system prompt in `handler.py` so repeated turns are structurally distinct. Validate with: `PYTHONPATH=. .venv/bin/python tests/test_process_response.py` and `PYTHONPATH=. .venv/bin/python tests/test_memory_maintenance.py`.
+- **Pitfall: Cron-based scheduled tasks never fired on quiet periods if scheduler startup depended on a user message reaching `handle()`.**
+  **Fix:** Start reminder scheduler during runtime bootstrap in `main.py` (`await handler.start_reminder_scheduler()`) and also guard with idempotent startup inside `AgentHandler.handle()`. Validate with: `PYTHONPATH=. .venv/bin/python tests/test_simple.py` and `PYTHONPATH=. .venv/bin/python tests/test_reminder_tasks.py`.
+- **Pitfall: Scheduled tasks that required model output could accidentally invoke normal tool loops instead of direct inference.**
+  **Fix:** Route reminder AI execution through a dedicated direct-inference path in `handler.py` (`_run_direct_ai_inference`) with `tools=[]`, then persist outputs via `ReminderScheduler` state and optional session message logging. Validate with: `PYTHONPATH=. .venv/bin/python tests/test_reminder_tasks.py`.
 
 ## Key Functions Reference
 

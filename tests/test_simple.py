@@ -38,6 +38,11 @@ async def test_tools_work():
     assert "consortium_start" in TOOLS
     assert "consortium_stop" in TOOLS
     assert "consortium_status" in TOOLS
+    assert "reminder_create" in TOOLS
+    assert "reminder_list" in TOOLS
+    assert "reminder_status" in TOOLS
+    assert "reminder_cancel" in TOOLS
+    assert "reminder_run_now" in TOOLS
     assert "send_tapback" in TOOLS
     print("✓ consortium management tools are registered")
 
@@ -56,6 +61,11 @@ async def test_payload_isolation():
     assert "consortium_start" in tool_names, "consortium_start missing from payload"
     assert "consortium_stop" in tool_names, "consortium_stop missing from payload"
     assert "consortium_status" in tool_names, "consortium_status missing from payload"
+    assert "reminder_create" in tool_names, "reminder_create missing from payload"
+    assert "reminder_list" in tool_names, "reminder_list missing from payload"
+    assert "reminder_status" in tool_names, "reminder_status missing from payload"
+    assert "reminder_cancel" in tool_names, "reminder_cancel missing from payload"
+    assert "reminder_run_now" in tool_names, "reminder_run_now missing from payload"
     assert "send_tapback" in tool_names, "send_tapback missing from payload"
     assert "consortium_agree" not in tool_names, "consortium_agree should not be public"
 
