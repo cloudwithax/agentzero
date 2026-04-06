@@ -18,7 +18,7 @@ from capabilities import Capability, CapabilityProfile, AdaptiveFormatter  # noq
 from examples import ExampleBank, AdaptiveFewShotManager  # noqa: E402
 from planning import TaskPlanner, TaskAnalyzer  # noqa: E402
 from skills import SkillRegistry  # noqa: E402
-from tools import set_memory_store, set_skill_registry, set_acp_agent  # noqa: E402
+from tools import set_memory_store, set_skill_registry, set_acp_agent, set_agent_workspace  # noqa: E402
 from handler import AgentHandler  # noqa: E402
 from integrations import run_telegram_bot_async, start_sendblue_bot  # noqa: E402
 from openai_compat_server import start_openai_compatible_server  # noqa: E402
@@ -276,6 +276,10 @@ def initialize_agent() -> tuple[AgentHandler, ACPAgent]:
 
     # Set memory store for tools
     set_memory_store(memory_store)
+
+    # Sync workspace path from handler config into tools
+    from handler import AGENT_WORKSPACE as _handler_workspace  # noqa: PLC0415
+    set_agent_workspace(_handler_workspace)
 
     # Initialize Agent Skills registry
     skill_registry = SkillRegistry(project_root=os.getcwd())

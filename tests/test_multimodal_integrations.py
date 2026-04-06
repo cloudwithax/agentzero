@@ -2,16 +2,16 @@
 """Tests for multimodal attachment handling in channel integrations."""
 
 import asyncio
+import base64
 import json
 import os
+from unittest.mock import patch
 
 from integrations import (
-    NVCF_ASSET_DESCRIPTION,
+    _attachment_url_to_base64_data_url,
     _build_user_message_content,
+    _build_user_message_content_async,
     _extract_agent_response_payload,
-    _extract_nvcf_asset_fields,
-    _target_content_type_for_non_native_image,
-    _upload_attachment_to_nvcf_asset,
 )
 
 
@@ -72,6 +72,46 @@ def test_non_multimodal_fallback_text() -> None:
     assert "https://img.example/only.png" in content
 
 
+def test_multimodal_message_blocks_respect_attachment_limit() -> None:
+    """Cap inbound image blocks to configured MAX_IMAGE_ATTACHMENTS_PER_MESSAGE."""
+    previous_model = os.environ.get("MODEL_ID")
+    previous_limit = os.environ.get("MAX_IMAGE_ATTACHMENTS_PER_MESSAGE")
+    os.environ["MODEL_ID"] = "meta/llama-3.2-11b-vision-instruct"
+    os.environ["MAX_IMAGE_ATTACHMENTS_PER_MESSAGE"] = "2"
+
+    try:
+        content = _build_user_message_content(
+            "Please describe all images.",
+            [
+                "https://img.example/a.png",
+                "https://img.example/b.png",
+                "https://img.example/c.png",
+            ],
+        )
+    finally:
+        if previous_model is None:
+            os.environ.pop("MODEL_ID", None)
+        else:
+            os.environ["MODEL_ID"] = previous_model
+        if previous_limit is None:
+            os.environ.pop("MAX_IMAGE_ATTACHMENTS_PER_MESSAGE", None)
+        else:
+            os.environ["MAX_IMAGE_ATTACHMENTS_PER_MESSAGE"] = previous_limit
+
+    assert isinstance(content, list)
+    assert content[0]["type"] == "text"
+    assert "included 2 of 3 images" in content[0]["text"]
+    assert content[1] == {
+        "type": "image_url",
+        "image_url": {"url": "https://img.example/a.png"},
+    }
+    assert content[2] == {
+        "type": "image_url",
+        "image_url": {"url": "https://img.example/b.png"},
+    }
+    assert len(content) == 3
+
+
 def test_extract_structured_response_payload() -> None:
     """Parse text and multiple attachments from JSON assistant output."""
     raw = json.dumps(
@@ -90,56 +130,6 @@ def test_extract_structured_response_payload() -> None:
     ]
 
 
-def test_multimodal_asset_data_url_block() -> None:
-    """Keep prebuilt NVCF asset references intact in multimodal content blocks."""
-    previous_model = os.environ.get("MODEL_ID")
-    os.environ["MODEL_ID"] = "qwen/qwen3.5-397b-a17b"
-
-    try:
-        content = _build_user_message_content(
-            "Analyze this image.",
-            [
-                "data:image/jpeg;asset_id,123e4567-e89b-12d3-a456-426614174000",
-            ],
-        )
-    finally:
-        if previous_model is None:
-            os.environ.pop("MODEL_ID", None)
-        else:
-            os.environ["MODEL_ID"] = previous_model
-
-    assert isinstance(content, list)
-    assert content[1] == {
-        "type": "image_url",
-        "image_url": {
-            "url": "data:image/jpeg;asset_id,123e4567-e89b-12d3-a456-426614174000"
-        },
-    }
-
-
-def test_extract_nvcf_asset_fields_with_nested_payload() -> None:
-    """Accept common create-asset response shapes with nested upload URL fields."""
-    payload = {
-        "assetId": "11111111-2222-3333-4444-555555555555",
-        "uploadDetails": {
-            "uploadUrl": "https://bucket.example/upload",
-        },
-    }
-
-    asset_id, upload_url = _extract_nvcf_asset_fields(payload)
-
-    assert asset_id == "11111111-2222-3333-4444-555555555555"
-    assert upload_url == "https://bucket.example/upload"
-
-
-def test_target_content_type_for_non_native_image() -> None:
-    """Normalize non-JPEG/PNG images to model-friendly formats."""
-    assert _target_content_type_for_non_native_image("image/jpeg") is None
-    assert _target_content_type_for_non_native_image("image/png") is None
-    assert _target_content_type_for_non_native_image("image/heic") == "image/jpeg"
-    assert _target_content_type_for_non_native_image("image/webp") == "image/png"
-
-
 class _FakeResponse:
     def __init__(self, *, status: int, body: bytes = b"", headers: dict | None = None):
         self.status = status
@@ -155,64 +145,120 @@ class _FakeResponse:
     async def read(self) -> bytes:
         return self._body
 
-    async def text(self) -> str:
-        return self._body.decode("utf-8", errors="replace")
-
-    async def json(self, content_type=None):
-        return {
-            "assetId": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-            "uploadUrl": "https://bucket.example/upload",
-        }
-
 
 class _FakeSession:
-    def __init__(self):
-        self.put_headers = None
+    def __init__(self, response: _FakeResponse):
+        self.response = response
+        self.requested_urls: list[str] = []
 
-    def get(self, _url: str) -> _FakeResponse:
-        return _FakeResponse(
+    def get(self, url: str) -> _FakeResponse:
+        self.requested_urls.append(url)
+        return self.response
+
+
+def test_attachment_url_to_base64_data_url_converts_to_jpeg() -> None:
+    """Always convert remote image URLs to JPEG base64 data URLs."""
+    session = _FakeSession(
+        _FakeResponse(
             status=200,
             body=b"fake-image-bytes",
             headers={"Content-Type": "image/png"},
         )
+    )
 
-    def post(self, _url: str, json=None, headers=None) -> _FakeResponse:
-        return _FakeResponse(status=200, body=b"{}")
-
-    def put(self, _url: str, data=None, headers=None) -> _FakeResponse:
-        self.put_headers = headers or {}
-        return _FakeResponse(status=204)
-
-
-def test_nvcf_upload_includes_signed_description_header() -> None:
-    """Include all signed headers when uploading to pre-signed NVCF URLs."""
-    session = _FakeSession()
-
-    result = asyncio.run(
-        _upload_attachment_to_nvcf_asset(
-            session,
-            "test-api-key",
-            "https://img.example/one.png",
+    with patch(
+        "integrations._convert_image_with_imagemagick_sync",
+        return_value=b"jpeg-converted-bytes",
+    ) as convert_mock:
+        result = asyncio.run(
+            _attachment_url_to_base64_data_url(session, "https://img.example/one.png")
         )
-    )
 
-    assert result == "data:image/png;asset_id,aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-    assert session.put_headers is not None
-    assert session.put_headers.get("Content-Type") == "image/png"
-    assert (
-        session.put_headers.get("x-amz-meta-nvcf-asset-description")
-        == NVCF_ASSET_DESCRIPTION
+    assert result == (
+        "data:image/jpeg;base64,"
+        + base64.b64encode(b"jpeg-converted-bytes").decode("ascii")
     )
+    assert session.requested_urls == ["https://img.example/one.png"]
+    assert convert_mock.call_count == 1
+    args = convert_mock.call_args.args
+    assert args[0] == b"fake-image-bytes"
+    assert args[1] == ".png"
+    assert args[2] == ".jpg"
+
+
+def test_attachment_data_url_to_base64_data_url_converts_to_jpeg() -> None:
+    """Always re-encode image data URLs as JPEG base64 data URLs."""
+    class _NoNetworkSession:
+        def get(self, _url: str):
+            raise AssertionError("Network fetch should not run for data URLs")
+
+    encoded_png = base64.b64encode(b"fake-png").decode("ascii")
+    source_data_url = f"data:image/png;base64,{encoded_png}"
+
+    with patch(
+        "integrations._convert_image_with_imagemagick_sync",
+        return_value=b"jpeg-from-data-url",
+    ) as convert_mock:
+        result = asyncio.run(
+            _attachment_url_to_base64_data_url(_NoNetworkSession(), source_data_url)
+        )
+
+    assert result == (
+        "data:image/jpeg;base64,"
+        + base64.b64encode(b"jpeg-from-data-url").decode("ascii")
+    )
+    assert convert_mock.call_count == 1
+    args = convert_mock.call_args.args
+    assert args[0] == b"fake-png"
+    assert args[1] == ".png"
+    assert args[2] == ".jpg"
+
+
+def test_build_user_message_content_async_uses_base64_and_drops_failed() -> None:
+    """Async builder should keep only successful base64 JPEG conversions."""
+    previous_model = os.environ.get("MODEL_ID")
+    os.environ["MODEL_ID"] = "meta/llama-3.2-11b-vision-instruct"
+
+    async def _fake_convert(_session, url: str) -> str | None:
+        if url.endswith("a.png"):
+            return "data:image/jpeg;base64,AAAA"
+        return None
+
+    try:
+        with patch(
+            "integrations._attachment_url_to_base64_data_url",
+            side_effect=_fake_convert,
+        ):
+            content = asyncio.run(
+                _build_user_message_content_async(
+                    "Please analyze these images.",
+                    ["https://img.example/a.png", "https://img.example/b.png"],
+                )
+            )
+    finally:
+        if previous_model is None:
+            os.environ.pop("MODEL_ID", None)
+        else:
+            os.environ["MODEL_ID"] = previous_model
+
+    assert isinstance(content, list)
+    assert content[0]["type"] == "text"
+    assert "Image conversion warning: dropped 1 image" in content[0]["text"]
+    assert content[1] == {
+        "type": "image_url",
+        "image_url": {"url": "data:image/jpeg;base64,AAAA"},
+    }
+    assert len(content) == 2
 
 
 def main() -> int:
     test_multimodal_message_blocks()
     test_non_multimodal_fallback_text()
+    test_multimodal_message_blocks_respect_attachment_limit()
     test_extract_structured_response_payload()
-    test_multimodal_asset_data_url_block()
-    test_extract_nvcf_asset_fields_with_nested_payload()
-    test_target_content_type_for_non_native_image()
-    test_nvcf_upload_includes_signed_description_header()
+    test_attachment_url_to_base64_data_url_converts_to_jpeg()
+    test_attachment_data_url_to_base64_data_url_converts_to_jpeg()
+    test_build_user_message_content_async_uses_base64_and_drops_failed()
     print("All multimodal integration tests passed")
     return 0
 

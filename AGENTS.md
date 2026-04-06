@@ -67,15 +67,14 @@ PYTHONPATH=. python3 tests/test_sendblue_debounce.py
 - `python-dotenv` - .env loading
 - `python-telegram-bot` - Telegram integration
 - `nvidia-riva-client` - Hosted ASR for Sendblue voice memo transcription
-- `Pillow` + `pillow-heif` - Image decoding/conversion
 - `strip-markdown` - Final plain-text normalization
 - `numpy` - Supporting numeric utilities
 
 External binaries used by integration/tool paths:
 
 - `pdftotext` - required by `read_pdf` tool
-- `ffmpeg` - used for iMessage voice memo conversion and image conversion fallback
-- `ImageMagick` (`magick`/`convert`) - preferred converter for some non-native image formats
+- `ffmpeg` - used for iMessage voice memo conversion fallback
+- `ImageMagick` (`magick`/`convert`) - required for inbound image-to-JPEG/base64 conversion
 
 ## Code Patterns & Conventions
 
@@ -264,6 +263,10 @@ All tools return a consistent dictionary format:
   **Fix:** Make ACP crypto-optional in `acp.py` (safe fallback signatures, optional identity key, robust security plugin verification), switch ACP runtime to an in-process network registry with lazy agent initialization, and add a core tool-path integration test that discovers and messages a live peer app (`tests/test_acp_core_tool_flow.py`). Validate with: `PYTHONPATH=. .venv/bin/python tests/test_acp.py`, `PYTHONPATH=. .venv/bin/python tests/test_acp_core_tool_flow.py`, `PYTHONPATH=. .venv/bin/python tests/test_simple.py`, and `PYTHONPATH=. .venv/bin/python tests/test_process_response.py`.
 - **Pitfall: ACP could only discover in-process agents, so a real external ACP server was invisible and unreachable from `acp_discover_peers` / `acp_send_message`.**
   **Fix:** Extend `acp.py` with remote ACP HTTP discovery + execution: load `ACP_REMOTE_ENDPOINTS`, query `/agents`, map `agent_name -> endpoint`, and send outbound ACP runs via `POST /runs` using `mode: "sync"` and ACP message-part input (`role: "user"` + `parts[].content`). Add regression coverage in `tests/test_acp_remote_http.py` and include it in `run_all_tests.py`. Validate with: `PYTHONPATH=. .venv/bin/python tests/test_acp_remote_http.py`, `PYTHONPATH=. .venv/bin/python tests/test_acp_core_tool_flow.py`, and a live tool-call probe using `execute_tool_calls` + `acp_send_message` against a remote ACP endpoint.
+- **Pitfall: Unbounded inbound image attachments could overwhelm multimodal turns, making per-message behavior unpredictable when users sent many images.**
+  **Fix:** Add a configurable cap in `integrations.py` (`MAX_IMAGE_ATTACHMENTS_PER_MESSAGE`, default `20`) and truncate extra attachments with an explicit context note to the model. Add regression coverage in `tests/test_multimodal_integrations.py` (`test_multimodal_message_blocks_respect_attachment_limit`). Validate with: `PYTHONPATH=. .venv/bin/python tests/test_multimodal_integrations.py`.
+- **Pitfall: NVIDIA NVCF image-asset upload paths added API coupling and conflicted with strict provider-side per-message image limits.**
+  **Fix:** Remove NVCF asset creation/upload + header injection paths (`integrations.py` + `api.py`), enforce `MAX_IMAGE_ATTACHMENTS_PER_MESSAGE=8` by default, and convert inbound images to JPEG base64 data URLs via ImageMagick before model calls. Add regression coverage in `tests/test_multimodal_integrations.py` and `tests/test_process_response.py`. Validate with: `PYTHONPATH=. .venv/bin/python tests/test_multimodal_integrations.py`, `PYTHONPATH=. .venv/bin/python tests/test_process_response.py`.
 
 ## Key Functions Reference
 
@@ -271,7 +274,7 @@ All tools return a consistent dictionary format:
 | -------------------------- | ------------------------------------------ | ---------------------- |
 | `initialize_agent()`       | Build memory/planning/handler stack        | `main.py:243`          |
 | `AgentHandler.handle()`    | Main request processing pipeline           | `handler.py:981`       |
-| `api_call_with_retry()`    | API call with retry + asset header wiring  | `api.py:237`           |
+| `api_call_with_retry()`    | API call with retry + stream assembly      | `api.py:237`           |
 | `execute_tool_calls()`     | Validate + execute model tool calls        | `api.py:298`           |
 | `process_response()`       | Multi-round tool-call loop + leak handling | `api.py:342`           |
 | `start_sendblue_bot()`     | Start Sendblue webhook/polling runtime     | `integrations.py:2266` |

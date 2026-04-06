@@ -14,6 +14,53 @@ import aiohttp
 
 from memory import EnhancedMemoryStore
 
+# ---------------------------------------------------------------------------
+# Workspace enforcement
+# ---------------------------------------------------------------------------
+_PROJECT_ROOT = os.path.normpath(os.path.dirname(os.path.abspath(__file__)))
+_DEFAULT_WORKSPACE = os.path.join(_PROJECT_ROOT, "workspace")
+AGENT_WORKSPACE = os.path.normpath(
+    os.environ.get("AGENT_WORKSPACE", _DEFAULT_WORKSPACE).strip() or _DEFAULT_WORKSPACE
+)
+# Paths the agent is explicitly allowed to write to even outside the workspace
+# (the project root itself for self-modification tasks).
+_ALWAYS_ALLOWED_PREFIXES = (AGENT_WORKSPACE, _PROJECT_ROOT)
+
+
+def _resolve_write_path(filepath: str) -> tuple[str, str | None]:
+    """Return (resolved_path, warning_or_None).
+
+    Relative paths are resolved relative to AGENT_WORKSPACE so that bare
+    filenames like ``meeting.ics`` land in the workspace rather than in the
+    project root.  Absolute paths that fall outside every allowed prefix are
+    redirected to ``workspace/scratch/<basename>``.
+    """
+    if os.path.isabs(filepath):
+        resolved = os.path.normpath(filepath)
+    else:
+        # Strip leading "workspace/" prefix so that "workspace/foo.txt" and
+        # "foo.txt" both resolve to AGENT_WORKSPACE/foo.txt, preventing the
+        # model from creating a nested workspace/workspace/ directory.
+        workspace_name = os.path.basename(AGENT_WORKSPACE)
+        parts = filepath.replace("\\", "/").split("/")
+        if parts and parts[0] == workspace_name:
+            filepath = "/".join(parts[1:]) or "."
+        resolved = os.path.normpath(os.path.join(AGENT_WORKSPACE, filepath))
+
+    for allowed in _ALWAYS_ALLOWED_PREFIXES:
+        if resolved.startswith(allowed + os.sep) or resolved == allowed:
+            return resolved, None
+
+    # Outside every allowed prefix — redirect to workspace/scratch/
+    basename = os.path.basename(resolved) or "file"
+    redirected = os.path.join(AGENT_WORKSPACE, "scratch", basename)
+    warning = (
+        f"Path '{filepath}' is outside the workspace. "
+        f"Redirected to '{redirected}'. "
+        f"Always write files inside {AGENT_WORKSPACE}."
+    )
+    return redirected, warning
+
 
 # Initialize memory store (will be set from main module)
 memory_store: Optional[EnhancedMemoryStore] = None
@@ -25,6 +72,12 @@ _runtime_session_id: contextvars.ContextVar[Optional[str]] = contextvars.Context
     "runtime_session_id",
     default=None,
 )
+
+
+def set_agent_workspace(path: str) -> None:
+    """Override the workspace path at runtime (called from main/handler)."""
+    global AGENT_WORKSPACE
+    AGENT_WORKSPACE = os.path.normpath(path)
 
 
 def set_memory_store(store: EnhancedMemoryStore):
@@ -82,9 +135,14 @@ async def read_file_tool(filepath):
 async def write_file_tool(filepath, content):
     """Write content to a file (overwrites existing)."""
     try:
-        with open(filepath, "w", encoding="utf-8") as f:
+        resolved, warning = _resolve_write_path(filepath)
+        os.makedirs(os.path.dirname(resolved) or ".", exist_ok=True)
+        with open(resolved, "w", encoding="utf-8") as f:
             f.write(content)
-        return {"success": True, "message": f"Written to {filepath}"}
+        result: dict[str, Any] = {"success": True, "message": f"Written to {resolved}"}
+        if warning:
+            result["warning"] = warning
+        return result
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -92,16 +150,20 @@ async def write_file_tool(filepath, content):
 async def edit_file_tool(filepath, old_str, new_str):
     """Replace old_str with new_str in file. Requires exact match."""
     try:
-        with open(filepath, "r", encoding="utf-8") as f:
+        resolved, warning = _resolve_write_path(filepath)
+        with open(resolved, "r", encoding="utf-8") as f:
             content = f.read()
 
         if old_str not in content:
             return {"success": False, "error": "old_str not found in file"}
 
         new_content = content.replace(old_str, new_str, 1)
-        with open(filepath, "w", encoding="utf-8") as f:
+        with open(resolved, "w", encoding="utf-8") as f:
             f.write(new_content)
-        return {"success": True, "message": f"Edited {filepath}"}
+        result: dict[str, Any] = {"success": True, "message": f"Edited {resolved}"}
+        if warning:
+            result["warning"] = warning
+        return result
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -720,6 +782,65 @@ async def web_search_tool(
         return {"success": False, "error": str(e)}
 
 
+async def generate_image_tool(
+    prompt: str,
+    filename: str,
+    width: int = 1024,
+    height: int = 1024,
+    model: str = "flux",
+):
+    """Generate an image from a text prompt and save it to the workspace.
+
+    Uses Pollinations.ai (free, no API key required).
+
+    Args:
+        prompt: Text description of the image to generate
+        filename: Output filename (e.g. robot_cafe.png). Saved to workspace.
+        width: Image width in pixels (default 1024)
+        height: Image height in pixels (default 1024)
+        model: Model to use — 'flux' (default, high quality) or 'turbo' (faster)
+    """
+    try:
+        import urllib.parse
+
+        encoded_prompt = urllib.parse.quote(prompt)
+        url = (
+            f"https://image.pollinations.ai/prompt/{encoded_prompt}"
+            f"?width={width}&height={height}&model={model}&nologo=true&enhance=true"
+        )
+
+        resolved, warning = _resolve_write_path(filename)
+        os.makedirs(os.path.dirname(resolved) or ".", exist_ok=True)
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url, timeout=aiohttp.ClientTimeout(total=120)
+            ) as resp:
+                if resp.status != 200:
+                    return {
+                        "success": False,
+                        "error": f"Image generation failed (HTTP {resp.status})",
+                    }
+                image_bytes = await resp.read()
+
+        with open(resolved, "wb") as f:
+            f.write(image_bytes)
+
+        result: dict[str, Any] = {
+            "success": True,
+            "message": f"Image saved to {resolved} ({len(image_bytes)} bytes)",
+            "path": resolved,
+        }
+        if warning:
+            result["warning"] = warning
+        return result
+
+    except asyncio.TimeoutError:
+        return {"success": False, "error": "Image generation timed out (>120s)"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 async def activate_skill_tool(name: str):
     """Activate a discovered skill and return its wrapped instructions."""
     if skill_registry is None:
@@ -931,6 +1052,8 @@ TOOLS = {
     "forget": forget_tool,
     "memory_stats": memory_stats_tool,
     "web_search": web_search_tool,
+    "generate_image": generate_image_tool,
+    "create_image": generate_image_tool,  # Alias
     "activate_skill": activate_skill_tool,
     "send_tapback": send_tapback_tool,
     "send_reaction": send_tapback_tool,  # Alias for clarity
@@ -976,6 +1099,8 @@ def validate_tool_args(func_name: str, func_args: dict) -> tuple:
         "recall": ["query"],
         "forget": ["memory_id"],
         "web_search": ["query"],
+        "generate_image": ["prompt", "filename"],
+        "create_image": ["prompt", "filename"],
         "activate_skill": ["name"],
         "send_tapback": ["message_handle", "reaction"],
         "send_reaction": ["message_handle", "reaction"],

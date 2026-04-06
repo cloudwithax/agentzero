@@ -8,13 +8,13 @@ import uuid
 from typing import Any, Awaitable, Callable, Optional
 
 import aiohttp
+import re as _re
+
 import strip_markdown
 
 from tools import TOOLS, validate_tool_args
 
 logger = logging.getLogger(__name__)
-
-ASSET_REFERENCE_PATTERN = re.compile(r"asset_id,([A-Za-z0-9-]+)")
 
 
 def _apply_cache_busting_headers(headers: dict[str, str]) -> dict[str, str]:
@@ -48,59 +48,6 @@ def _message_content_to_text(content: Any) -> str:
     return "" if content is None else str(content)
 
 
-def _append_asset_ids_from_text(
-    text: str,
-    seen: set[str],
-    ordered_asset_ids: list[str],
-) -> None:
-    for match in ASSET_REFERENCE_PATTERN.finditer(text or ""):
-        asset_id = match.group(1).strip()
-        if asset_id and asset_id not in seen:
-            seen.add(asset_id)
-            ordered_asset_ids.append(asset_id)
-
-
-def _extract_nvcf_asset_ids(messages: Any) -> list[str]:
-    """Extract asset IDs from conversation messages for NVCF header wiring."""
-    if not isinstance(messages, list):
-        return []
-
-    seen: set[str] = set()
-    ordered_asset_ids: list[str] = []
-
-    for message in messages:
-        if not isinstance(message, dict):
-            continue
-
-        content = message.get("content")
-        if isinstance(content, str):
-            _append_asset_ids_from_text(content, seen, ordered_asset_ids)
-            continue
-
-        if not isinstance(content, list):
-            continue
-
-        for item in content:
-            if not isinstance(item, dict):
-                continue
-
-            text_value = item.get("text")
-            if isinstance(text_value, str):
-                _append_asset_ids_from_text(text_value, seen, ordered_asset_ids)
-
-            content_value = item.get("content")
-            if isinstance(content_value, str):
-                _append_asset_ids_from_text(content_value, seen, ordered_asset_ids)
-
-            image_obj = item.get("image_url")
-            if isinstance(image_obj, dict):
-                image_url = image_obj.get("url")
-                if isinstance(image_url, str):
-                    _append_asset_ids_from_text(image_url, seen, ordered_asset_ids)
-
-    return ordered_asset_ids
-
-
 TOOL_LEAK_PATTERNS = [
     "```bash",
     "```sh",
@@ -109,6 +56,35 @@ TOOL_LEAK_PATTERNS = [
     "<|tool_call|>",
     "<|tool_calls|>",
 ]
+
+# Matches fenced code blocks (``` ... ```) and inline code (`...`).
+_CODE_FENCE_RE = _re.compile(r"(```[\s\S]*?```|`[^`\n]+`)")
+
+
+def safe_strip_markdown(text: str) -> str:
+    """Strip markdown formatting while preserving content inside code fences/spans.
+
+    ``strip_markdown`` treats ``__word__`` as bold markup and removes the
+    underscores, which mangles Python dunder names like ``__name__``.  This
+    wrapper extracts all code spans/blocks first, strips markdown on the
+    remaining prose, then splices the original code back in.
+    """
+    if not text:
+        return text
+
+    placeholders: list[str] = []
+
+    def _stash(match: _re.Match) -> str:
+        placeholders.append(match.group(0))
+        return f"\x00CODE{len(placeholders) - 1}\x00"
+
+    protected = _CODE_FENCE_RE.sub(_stash, text)
+    stripped = strip_markdown.strip_markdown(protected)
+
+    for idx, original in enumerate(placeholders):
+        stripped = stripped.replace(f"\x00CODE{idx}\x00", original)
+
+    return stripped
 
 
 def detect_tool_leak(content: str) -> bool:
@@ -432,8 +408,8 @@ async def api_call_with_retry(
     url: str,
     json_data: dict[str, Any],
     headers: dict[str, str],
-    max_retries: int = 3,
-    backoff: float = 2.0,
+    max_retries: int = 5,
+    backoff: float = 3.0,
     stream: bool = False,
     stream_chunk_callback: Optional[Callable[[str], Awaitable[None]]] = None,
 ) -> dict[str, Any]:
@@ -446,14 +422,6 @@ async def api_call_with_retry(
     )
     request_payload = json_data.copy()
     request_payload["stream"] = stream
-
-    has_asset_header = any(
-        key.lower() == "nvcf-input-asset-references" for key in request_headers
-    )
-    if not has_asset_header:
-        asset_ids = _extract_nvcf_asset_ids(request_payload.get("messages"))
-        if asset_ids:
-            request_headers["NVCF-INPUT-ASSET-REFERENCES"] = ",".join(asset_ids)
 
     for attempt in range(max_retries):
         try:
@@ -477,9 +445,21 @@ async def api_call_with_retry(
                             stream_chunk_callback=stream_chunk_callback,
                         )
                 else:
-                    response_data = await resp.json()
+                    response_data = await resp.json(content_type=None)
 
-                # Check for rate limiting or server errors
+                # Handle NVIDIA/non-standard rate-limit format: {"status": 429, "title": "..."}
+                if resp.status == 429 or response_data.get("status") == 429:
+                    if attempt < max_retries - 1:
+                        # Cap per-attempt wait at 15s so we don't blow past benchmark timeouts
+                        wait_time = min(backoff ** (attempt + 1), 15.0)
+                        logger.warning(
+                            f"Rate limit (429) hit, retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})..."
+                        )
+                        await asyncio.sleep(wait_time)
+                        continue
+                    return {"error": {"message": "Rate limit exceeded after retries"}}
+
+                # Check for rate limiting or server errors (standard OpenAI format)
                 if "error" in response_data:
                     error = response_data["error"]
                     error_msg = error.get("message", "Unknown error")
@@ -491,7 +471,7 @@ async def api_call_with_retry(
                         "server_error",
                     ]:
                         if attempt < max_retries - 1:
-                            wait_time = backoff**attempt
+                            wait_time = min(backoff ** (attempt + 1), 15.0)
                             logger.warning(
                                 f"Rate limit hit, retrying in {wait_time}s..."
                             )
@@ -587,106 +567,82 @@ async def process_response(
     max_tool_leak_retries: int = 1,
     stream_chunk_callback: Optional[Callable[[str], Awaitable[None]]] = None,
 ) -> str:
-    """Process API response. Handles multiple rounds of tool calls."""
-    tool_leak_retry_count = 0
+    """Process API response via the agentic loop.
 
-    while True:
-        # Handle API errors
-        if "error" in response_data:
-            error_msg = response_data["error"].get("message", "Unknown API error")
-            logger.error(f"API error: {error_msg}")
-            return f"Error: {error_msg}"
+    The first response has already been fetched by the caller; this function
+    seeds the agentic loop with it and lets ``run_agentic_loop`` handle all
+    subsequent rounds of tool calling until the model produces a final text
+    answer or the iteration cap is reached.
+    """
+    # Lazy import to avoid a circular dependency at module load time.
+    from agentic_loop import run_agentic_loop  # noqa: PLC0415
 
-        if "choices" not in response_data or not response_data["choices"]:
-            logger.error(f"No choices in response: {response_data}")
-            return "Error: No response from API"
+    # Handle top-level API errors before entering the loop.
+    if "error" in response_data:
+        error_msg = response_data["error"].get("message", "Unknown API error")
+        logger.error("API error: %s", error_msg)
+        return f"Error: {error_msg}"
 
-        message = response_data["choices"][0]["message"]
+    if not response_data.get("choices"):
+        logger.error("No choices in initial response: %s", response_data)
+        return "Error: No response from API"
 
-        # Fallback: recover tool calls when model emits raw bash code fences.
-        if not message.get("tool_calls"):
-            inferred_tool_calls = infer_tool_calls_from_content(
-                _message_content_to_text(message.get("content", ""))
-            )
-            if inferred_tool_calls:
-                message["tool_calls"] = inferred_tool_calls
-                message["content"] = None
-                logger.warning("Recovered tool call from leaked content")
+    # Seed the conversation with the first assistant message so the loop
+    # doesn't make a redundant extra API call for the initial response.
+    first_message = response_data["choices"][0]["message"]
 
-        # Keep processing tool calls until there are none
-        while "tool_calls" in message and message["tool_calls"]:
-            # Execute tool calls
-            allowed_tool_names = _extract_allowed_tool_names(base_payload)
-            tool_results = await execute_tool_calls(
-                message,
-                allowed_tool_names=allowed_tool_names,
-            )
+    # Recover leaked tool calls in the initial response before handing off.
+    if not first_message.get("tool_calls"):
+        inferred = infer_tool_calls_from_content(
+            _message_content_to_text(first_message.get("content", ""))
+        )
+        if inferred:
+            first_message = dict(first_message)
+            first_message["tool_calls"] = inferred
+            first_message["content"] = None
+            logger.warning("Recovered tool call from leaked content in initial response")
 
-            # Build conversation history
-            messages.append(message)
-            messages.extend(tool_results)
+    tool_calls = first_message.get("tool_calls") or []
 
-            # Make follow-up call with tool results (with retry)
-            current_payload = base_payload.copy()
-            current_payload["messages"] = messages
+    # Fast path: no tool calls at all — just clean up and return.
+    if not tool_calls:
+        content_text = _message_content_to_text(first_message.get("content", ""))
+        if not detect_tool_leak(content_text):
+            return safe_strip_markdown(content_text) if content_text else ""
+        # Fall through to the loop for leak-guard retry.
 
-            response_data = await api_call_with_retry(
-                session,
-                base_url,
-                current_payload,
-                {"Authorization": f"Bearer {api_key}"},
-                stream=stream_chunk_callback is not None,
-                stream_chunk_callback=stream_chunk_callback,
-            )
+    if tool_calls:
+        # Execute the first round of tool calls immediately, then let the loop
+        # handle follow-up rounds (this avoids a redundant API call).
+        # Mutate messages in-place so callers that inspect the list afterwards
+        # (e.g. existing tests) see the appended tool-call and result entries.
+        allowed_tool_names = _extract_allowed_tool_names(base_payload)
+        tool_results = await execute_tool_calls(
+            first_message, allowed_tool_names=allowed_tool_names
+        )
+        messages.append(first_message)
+        messages.extend(tool_results)
+    else:
+        # Leak detected in a no-tool-call response — re-enter the loop so the
+        # formatting-guard retry logic in run_agentic_loop can handle it.
+        messages.append(first_message)
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "Your last reply exposed internal tool call content. "
+                    "Do not show tool calls, shell commands, code fences, or JSON internals. "
+                    "Reply naturally in plain text for the end user."
+                ),
+            }
+        )
 
-            # Handle errors in follow-up call
-            if "error" in response_data:
-                error_msg = response_data["error"].get("message", "Unknown API error")
-                logger.error(f"API error in follow-up: {error_msg}")
-                return f"Error: {error_msg}"
-
-            if "choices" not in response_data or not response_data["choices"]:
-                logger.error("No choices in follow-up response")
-                return "Error: No response from API"
-
-            message = response_data["choices"][0]["message"]
-
-        content_text = _message_content_to_text(message.get("content", ""))
-        if detect_tool_leak(content_text):
-            if tool_leak_retry_count < max_tool_leak_retries:
-                tool_leak_retry_count += 1
-                logger.warning(
-                    "Detected leaked tool-call content, retrying with formatting guard "
-                    f"(attempt {tool_leak_retry_count}/{max_tool_leak_retries})..."
-                )
-
-                leak_guard_message = {
-                    "role": "user",
-                    "content": (
-                        "Your last reply exposed internal tool call content. "
-                        "Do not show tool calls, shell commands, code fences, or JSON internals. "
-                        "Reply naturally in plain text for the end user."
-                    ),
-                }
-                messages.append(message)
-                messages.append(leak_guard_message)
-
-                current_payload = base_payload.copy()
-                current_payload["messages"] = messages
-
-                response_data = await api_call_with_retry(
-                    session,
-                    base_url,
-                    current_payload,
-                    {"Authorization": f"Bearer {api_key}"},
-                    stream=stream_chunk_callback is not None,
-                    stream_chunk_callback=stream_chunk_callback,
-                )
-                continue
-
-            logger.warning("Max tool-leak retries exceeded, returning safe fallback")
-            return (
-                "Sorry, there was an internal formatting issue. Please send that again."
-            )
-
-        return strip_markdown.strip_markdown(content_text) if content_text else ""
+    return await run_agentic_loop(
+        messages=messages,
+        session=session,
+        base_url=base_url,
+        api_key=api_key,
+        base_payload=base_payload,
+        stream_chunk_callback=stream_chunk_callback,
+        max_tool_leak_retries=max_tool_leak_retries,
+    )

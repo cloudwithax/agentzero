@@ -125,6 +125,12 @@ API_KEY = os.environ.get(
 MODEL_ID = os.environ.get("MODEL_ID", "moonshotai/kimi-k2-instruct-0905")
 CONSORTIUM_MODEL_ID = os.environ.get("CONSORTIUM_MODEL", MODEL_ID).strip() or MODEL_ID
 
+# Workspace — all agent-created files must live here.
+_DEFAULT_WORKSPACE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workspace")
+AGENT_WORKSPACE = os.path.normpath(
+    os.environ.get("AGENT_WORKSPACE", _DEFAULT_WORKSPACE).strip() or _DEFAULT_WORKSPACE
+)
+
 # Base payload template (do not mutate globally)
 BASE_PAYLOAD = {
     "model": MODEL_ID,
@@ -454,6 +460,40 @@ BASE_PAYLOAD = {
                         },
                     },
                     "required": ["query"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "generate_image",
+                "description": "Generate an image from a text prompt and save it as a PNG/JPG file in the workspace. Use this for any image creation, illustration, or visual generation task.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "prompt": {
+                            "type": "string",
+                            "description": "Detailed text description of the image to generate",
+                        },
+                        "filename": {
+                            "type": "string",
+                            "description": "Output filename (e.g. robot_cafe.png). Saved to workspace.",
+                        },
+                        "width": {
+                            "type": "integer",
+                            "description": "Image width in pixels (default 1024)",
+                        },
+                        "height": {
+                            "type": "integer",
+                            "description": "Image height in pixels (default 1024)",
+                        },
+                        "model": {
+                            "type": "string",
+                            "enum": ["flux", "turbo"],
+                            "description": "Model: flux (high quality, default) or turbo (faster)",
+                        },
+                    },
+                    "required": ["prompt", "filename"],
                 },
             },
         },
@@ -2343,6 +2383,26 @@ class AgentHandler:
             "Users can also explicitly activate skills with /skill-name or $skill-name. Treat that as a harness-level activation signal.\n"
             'For readability, you may split a reply into multiple chunks using <message>...</message> blocks. You may also insert <typing seconds="1.2"/> between message blocks to add brief pacing pauses. If you use this format, keep all user-visible text inside those message blocks.\n'
             "IMPORTANT: Do not use markdown formatting, code blocks, or emojis in your responses. Respond in plain text only.\n"
+            "CRITICAL: For any task requiring current real-time data — stock prices, prediction market odds, live news, current weather, today's events — you MUST use the web_search tool. Never fabricate, guess, or use training-data values for live data. If web_search fails, say so explicitly rather than inventing numbers.\n"
+            "CRITICAL: When asked to save, write, or create a file, ALWAYS call the write tool with the file path and content. Never include file contents in your response text — write them to disk. Your text response should only confirm what was written and where.\n"
+            f"\n\n[Workspace]:\n"
+            f"Your persistent workspace is at: {AGENT_WORKSPACE}\n"
+            f"ALWAYS write files here — never to /tmp, ~, or any other path.\n"
+            f"Directory structure and when to use each:\n"
+            f"  {AGENT_WORKSPACE}/projects/<project-name>/  — one folder per project; use a short, descriptive slug (e.g. flask-site, data-pipeline)\n"
+            f"  {AGENT_WORKSPACE}/scratch/                  — throwaway experiments, one-off scripts\n"
+            f"  {AGENT_WORKSPACE}/archive/                  — completed or inactive project snapshots\n"
+            f"Rules:\n"
+            f"  1. DEFAULT: write ALL files directly at the workspace root (e.g. {AGENT_WORKSPACE}/foo.txt, {AGENT_WORKSPACE}/src/main.py). This is the default for any task that specifies file names or paths.\n"
+            f"  2. EXCEPTION: only use a projects/<slug>/ subdirectory when the user explicitly says 'new project' or 'build me a project' WITHOUT specifying any file paths at all.\n"
+            f"  3. Keywords like 'at workspace root', 'in the workspace', or any explicit filename mean: use the workspace root, not projects/.\n"
+            f"  4. Use bash mkdir -p to create subdirectories before writing files.\n"
+            f"  5. When done, tell the user the full path of every file you created.\n"
+            f"ICS/iCalendar format reminder — use this exact structure:\n"
+            f"  BEGIN:VCALENDAR\\nVERSION:2.0\\nPRODID:-//AgentZero//EN\\nBEGIN:VEVENT\\n"
+            f"  DTSTART:YYYYMMDDTHHmmssZ\\nDTEND:YYYYMMDDTHHmmssZ\\nSUMMARY:Title\\n"
+            f"  DESCRIPTION:Notes\\nATTENDEE:mailto:email@example.com\\nEND:VEVENT\\nEND:VCALENDAR\n"
+            f"  (ATTENDEE uses a colon before mailto, not a semicolon)\n"
         )
         if request_freshness_token:
             universal_instructions += (

@@ -76,3 +76,8 @@ workspace/
 
 # nohup output
 nohup.out
+
+#
+test_image.png
+
+.venv/

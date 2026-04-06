@@ -1,7 +1,5 @@
-  aiohttp
+aiohttp
 numpy
-Pillow
-pillow-heif
 python-telegram-bot
 python-dotenv
 nvidia-riva-client
