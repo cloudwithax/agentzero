@@ -587,56 +587,9 @@ async def process_response(
         logger.error("No choices in initial response: %s", response_data)
         return "Error: No response from API"
 
-    # Seed the conversation with the first assistant message so the loop
-    # doesn't make a redundant extra API call for the initial response.
-    first_message = response_data["choices"][0]["message"]
-
-    # Recover leaked tool calls in the initial response before handing off.
-    if not first_message.get("tool_calls"):
-        inferred = infer_tool_calls_from_content(
-            _message_content_to_text(first_message.get("content", ""))
-        )
-        if inferred:
-            first_message = dict(first_message)
-            first_message["tool_calls"] = inferred
-            first_message["content"] = None
-            logger.warning("Recovered tool call from leaked content in initial response")
-
-    tool_calls = first_message.get("tool_calls") or []
-
-    # Fast path: no tool calls at all — just clean up and return.
-    if not tool_calls:
-        content_text = _message_content_to_text(first_message.get("content", ""))
-        if not detect_tool_leak(content_text):
-            return safe_strip_markdown(content_text) if content_text else ""
-        # Fall through to the loop for leak-guard retry.
-
-    if tool_calls:
-        # Execute the first round of tool calls immediately, then let the loop
-        # handle follow-up rounds (this avoids a redundant API call).
-        # Mutate messages in-place so callers that inspect the list afterwards
-        # (e.g. existing tests) see the appended tool-call and result entries.
-        allowed_tool_names = _extract_allowed_tool_names(base_payload)
-        tool_results = await execute_tool_calls(
-            first_message, allowed_tool_names=allowed_tool_names
-        )
-        messages.append(first_message)
-        messages.extend(tool_results)
-    else:
-        # Leak detected in a no-tool-call response — re-enter the loop so the
-        # formatting-guard retry logic in run_agentic_loop can handle it.
-        messages.append(first_message)
-        messages.append(
-            {
-                "role": "user",
-                "content": (
-                    "Your last reply exposed internal tool call content. "
-                    "Do not show tool calls, shell commands, code fences, or JSON internals. "
-                    "Reply naturally in plain text for the end user."
-                ),
-            }
-        )
-
+    # Hand the initial response directly to the agentic loop.
+    # The loop owns the full while-tool-calls cycle and will handle this
+    # response as its first iteration without making a redundant API call.
     return await run_agentic_loop(
         messages=messages,
         session=session,
@@ -645,4 +598,5 @@ async def process_response(
         base_payload=base_payload,
         stream_chunk_callback=stream_chunk_callback,
         max_tool_leak_retries=max_tool_leak_retries,
+        initial_response_data=response_data,
     )
