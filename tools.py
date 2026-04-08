@@ -2,6 +2,7 @@
 
 import asyncio
 import contextvars
+import fnmatch
 import glob
 import json
 import os
@@ -122,12 +123,38 @@ def reset_tool_runtime_session(token: contextvars.Token):
 
 
 # File tools
-async def read_file_tool(filepath):
-    """Read the contents of a file."""
+async def read_file_tool(filepath, offset: int | None = None, limit: int | None = None):
+    """Read the contents of a file, with optional line slicing.
+
+    ``offset`` and ``limit`` are interpreted as line-oriented values to match
+    common model tool-call behavior. ``offset`` is human-friendly: ``0`` and
+    ``1`` both start from the first line.
+    """
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             content = f.read()
-        return {"success": True, "content": content}
+
+        if offset is None and limit is None:
+            return {"success": True, "content": content}
+
+        offset_value = int(offset or 0)
+        limit_value = None if limit is None else int(limit)
+        if offset_value < 0:
+            return {"success": False, "error": "offset must be non-negative"}
+        if limit_value is not None and limit_value < 0:
+            return {"success": False, "error": "limit must be non-negative"}
+
+        lines = content.splitlines(keepends=True)
+        start_index = 0 if offset_value <= 1 else offset_value - 1
+        end_index = None if limit_value is None else start_index + limit_value
+        sliced = "".join(lines[start_index:end_index])
+        return {
+            "success": True,
+            "content": sliced,
+            "offset": offset_value,
+            "limit": limit_value,
+            "truncated": end_index is not None and end_index < len(lines),
+        }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -177,17 +204,45 @@ async def glob_tool(pattern):
         return {"success": False, "error": str(e)}
 
 
-async def grep_tool(pattern, path="."):
-    """Search for pattern in files. Returns matching lines with filenames."""
+async def grep_tool(
+    pattern,
+    path=".",
+    include: str | None = None,
+    max_matches: int | None = None,
+    **_ignored_kwargs,
+):
+    """Search for pattern in files. Returns matching lines with filenames.
+
+    Supports optional ``include`` filename patterns and ``max_matches`` limits
+    to align with common model-generated grep arguments.
+    """
     try:
+        compiled_pattern = re.compile(pattern)
         matches = []
+        include_patterns = []
+        if include:
+            include_patterns = [item.strip() for item in str(include).split(",") if item.strip()]
+
+        max_match_count = None
+        if max_matches is not None:
+            max_match_count = int(max_matches)
+            if max_match_count < 0:
+                return {"success": False, "error": "max_matches must be non-negative"}
+
         for root, dirs, files in os.walk(path):
             for file in files:
                 filepath = os.path.join(root, file)
+                if include_patterns:
+                    if not any(
+                        fnmatch.fnmatch(file, pattern_item)
+                        or fnmatch.fnmatch(filepath, pattern_item)
+                        for pattern_item in include_patterns
+                    ):
+                        continue
                 try:
                     with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
                         for i, line in enumerate(f, 1):
-                            if re.search(pattern, line):
+                            if compiled_pattern.search(line):
                                 matches.append(
                                     {
                                         "file": filepath,
@@ -195,6 +250,11 @@ async def grep_tool(pattern, path="."):
                                         "content": line.rstrip(),
                                     }
                                 )
+                                if (
+                                    max_match_count is not None
+                                    and len(matches) >= max_match_count
+                                ):
+                                    return {"success": True, "matches": matches}
                 except Exception:
                     continue
         return {"success": True, "matches": matches}

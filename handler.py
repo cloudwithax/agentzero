@@ -15,7 +15,7 @@ from memory import EnhancedMemoryStore
 from capabilities import CapabilityProfile, AdaptiveFormatter
 from examples import AdaptiveFewShotManager
 from planning import TaskType, TaskPlanner, TaskAnalyzer
-from api import api_call_with_retry, process_response
+from api import api_call_with_retry, process_response, safe_strip_markdown
 from skills import SkillRegistry
 from reminder_tasks import ReminderScheduler
 from tools import (
@@ -26,6 +26,7 @@ from tools import (
     set_acp_agent,
 )
 from acp import ACPAgent
+from prompt_templates import get_template
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,14 @@ DELIVERY_TYPING_DIRECTIVE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 DELIVERY_MESSAGE_TAG_PATTERN = re.compile(r"</?message>", re.IGNORECASE)
+INTERNAL_PROMPT_RESIDUE_PATTERNS = (
+    re.compile(
+        r"(?i)(?:^|[\s\n])no more loops,\s*no more narration(?:\s*[—-]\s*just the reaction)?[.!]?"
+    ),
+    re.compile(r"(?i)(?:^|[\s\n])tool execution is mandatory[.!]?"),
+    re.compile(r"(?i)(?:^|[\s\n])act,\s*don't narrate[.!]?"),
+    re.compile(r"(?i)(?:^|[\s\n])do not narrate(?: what you will do)?[.!]?"),
+)
 
 
 def _content_to_text(content: Any) -> str:
@@ -81,6 +90,21 @@ def _strip_delivery_directives(content: Any) -> str:
     sanitized = DELIVERY_TYPING_DIRECTIVE_PATTERN.sub("", normalized)
     sanitized = DELIVERY_MESSAGE_TAG_PATTERN.sub("", sanitized)
     return sanitized.strip()
+
+
+def _strip_internal_prompt_residue(content: str) -> str:
+    """Remove obvious leaked internal control phrases from visible assistant text."""
+    cleaned = "" if content is None else str(content)
+    if not cleaned.strip():
+        return ""
+
+    for pattern in INTERNAL_PROMPT_RESIDUE_PATTERNS:
+        cleaned = pattern.sub(" ", cleaned)
+
+    cleaned = re.sub(r"\s+([.,!?])", r"\1", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip(" \t\r\n-—")
 
 
 def _build_consortium_agree_tool_schema() -> dict[str, Any]:
@@ -126,7 +150,9 @@ MODEL_ID = os.environ.get("MODEL_ID", "moonshotai/kimi-k2-instruct-0905")
 CONSORTIUM_MODEL_ID = os.environ.get("CONSORTIUM_MODEL", MODEL_ID).strip() or MODEL_ID
 
 # Workspace — all agent-created files must live here.
-_DEFAULT_WORKSPACE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workspace")
+_DEFAULT_WORKSPACE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "workspace"
+)
 AGENT_WORKSPACE = os.path.normpath(
     os.environ.get("AGENT_WORKSPACE", _DEFAULT_WORKSPACE).strip() or _DEFAULT_WORKSPACE
 )
@@ -138,7 +164,7 @@ BASE_PAYLOAD = {
     "top_p": 0.9,
     "frequency_penalty": 0,
     "presence_penalty": 0,
-    "max_tokens": 4096,
+    "max_tokens": 32768,
     "stream": False,
     "tools": [
         {
@@ -729,7 +755,12 @@ BASE_PAYLOAD = {
                             "description": "Service endpoint address",
                         },
                     },
-                    "required": ["service_name", "capabilities", "description", "endpoint"],
+                    "required": [
+                        "service_name",
+                        "capabilities",
+                        "description",
+                        "endpoint",
+                    ],
                 },
             },
         },
@@ -812,16 +843,8 @@ BASE_PAYLOAD = {
 CONSORTIUM_CONTACT_MESSAGE = "contacting the consortium to decide your verdict"
 CONSORTIUM_COMPLETION_MESSAGE = "the consortium has reached an agreement."
 CONSORTIUM_MAX_ROUNDS = 4
-IMESSAGE_SYSTEM_PROMPT_SUFFIX = (
-    '"The person is using iMessage. A phone screen shows about 6-8 sentences at a time. '
-    "For simple questions, you will answer in 1-2 sentences. For how-to questions, a short "
-    "list with no intro. For substantive topics, 2-3 short paragraphs - roughly one screenful. "
-    "For complex questions, you should keep it under two screenfuls. You will always lead with "
-    "the answer. No preamble, no restating the question, no filler. If the answer is naturally "
-    "list-shaped - benefits and precautions, a checklist, a comparison - keep it as a short "
-    "list. Lists scan faster than prose on a small screen. These are defaults - if the person "
-    'asks to go deeper or explain fully, you will respond at whatever length the topic needs."'
-)
+
+FINAL_RESPONSE_MAX_TOKENS = int(os.environ.get("FINAL_RESPONSE_MAX_TOKENS", "150"))
 
 AUTO_MEMORY_ENABLED = os.environ.get("AUTO_MEMORY_ENABLED", "1").strip() != "0"
 AUTO_MEMORY_MIN_MESSAGES_PER_MEMORY = max(
@@ -1009,17 +1032,13 @@ class AgentHandler:
         if not prompt_text:
             return ""
 
+        system_content = get_template("direct_inference", {})
+
         payload = BASE_PAYLOAD.copy()
         payload["model"] = MODEL_ID
         payload["tools"] = []
         payload["messages"] = [
-            {
-                "role": "system",
-                "content": (
-                    "You are executing a scheduled task. "
-                    "Return only the requested result in plain text."
-                ),
-            },
+            {"role": "system", "content": system_content},
             {
                 "role": "user",
                 "content": f"Scheduled task {task_id}:\n{prompt_text}",
@@ -1063,12 +1082,30 @@ class AgentHandler:
             output=output,
         )
 
+    _BARE_REACTION_RE = re.compile(
+        r"^(?:like|love|dislike|laugh|emphasize|question)[.!]?\s*$",
+        re.IGNORECASE,
+    )
+
     def _finalize_visible_response(
         self, content: Any, session_id: Optional[str]
     ) -> str:
         """Return text safe for visible responses with delivery directives removed."""
         normalized = "" if content is None else str(content)
-        return _strip_delivery_directives(normalized)
+        visible_text = _strip_delivery_directives(normalized)
+        visible_text = _strip_internal_prompt_residue(visible_text)
+        if (
+            session_id
+            and session_id.startswith("imessage_")
+            and self._BARE_REACTION_RE.match(visible_text.strip())
+        ):
+            logger.warning(
+                "Suppressing bare reaction word '%s' from outbound iMessage "
+                "delivery — tapbacks must use send_tapback tool.",
+                visible_text.strip(),
+            )
+            return ""
+        return visible_text
 
     def _build_request_payload_template(self) -> dict[str, Any]:
         """Build base payload with dynamic tool registration (including skills)."""
@@ -2370,74 +2407,25 @@ class AgentHandler:
     ) -> str:
         """Build the canonical system prompt used by the primary agent."""
         current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        universal_instructions = (
-            f"\n\n[Current Date and Time]: {current_time}\n"
-            "\n\n[System Instructions & Tools]:\n"
-            "You have access to tools via tool_calls. Use the remember() tool to store important facts about the user or session.\n"
-            "If the user asks you to remember or store something, you MUST use the remember() tool.\n"
-            "Use recall() to retrieve past memories.\n"
-            "If you need access to current information not available to you, use the web_search() tool.\n"
-            "Use consortium_start() to launch a consortium task, consortium_status() to check progress/results, and consortium_stop() to cancel an active consortium task.\n"
-            "Use reminder_create() with cron syntax for one-off or recurring tasks. Use reminder_list(), reminder_status(), reminder_cancel(), and reminder_run_now() to manage reminder tasks.\n"
-            "If skills are listed in <available_skills>, call activate_skill(name) before executing specialized workflows.\n"
-            "Users can also explicitly activate skills with /skill-name or $skill-name. Treat that as a harness-level activation signal.\n"
-            'For readability, you may split a reply into multiple chunks using <message>...</message> blocks. You may also insert <typing seconds="1.2"/> between message blocks to add brief pacing pauses. If you use this format, keep all user-visible text inside those message blocks.\n'
-            "IMPORTANT: Do not use markdown formatting, code blocks, or emojis in your responses. Respond in plain text only.\n"
-            "CRITICAL: For any task requiring current real-time data — stock prices, prediction market odds, live news, current weather, today's events — you MUST use the web_search tool. Never fabricate, guess, or use training-data values for live data. If web_search fails, say so explicitly rather than inventing numbers.\n"
-            "CRITICAL: When asked to save, write, or create a file, ALWAYS call the write tool with the file path and content. Never include file contents in your response text — write them to disk. Your text response should only confirm what was written and where.\n"
-            "CRITICAL: You have full shell access via the bash tool — git, npm, curl, python, anything. If a task requires git push, API calls, or running a build, use bash and do it. Do not claim you lack the ability to interact with external services.\n"
-            "CRITICAL: When the user says you failed to do something, did not complete a task, or accuses you of hallucinating work — do NOT apologize and explain limitations. Instead: (1) call recall() to check your memory for what was worked on, (2) use bash to check the workspace for relevant files, (3) then take action to actually complete the task. Never respond to task-failure accusations with text alone.\n"
-            f"\n\n[Workspace]:\n"
-            f"Your persistent workspace is at: {AGENT_WORKSPACE}\n"
-            f"ALWAYS write files here — never to /tmp, ~, or any other path.\n"
-            f"Directory structure and when to use each:\n"
-            f"  {AGENT_WORKSPACE}/projects/<project-name>/  — one folder per project; use a short, descriptive slug (e.g. flask-site, data-pipeline)\n"
-            f"  {AGENT_WORKSPACE}/scratch/                  — throwaway experiments, one-off scripts\n"
-            f"  {AGENT_WORKSPACE}/archive/                  — completed or inactive project snapshots\n"
-            f"Rules:\n"
-            f"  1. DEFAULT: write ALL files directly at the workspace root (e.g. {AGENT_WORKSPACE}/foo.txt, {AGENT_WORKSPACE}/src/main.py). This is the default for any task that specifies file names or paths.\n"
-            f"  2. EXCEPTION: only use a projects/<slug>/ subdirectory when the user explicitly says 'new project' or 'build me a project' WITHOUT specifying any file paths at all.\n"
-            f"  3. Keywords like 'at workspace root', 'in the workspace', or any explicit filename mean: use the workspace root, not projects/.\n"
-            f"  4. Use bash mkdir -p to create subdirectories before writing files.\n"
-            f"  5. When done, tell the user the full path of every file you created.\n"
-            f"ICS/iCalendar format reminder — use this exact structure:\n"
-            f"  BEGIN:VCALENDAR\\nVERSION:2.0\\nPRODID:-//AgentZero//EN\\nBEGIN:VEVENT\\n"
-            f"  DTSTART:YYYYMMDDTHHmmssZ\\nDTEND:YYYYMMDDTHHmmssZ\\nSUMMARY:Title\\n"
-            f"  DESCRIPTION:Notes\\nATTENDEE:mailto:email@example.com\\nEND:VEVENT\\nEND:VCALENDAR\n"
-            f"  (ATTENDEE uses a colon before mailto, not a semicolon)\n"
-        )
-        if request_freshness_token:
-            universal_instructions += (
-                f"{REQUEST_FRESHNESS_INSTRUCTION}\n"
-                f"[Freshness Token]: {request_freshness_token}\n"
-            )
-        session_suffix = (
-            f"\n\n{session_prompt_suffix}\n" if session_prompt_suffix else ""
-        )
 
-        if custom_prompt:
-            return (
+        context = {
+            "current_time": current_time,
+            "workspace_path": AGENT_WORKSPACE,
+            "memory_context": memory_context,
+            "skills_catalog_context": skills_catalog_context,
+            "active_skills_context": active_skills_context,
+            "request_freshness_token": request_freshness_token,
+            "session_prompt_suffix": session_prompt_suffix,
+            "identity": (
                 custom_prompt
-                + universal_instructions
-                + session_suffix
-                + memory_context
-                + plan_context
-                + example_context
-                + (f"\n\n{skills_catalog_context}" if skills_catalog_context else "")
-                + (f"\n\n{active_skills_context}" if active_skills_context else "")
-            )
+                if custom_prompt
+                else "You are a helpful AI assistant with persistent memory."
+            ),
+            "plan_context": plan_context,
+            "example_context": example_context,
+        }
 
-        skills_catalog_suffix = (
-            f"\n\n{skills_catalog_context}" if skills_catalog_context else ""
-        )
-        active_skills_suffix = (
-            f"\n\n{active_skills_context}" if active_skills_context else ""
-        )
-        return (
-            "You are a helpful AI assistant with persistent memory."
-            f"{universal_instructions}{session_suffix}{memory_context}{plan_context}{example_context}"
-            f"{skills_catalog_suffix}{active_skills_suffix}"
-        )
+        return get_template("system_prompt", context)
 
     def _build_request_freshness_token(self) -> str:
         """Return a unique token for the current visible response generation."""
@@ -2445,9 +2433,46 @@ class AgentHandler:
 
     def _get_session_prompt_suffix(self, session_id: Optional[str]) -> str:
         """Return channel-specific prompt guidance for the active session."""
-        if session_id and session_id.startswith("imessage_"):
-            return IMESSAGE_SYSTEM_PROMPT_SUFFIX
-        return ""
+        if not session_id:
+            return ""
+
+        is_messaging = session_id.startswith("imessage_") or session_id.startswith(
+            "tg_"
+        )
+
+        if not is_messaging:
+            return ""
+
+        return (
+            "\n\nCONVERSATIONAL STYLE — MESSAGING SESSIONS:\n"
+            "You are in a live text conversation, not writing an email or documentation. "
+            "Follow these rules strictly:\n\n"
+            "1. EMOTION FIRST, LOGIC SECOND. When a message carries emotional weight "
+            "(frustration, excitement, sadness, anger, fear, surprise, joy), acknowledge "
+            "the emotion before offering any practical advice. A human reacts to how "
+            "something feels before they solve what happened.\n\n"
+            "2. KEEP REPLIES SHORT. One to three sentences per response. Never dump a "
+            "wall of text. If you have multiple things to say, pick the most emotionally "
+            "relevant one first and let the rest come out naturally across follow-up "
+            "turns.\n\n"
+            "3. SOFT PROBES OVER INFO DUMPS. Instead of listing everything at once, ask "
+            "one gentle follow-up question that lets the user share more. Practical "
+            "details (insurance, next steps, logistics) should come up organically after "
+            "the emotional moment has been addressed — not before.\n\n"
+            "4. MATCH ENERGY. Mirror the user's tone and intensity. If they're casual "
+            "and low-key, be casual. If they're fired up, match that energy with "
+            "sympathy. If they're being funny, lean into it. Never respond to a "
+            "distressed message with clinical detachment.\n\n"
+            '5. NO AI-FLAVORED FILLER. Do not start with "I\'m sorry to hear that" or '
+            '"That sounds difficult." Use real conversational language: "damn," '
+            '"that sucks," "no way," "oh man," "wait really?" — whatever fits '
+            "the moment naturally.\n\n"
+            "6. TASK MODE EXCEPTION. If the user is clearly in task mode (asking you to "
+            "write code, search the web, execute tools, look something up), switch to "
+            "efficient execution mode. Get the job done concisely. The conversational "
+            "style above applies to casual, emotional, or storytelling exchanges — not "
+            "to directed work requests."
+        )
 
     async def _generate_consortium_acknowledgement(
         self,
@@ -2545,22 +2570,25 @@ class AgentHandler:
         request_freshness_token: str = "",
     ) -> tuple[str, dict[str, Any] | None]:
         """Run one model turn in consortium mode."""
-        system_parts = [
-            "You are participating in 'the consortium', a four-persona decision panel.",
-            f"Identity: {member['name']}",
-            f"Core stance: {member['stance']}",
-            f"Personality: {member['persona']}",
-            "Stay strictly in this identity and tone.",
-            "Do not imitate language, priorities, or conclusions from other members.",
-            "Do not reveal or infer hidden identities for prior panel notes.",
-            "Debate rigorously and challenge weak claims.",
-            "Avoid premature consensus and defend independent reasoning.",
-            "If and only if the panel is ready for a final shared verdict, call consortium_agree.",
-            "When calling consortium_agree, include verdict, rationale, confidence (0..1), and key_points.",
-            "After tool calls, provide a short plain-text turn (no markdown).",
-        ]
+        system_content = get_template(
+            "consortium_member",
+            {
+                "member_name": member["name"],
+                "member_stance": member["stance"],
+                "member_persona": member["persona"],
+                "custom_prompt": custom_prompt,
+                "session_prompt_suffix": session_prompt_suffix,
+                "memory_context": memory_context.strip() if memory_context else "",
+                "skills_catalog_context": skills_catalog_context.strip()
+                if skills_catalog_context
+                else "",
+                "active_skills_context": active_skills_context.strip()
+                if active_skills_context
+                else "",
+                "request_freshness_token": request_freshness_token,
+            },
+        )
 
-        # Member-specific temperature differentiates reasoning style while using one model.
         member_temperature = member.get(
             "temperature", BASE_PAYLOAD.get("temperature", 0.6)
         )
@@ -2568,23 +2596,6 @@ class AgentHandler:
             member_temperature = float(member_temperature)
         except (TypeError, ValueError):
             member_temperature = float(BASE_PAYLOAD.get("temperature", 0.6))
-
-        if custom_prompt:
-            system_parts.append(f"User-configured system prompt: {custom_prompt}")
-
-        if session_prompt_suffix:
-            system_parts.append(session_prompt_suffix)
-
-        if memory_context:
-            system_parts.append(memory_context.strip())
-        if skills_catalog_context:
-            system_parts.append(skills_catalog_context.strip())
-        if active_skills_context:
-            system_parts.append(active_skills_context.strip())
-
-        if request_freshness_token:
-            system_parts.append(REQUEST_FRESHNESS_INSTRUCTION)
-            system_parts.append(f"[Freshness Token]: {request_freshness_token}")
 
         if round_number == 1:
             panel_context = "Blind round: produce an independent first-pass analysis using only the user request."
@@ -2604,7 +2615,7 @@ class AgentHandler:
         )
 
         member_messages = [
-            {"role": "system", "content": "\n".join(system_parts)},
+            {"role": "system", "content": system_content},
             {"role": "user", "content": user_prompt},
         ]
 
@@ -2709,25 +2720,21 @@ class AgentHandler:
             if member["member_id"] in agreed_member_ids
         ]
 
-        judge_system_parts = [
-            "You are the judge model for 'the consortium'.",
-            "You receive a transcript from four debating specialist personas.",
-            "Synthesize their arguments into one final plain-text answer for the user.",
-            "Be clear, decisive, and actionable.",
-        ]
-        if custom_prompt:
-            judge_system_parts.append(f"User-configured system prompt: {custom_prompt}")
-        if session_prompt_suffix:
-            judge_system_parts.append(session_prompt_suffix)
-        if memory_context:
-            judge_system_parts.append(memory_context.strip())
-        if skills_catalog_context:
-            judge_system_parts.append(skills_catalog_context.strip())
-        if active_skills_context:
-            judge_system_parts.append(active_skills_context.strip())
-        if request_freshness_token:
-            judge_system_parts.append(REQUEST_FRESHNESS_INSTRUCTION)
-            judge_system_parts.append(f"[Freshness Token]: {request_freshness_token}")
+        judge_system_content = get_template(
+            "consortium_judge",
+            {
+                "custom_prompt": custom_prompt,
+                "session_prompt_suffix": session_prompt_suffix,
+                "memory_context": memory_context.strip() if memory_context else "",
+                "skills_catalog_context": skills_catalog_context.strip()
+                if skills_catalog_context
+                else "",
+                "active_skills_context": active_skills_context.strip()
+                if active_skills_context
+                else "",
+                "request_freshness_token": request_freshness_token,
+            },
+        )
 
         judge_user_prompt = (
             f"Original user request:\n{user_query}\n\n"
@@ -2745,7 +2752,7 @@ class AgentHandler:
         judge_payload["model"] = CONSORTIUM_MODEL_ID
         judge_payload["tools"] = []
         judge_payload["messages"] = [
-            {"role": "system", "content": "\n".join(judge_system_parts)},
+            {"role": "system", "content": judge_system_content},
             {"role": "user", "content": judge_user_prompt},
         ]
 
@@ -3029,23 +3036,18 @@ class AgentHandler:
             "role": "system",
             "content": system_content,
         }
-
-        # Build rolling context window
         messages = self._build_rolling_context(
             system_message=system_message,
             current_messages=data.get("messages", []),
             session_id=session_id,
-            context_window=128000,  # Kimi K2 context window
+            context_window=128000,
             buffer_tokens=2000,
         )
-
-        # Create a fresh payload for this request (avoid global mutation)
         payload_template = self._build_request_payload_template()
         current_payload = payload_template.copy()
         current_payload["messages"] = messages
 
         async with aiohttp.ClientSession() as session:
-            # Make initial API call with retry logic
             response_data = await api_call_with_retry(
                 session,
                 BASE_URL,
@@ -3071,32 +3073,32 @@ class AgentHandler:
 
             content = self._finalize_visible_response(content, session_id)
 
-            # Store conversation in memory
-            if session_id and user_query:
-                self.memory_store.add_conversation_message(
-                    role="user",
-                    content=user_query,
-                    session_id=session_id,
-                    metadata=normalized_request_metadata or None,
-                )
-            if session_id and content:
-                self.memory_store.add_conversation_message(
-                    role="assistant", content=content, session_id=session_id
-                )
-
-            await self._run_memory_maintenance(
-                session=session,
+        # Store conversation in memory
+        if session_id and user_query:
+            self.memory_store.add_conversation_message(
+                role="user",
+                content=user_query,
                 session_id=session_id,
-                user_query=user_query,
-                assistant_response=content,
+                metadata=normalized_request_metadata or None,
+            )
+        if session_id and content:
+            self.memory_store.add_conversation_message(
+                role="assistant", content=content, session_id=session_id
             )
 
-            # Provide feedback on examples if task was completed
-            if task and content and not content.startswith("Error:"):
-                self.example_bank.auto_feedback(task.type, success=True, efficiency=1.0)
+        await self._run_memory_maintenance(
+            session=session,
+            session_id=session_id,
+            user_query=user_query,
+            assistant_response=content,
+        )
 
-            print(content)
-            return content
+        # Provide feedback on examples if task was completed
+        if task and content and not content.startswith("Error:"):
+            self.example_bank.auto_feedback(task.type, success=True, efficiency=1.0)
+
+        print(content)
+        return content
 
     def _build_rolling_context(
         self,

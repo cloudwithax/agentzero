@@ -16,6 +16,18 @@ async def test_tools_work():
     assert result["success"], f"Read failed: {result}"
     print(f"✓ read works, got {len(result['content'])} bytes")
 
+    sliced = await TOOLS["read"](filepath="AGENTS.md", limit=1)
+    assert sliced["success"], f"Read slice failed: {sliced}"
+    assert sliced["content"].startswith("# AgentZero"), f"Unexpected slice: {sliced}"
+    print("✓ read supports model-style limit slicing")
+
+    sliced_with_offset = await TOOLS["read"](filepath="AGENTS.md", offset=1, limit=1)
+    assert sliced_with_offset["success"], f"Read offset slice failed: {sliced_with_offset}"
+    assert sliced_with_offset["content"].startswith("# AgentZero"), (
+        f"Unexpected offset slice: {sliced_with_offset}"
+    )
+    print("✓ read supports human-friendly offset slicing")
+
     # Test glob
     result = await TOOLS["glob"](pattern="*.py")
     assert result["success"]
@@ -23,10 +35,22 @@ async def test_tools_work():
     print(f"✓ glob works, found {len(result['matches'])} files")
 
     # Test grep
-    result = await TOOLS["grep"](pattern="import")
+    result = await TOOLS["grep"](pattern="import", path="tests")
     assert result["success"]
     assert len(result["matches"]) > 0
     print(f"✓ grep works, found {len(result['matches'])} matches")
+
+    include_result = await TOOLS["grep"](
+        pattern="Pitfall:",
+        path=".",
+        include="AGENTS.md",
+        max_matches=1,
+    )
+    assert include_result["success"], f"Grep include failed: {include_result}"
+    assert len(include_result["matches"]) == 1, (
+        f"Unexpected grep include matches: {include_result}"
+    )
+    print("✓ grep supports include/max_matches arguments")
 
     # Test bash
     result = await TOOLS["bash"](command="echo 'test'")

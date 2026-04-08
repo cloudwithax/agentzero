@@ -21,6 +21,11 @@ async def test_tools():
         f"Read result: success={result.get('success')}, content length={len(result.get('content', '')) if result.get('success') else 'N/A'}"
     )
 
+    sliced = await read_file_tool("AGENTS.md", limit=1)
+    print(
+        f"Read slice result: success={sliced.get('success')}, first line={sliced.get('content', '').strip()!r}"
+    )
+
     # Test glob
     result = await glob_tool("*.py")
     print(
@@ -31,6 +36,11 @@ async def test_tools():
     result = await grep_tool("import")
     print(
         f"Grep result: success={result.get('success')}, matches count={len(result.get('matches', []))}"
+    )
+
+    result = await grep_tool("Pitfall:", path=".", include="AGENTS.md", max_matches=1)
+    print(
+        f"Grep include result: success={result.get('success')}, matches count={len(result.get('matches', []))}"
     )
 
     # Test bash

@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import inspect
 import mimetypes
 import json
 import logging
@@ -1801,7 +1802,9 @@ async def _attachment_url_to_base64_data_url(
                 )
 
             if not content_type:
-                logger.warning("Skipping non-image attachment URL: %s", normalized_source)
+                logger.warning(
+                    "Skipping non-image attachment URL: %s", normalized_source
+                )
                 return None
 
         source_extension = _guess_source_extension(content_type, normalized_source)
@@ -1827,7 +1830,9 @@ async def _attachment_url_to_base64_data_url(
         return None
 
 
-def _apply_image_attachment_limit(text: str, attachment_urls: list[str]) -> tuple[str, list[str]]:
+def _apply_image_attachment_limit(
+    text: str, attachment_urls: list[str]
+) -> tuple[str, list[str]]:
     """Normalize and clamp inbound image attachments to the configured maximum."""
     normalized_text = (text or "").strip()
     normalized_attachments = _normalize_attachment_urls(attachment_urls)
@@ -2294,6 +2299,8 @@ async def send_imessage(
     message_text = str(delivery_plan[0].get("text", ""))
 
     normalized_media_urls = _normalize_attachment_urls(media_urls)
+    if not message_text.strip() and not normalized_media_urls:
+        return {"success": True, "skipped": True, "reason": "empty payload"}
 
     close_session = False
     if session is None:
@@ -2708,7 +2715,10 @@ def _is_sendblue_invalid_typing_webhook_type_error(result: dict[str, Any]) -> bo
         if isinstance(raw_error, str):
             message = raw_error.strip().lower()
 
-    return "invalid webhook type" in message and "typing_indicator" in message
+    if "invalid webhook type" not in message:
+        return False
+
+    return "typing_indicator" in message or "must be one of:" in message
 
 
 async def ensure_sendblue_receive_webhook(
@@ -2979,23 +2989,32 @@ async def process_imessage_and_reply(
         )
 
         stop_typing = asyncio.Event()
+        # Dedicated session for typing indicators so they don't compete
+        # with the handler's API calls on the shared session.
+        typing_session = aiohttp.ClientSession()
 
         async def _typing_loop():
             try:
                 while not stop_typing.is_set():
                     typing_res = await send_typing_indicator(
-                        phone_number, session=session
+                        phone_number, session=typing_session
                     )
                     if stop_typing.is_set():
                         break
                     if not typing_res.get("success"):
                         logger.debug("Typing indicator failed: %s", typing_res)
                     try:
-                        await asyncio.wait_for(stop_typing.wait(), timeout=4)
+                        await asyncio.wait_for(stop_typing.wait(), timeout=2)
                     except asyncio.TimeoutError:
                         continue
             except asyncio.CancelledError:
                 return
+            finally:
+                close = getattr(typing_session, "close", None)
+                if callable(close):
+                    maybe_close = close()
+                    if inspect.isawaitable(maybe_close):
+                        await maybe_close
 
         typing_task = asyncio.create_task(_typing_loop())
 
@@ -3041,14 +3060,27 @@ async def process_imessage_and_reply(
             if not send_res.get("success"):
                 logger.error("Failed to send interim Sendblue reply: %s", send_res)
 
+        _request_timeout = _env_int("REQUEST_TIMEOUT_SECONDS", 600, minimum=60)
+
         try:
-            resp = await handle_imessage(
-                handler,
-                phone_number,
-                user_content,
-                interim_response_callback=_send_interim_response,
-                message_handle=message_handle,
-                part_index=part_index,
+            resp = await asyncio.wait_for(
+                handle_imessage(
+                    handler,
+                    phone_number,
+                    user_content,
+                    interim_response_callback=_send_interim_response,
+                    message_handle=message_handle,
+                    part_index=part_index,
+                ),
+                timeout=_request_timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "Request timed out after %ds for %s", _request_timeout, phone_number
+            )
+            resp = (
+                "Error: Request timed out — the task was too complex to complete "
+                "within the time limit. Please try breaking it into smaller steps."
             )
         finally:
             await _stop_typing_loop("response_ready")
@@ -3141,6 +3173,11 @@ async def start_sendblue_webhook_server(
                 # Some webhook providers may send form-encoded payloads.
                 form_data = await request.post()
                 data = dict(form_data)
+
+            logger.debug(
+                "Raw Sendblue webhook payload:\n%s",
+                json.dumps(data, indent=2, default=str),
+            )
 
             sender_number = _extract_sendblue_sender_number(data)
             raw_content = (

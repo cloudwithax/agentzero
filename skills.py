@@ -88,19 +88,55 @@ def _coerce_scalar(value: str) -> str:
 def _parse_frontmatter_fallback(frontmatter_text: str) -> dict[str, Any]:
     """Minimal parser for expected Skill frontmatter fields.
 
-    Supports top-level `key: value` pairs and one-level `metadata:` mappings.
+    Supports top-level `key: value` pairs, one-level `metadata:` mappings,
+    and YAML block scalars (folded `>` and literal `|`).
     """
     parsed: dict[str, Any] = {}
     metadata: dict[str, str] = {}
     in_metadata = False
+    # Track block scalar collection (YAML `>` or `|` indicators).
+    block_key: Optional[str] = None
+    block_lines: list[str] = []
+    block_folded: bool = False  # True for `>`, False for `|`
+
+    def _flush_block() -> None:
+        """Commit any accumulated block scalar to `parsed`."""
+        nonlocal block_key, block_lines, block_folded
+        if block_key is not None and block_lines:
+            if block_folded:
+                # Folded: join lines with spaces (like YAML `>`)
+                parsed[block_key] = " ".join(block_lines)
+            else:
+                # Literal: preserve newlines (like YAML `|`)
+                parsed[block_key] = "\n".join(block_lines)
+        block_key = None
+        block_lines = []
+        block_folded = False
 
     for raw_line in frontmatter_text.splitlines():
         line = raw_line.rstrip("\n")
         stripped = line.strip()
+
+        is_indented = line.startswith(" ") or line.startswith("\t")
+
+        # Collect continuation lines for a block scalar.
+        if block_key is not None:
+            if is_indented and stripped:
+                block_lines.append(stripped)
+                continue
+            elif not stripped:
+                # Blank line inside a block scalar: preserve for literal,
+                # treat as paragraph break for folded.
+                if not block_folded:
+                    block_lines.append("")
+                continue
+            else:
+                # Non-indented, non-empty line → block is over.
+                _flush_block()
+
         if not stripped or stripped.startswith("#"):
             continue
 
-        is_indented = line.startswith(" ") or line.startswith("\t")
         if in_metadata and is_indented:
             if ":" not in stripped:
                 continue
@@ -125,7 +161,17 @@ def _parse_frontmatter_fallback(frontmatter_text: str) -> dict[str, Any]:
             in_metadata = True
             continue
 
+        # Detect YAML block scalar indicators (`>` or `|`).
+        if value in (">", "|", ">-", "|-"):
+            block_key = key
+            block_lines = []
+            block_folded = value.startswith(">")
+            continue
+
         parsed[key] = _coerce_scalar(value)
+
+    # Flush any trailing block scalar at end of frontmatter.
+    _flush_block()
 
     if metadata:
         parsed["metadata"] = metadata
@@ -529,6 +575,7 @@ class SkillRegistry:
         lines = [
             "The following skills provide specialized instructions for specific tasks.",
             "When a task matches a skill's description, call activate_skill with the skill name before proceeding.",
+            "After activating a skill, you will receive its full instructions in the tool result. You MUST read and follow those instructions step-by-step to complete the user's request.",
             "When a skill references relative paths, resolve them against the skill directory and use absolute paths in tool calls.",
             "",
             "<available_skills>",

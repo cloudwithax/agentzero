@@ -3,16 +3,17 @@
 import asyncio
 import json
 import sys
-from unittest.mock import AsyncMock
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
-sys.path.insert(0, "/home/clxud/Documents/github/agentzero")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from api import (
     _apply_cache_busting_headers,
     api_call_with_retry,
     execute_tool_calls,
     process_response,
 )
-from handler import BASE_URL, API_KEY, BASE_PAYLOAD
+from handler import BASE_URL, API_KEY, BASE_PAYLOAD, FINAL_RESPONSE_MAX_TOKENS
 
 
 def test_cache_busting_headers_are_applied() -> None:
@@ -178,9 +179,9 @@ async def test_api_call_with_retry_streams_tool_calls():
 
     tool_calls = response_data["choices"][0]["message"].get("tool_calls") or []
     assert len(tool_calls) == 1, f"Unexpected tool calls: {tool_calls}"
-    assert (
-        tool_calls[0]["function"]["name"] == "bash"
-    ), f"Unexpected tool call: {tool_calls[0]}"
+    assert tool_calls[0]["function"]["name"] == "bash", (
+        f"Unexpected tool call: {tool_calls[0]}"
+    )
     assert tool_calls[0]["function"]["arguments"] == '{"command": "echo hi"}'
     print("  ✓ Passed")
 
@@ -192,7 +193,9 @@ async def test_api_call_with_retry_does_not_add_nvcf_header():
     captured_headers: dict[str, str] = {}
 
     class MockResponse:
-        async def json(self):
+        status = 200
+
+        async def json(self, content_type=None):
             return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
 
     class MockPostCM:
@@ -328,9 +331,10 @@ async def test_tool_calls():
         ]
     }
 
-    # Create proper async context manager mock
     class MockResponse:
-        async def json(self):
+        status = 200
+
+        async def json(self, content_type=None):
             return second_response
 
     class MockPostCM:
@@ -402,7 +406,9 @@ async def test_multiple_tool_calls():
     }
 
     class MockResponse:
-        async def json(self):
+        status = 200
+
+        async def json(self, content_type=None):
             return second_response
 
     class MockPostCM:
@@ -467,7 +473,9 @@ async def test_unknown_tool():
     }
 
     class MockResponse:
-        async def json(self):
+        status = 200
+
+        async def json(self, content_type=None):
             return second_response
 
     class MockPostCM:
@@ -570,7 +578,9 @@ async def test_message_history_preservation():
     }
 
     class MockResponse:
-        async def json(self):
+        status = 200
+
+        async def json(self, content_type=None):
             return second_response
 
     class MockPostCM:
@@ -594,9 +604,9 @@ async def test_message_history_preservation():
 
     # Messages should be extended with assistant tool_calls + tool result
     # Original: 2 messages, after: 2 + 1 (assistant) + 1 (tool) = 4
-    assert (
-        len(messages) == original_len + 2
-    ), f"Messages not extended properly: {len(messages)}"
+    assert len(messages) == original_len + 2, (
+        f"Messages not extended properly: {len(messages)}"
+    )
     assert messages[2].get("tool_calls") is not None, "Missing tool_calls"
     assert messages[3]["role"] == "tool", "Missing tool result"
 
@@ -628,8 +638,9 @@ async def test_tool_leak_retry():
     class MockResponse:
         def __init__(self, payload):
             self.payload = payload
+            self.status = 200
 
-        async def json(self):
+        async def json(self, content_type=None):
             return self.payload
 
     class MockPostCM:
@@ -658,9 +669,9 @@ async def test_tool_leak_retry():
     )
 
     assert content == "All set, I fixed it.", f"Unexpected content: {content}"
-    assert (
-        mock_session.calls == 1
-    ), f"Expected one follow-up call, got {mock_session.calls}"
+    assert mock_session.calls == 1, (
+        f"Expected one follow-up call, got {mock_session.calls}"
+    )
     tool_results = [m for m in messages if m.get("role") == "tool"]
     assert len(tool_results) == 1, "Expected inferred bash tool result in history"
     print("  ✓ Passed")
@@ -682,7 +693,9 @@ async def test_tool_leak_fallback():
     }
 
     class MockResponse:
-        async def json(self):
+        status = 200
+
+        async def json(self, content_type=None):
             return leaked_response
 
     class MockPostCM:
@@ -710,9 +723,9 @@ async def test_tool_leak_fallback():
         max_tool_leak_retries=1,
     )
 
-    assert (
-        "internal formatting issue" in content.lower()
-    ), f"Unexpected content: {content}"
+    assert "internal formatting issue" in content.lower(), (
+        f"Unexpected content: {content}"
+    )
     print("  ✓ Passed")
 
 
@@ -745,8 +758,9 @@ async def test_json_tool_call_recovery():
     class MockResponse:
         def __init__(self, payload):
             self.payload = payload
+            self.status = 200
 
-        async def json(self):
+        async def json(self, content_type=None):
             return self.payload
 
     class MockPostCM:
@@ -774,15 +788,267 @@ async def test_json_tool_call_recovery():
         first_response, messages, mock_session, BASE_URL, API_KEY, BASE_PAYLOAD.copy()
     )
 
-    assert (
-        content == "Recovered and executed successfully."
-    ), f"Unexpected content: {content}"
-    assert (
-        mock_session.calls == 1
-    ), f"Expected one follow-up call, got {mock_session.calls}"
+    assert content == "Recovered and executed successfully.", (
+        f"Unexpected content: {content}"
+    )
+    assert mock_session.calls == 1, (
+        f"Expected one follow-up call, got {mock_session.calls}"
+    )
     tool_results = [m for m in messages if m.get("role") == "tool"]
     assert len(tool_results) == 1, "Expected recovered tool result in history"
     print("  ✓ Passed")
+
+
+async def test_complex_multi_round_agentic_flow() -> None:
+    """Complex tasks should survive narration and multiple tool rounds."""
+    print("Test 12: Complex multi-round agentic flow")
+
+    initial_response = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": (
+                        "let me inspect the reminder state and run the publish step now."
+                    ),
+                }
+            }
+        ]
+    }
+
+    followup_responses = [
+        {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_check_state",
+                                "type": "function",
+                                "function": {
+                                    "name": "bash",
+                                    "arguments": json.dumps(
+                                        {"command": "echo reminder state clean"}
+                                    ),
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        },
+        {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_publish",
+                                "type": "function",
+                                "function": {
+                                    "name": "bash",
+                                    "arguments": json.dumps(
+                                        {
+                                            "command": "echo https://cedar-canopy-ytnp.here.now/"
+                                        }
+                                    ),
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        },
+        {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": (
+                            "Reminder state is clean and the site is live at "
+                            "https://cedar-canopy-ytnp.here.now/."
+                        ),
+                    }
+                }
+            ]
+        },
+    ]
+
+    tool_results = [
+        [
+            {
+                "tool_call_id": "call_check_state",
+                "role": "tool",
+                "content": json.dumps(
+                    {"success": True, "stdout": "reminder state clean\n"}
+                ),
+            }
+        ],
+        [
+            {
+                "tool_call_id": "call_publish",
+                "role": "tool",
+                "content": json.dumps(
+                    {
+                        "success": True,
+                        "stdout": "https://cedar-canopy-ytnp.here.now/\n",
+                    }
+                ),
+            }
+        ],
+    ]
+
+    async def fake_api_call_with_retry(*args, **kwargs):
+        assert followup_responses, "Unexpected extra follow-up API call"
+        return followup_responses.pop(0)
+
+    execute_tool_calls = AsyncMock(side_effect=tool_results)
+    messages = [{"role": "user", "content": "Check reminders, publish, and summarize"}]
+
+    with (
+        patch("agentic_loop.api_call_with_retry", side_effect=fake_api_call_with_retry),
+        patch("agentic_loop.execute_tool_calls", execute_tool_calls),
+    ):
+        content = await process_response(
+            initial_response,
+            messages,
+            AsyncMock(),
+            BASE_URL,
+            API_KEY,
+            BASE_PAYLOAD.copy(),
+        )
+
+    assert "Reminder state is clean" in content
+    assert "https://cedar-canopy-ytnp.here.now/" in content
+    assert execute_tool_calls.await_count == 2
+    tool_messages = [message for message in messages if message.get("role") == "tool"]
+    assert len(tool_messages) == 2, f"Expected two tool results, got {tool_messages}"
+    assert any(
+        "did not make any tool calls" in message.get("content", "")
+        for message in messages
+        if message.get("role") == "user"
+    ), "Expected narration nudge in message history"
+    print("  ✓ Passed")
+
+
+async def test_initial_payload_has_sufficient_max_tokens_for_complex_requests() -> None:
+    """Regression: complex multi-step requests (e.g. 'make a website') must not be
+    truncated by a low max_tokens limit on the initial API call.
+
+    Before the fix, handler.py applied FINAL_RESPONSE_MAX_TOKENS (150) to the
+    initial payload, which truncated the model's tool-call response for complex
+    tasks and caused 'Error: No response from API'.
+    """
+    print("Test 13: Initial payload has sufficient max_tokens for complex requests")
+
+    from handler import AgentHandler
+
+    tmp = Path("/tmp/test_max_tokens_regression.db")
+    tmp.touch()
+
+    try:
+        from memory import EnhancedMemoryStore
+        from capabilities import CapabilityProfile, AdaptiveFormatter
+        from examples import AdaptiveFewShotManager, ExampleBank
+        from planning import TaskPlanner, TaskAnalyzer
+
+        store = EnhancedMemoryStore(db_path=str(tmp), api_key="test")
+        profile = CapabilityProfile(set(), model_name="test")
+        planner = TaskPlanner(profile)
+        analyzer = TaskAnalyzer()
+        formatter = AdaptiveFormatter(profile)
+        examples_manager = AdaptiveFewShotManager(ExampleBank())
+
+        handler_instance = AgentHandler(
+            memory_store=store,
+            capability_profile=profile,
+            example_bank=examples_manager,
+            task_planner=planner,
+            task_analyzer=analyzer,
+            adaptive_formatter=formatter,
+        )
+
+        captured_payloads: list[dict] = []
+
+        async def _capture_payload(_session, _url, payload, _headers, **_kw):
+            captured_payloads.append(dict(payload))
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "I'll build that for you.",
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "write",
+                                        "arguments": json.dumps(
+                                            {
+                                                "filepath": "workspace/index.html",
+                                                "content": "<html>...</html>",
+                                            }
+                                        ),
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            }
+
+        async def _fake_execute_tools(message, **_kw):
+            return [
+                {
+                    "tool_call_id": "call_1",
+                    "role": "tool",
+                    "content": json.dumps({"success": True}),
+                }
+            ]
+
+        with (
+            patch(
+                "handler.api_call_with_retry",
+                new=AsyncMock(side_effect=_capture_payload),
+            ),
+            patch(
+                "agentic_loop.execute_tool_calls",
+                new=AsyncMock(side_effect=_fake_execute_tools),
+            ),
+            patch.object(store, "search_memories", new=AsyncMock(return_value=[])),
+        ):
+            result = await handler_instance.handle(
+                {
+                    "messages": [
+                        {"role": "user", "content": "make a 3d dice roller website"}
+                    ]
+                },
+                session_id="test_session",
+            )
+
+            assert len(captured_payloads) >= 1, "Expected at least one API call"
+            initial = captured_payloads[0]
+            initial_max_tokens = initial.get("max_tokens", 0)
+
+            assert initial_max_tokens >= 8000, (
+                f"Initial payload max_tokens={initial_max_tokens} is too low for "
+                f"complex multi-step requests; the model needs enough budget to emit "
+                f"complete tool calls (function name + JSON arguments). "
+                f"FINAL_RESPONSE_MAX_TOKENS ({FINAL_RESPONSE_MAX_TOKENS}) should NOT "
+                f"be applied to the initial payload."
+            )
+
+            assert "Error: No response from API" not in (result or "")
+
+        print("  ✓ Passed")
+
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 async def main():
@@ -807,6 +1073,8 @@ async def main():
     await test_tool_leak_retry()
     await test_tool_leak_fallback()
     await test_json_tool_call_recovery()
+    await test_complex_multi_round_agentic_flow()
+    await test_initial_payload_has_sufficient_max_tokens_for_complex_requests()
 
     print()
     print("=" * 60)

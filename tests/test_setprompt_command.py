@@ -56,7 +56,7 @@ async def test_setprompt_command_flow():
         assert 12345 in pending_prompt_users
         
         # Reset mock
-        mock_message.reply_text.reset_amock()
+        mock_message.reply_text.reset_mock()
         
         # Create mock update for the actual prompt message
         mock_update2 = MagicMock()

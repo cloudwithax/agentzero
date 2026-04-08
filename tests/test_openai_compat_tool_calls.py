@@ -4,8 +4,9 @@
 import asyncio
 import json
 import sys
+from pathlib import Path
 
-sys.path.insert(0, "/home/clxud/Documents/github/agentzero")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from aiohttp.test_utils import TestClient, TestServer
 from unittest.mock import AsyncMock, patch
@@ -78,8 +79,9 @@ class ToolCallingHandler:
         class MockResponse:
             def __init__(self, payload):
                 self.payload = payload
+                self.status = 200
 
-            async def json(self):
+            async def json(self, content_type=None):
                 return self.payload
 
         class MockPostCM:

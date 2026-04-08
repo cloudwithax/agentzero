@@ -447,6 +447,11 @@ async def api_call_with_retry(
                 else:
                     response_data = await resp.json(content_type=None)
 
+                logger.debug(
+                    "Raw API response:\n%s",
+                    json.dumps(response_data, indent=2, default=str),
+                )
+
                 # Handle NVIDIA/non-standard rate-limit format: {"status": 429, "title": "..."}
                 if resp.status == 429 or response_data.get("status") == 429:
                     if attempt < max_retries - 1:
@@ -537,13 +542,49 @@ async def execute_tool_calls(
         if func_name in TOOLS:
             try:
                 result = await TOOLS[func_name](**func_args)
-                tool_results.append(
-                    {
-                        "tool_call_id": tool_call["id"],
-                        "role": "tool",
-                        "content": json.dumps(result),
-                    }
-                )
+
+                # When activate_skill succeeds with content, surface the
+                # skill instructions as prominent text so the model treats
+                # them as actionable directives rather than a passive JSON
+                # acknowledgment.  This aligns with the Agent Skills spec's
+                # progressive-disclosure model: once a skill is triggered,
+                # its instructions must enter the context window in a form
+                # the model will follow.
+                if (
+                    func_name == "activate_skill"
+                    and isinstance(result, dict)
+                    and result.get("success")
+                    and result.get("content")
+                    and not result.get("already_active")
+                ):
+                    skill_name = result.get("name", "unknown")
+                    skill_dir = result.get("skill_dir", "")
+                    skill_content = result["content"]
+                    tool_result_text = (
+                        f"[Skill '{skill_name}' activated successfully]\n"
+                        f"Skill directory: {skill_dir}\n\n"
+                        f"You MUST follow the instructions below for the current task.\n"
+                        f"--- BEGIN SKILL INSTRUCTIONS ---\n"
+                        f"{skill_content}\n"
+                        f"--- END SKILL INSTRUCTIONS ---\n\n"
+                        f"Now proceed with the user's request, following the skill "
+                        f"instructions above."
+                    )
+                    tool_results.append(
+                        {
+                            "tool_call_id": tool_call["id"],
+                            "role": "tool",
+                            "content": tool_result_text,
+                        }
+                    )
+                else:
+                    tool_results.append(
+                        {
+                            "tool_call_id": tool_call["id"],
+                            "role": "tool",
+                            "content": json.dumps(result),
+                        }
+                    )
             except Exception as e:
                 logger.error(f"Tool execution error for {func_name}: {e}")
                 tool_results.append(

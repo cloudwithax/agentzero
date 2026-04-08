@@ -12,7 +12,7 @@ from capabilities import AdaptiveFormatter, Capability, CapabilityProfile
 from examples import AdaptiveFewShotManager, ExampleBank
 from handler import (
     AgentHandler,
-    IMESSAGE_SYSTEM_PROMPT_SUFFIX,
+    FINAL_RESPONSE_MAX_TOKENS,
     REQUEST_FRESHNESS_INSTRUCTION,
 )
 from memory import EnhancedMemoryStore
@@ -431,10 +431,10 @@ async def test_imessage_session_injects_mobile_prompt_defaults() -> None:
     try:
         _, handler = _create_store_and_handler(tmp.name)
 
-        captured_payload: dict[str, object] = {}
+        captured_payloads: list[dict[str, object]] = []
 
         async def _fake_api_call(_session, _url, payload, _headers, **_kwargs):
-            captured_payload["messages"] = payload.get("messages", [])
+            captured_payloads.append(dict(payload))
             return {"id": "fake", "choices": [{"message": {"role": "assistant"}}]}
 
         with (
@@ -452,9 +452,18 @@ async def test_imessage_session_injects_mobile_prompt_defaults() -> None:
             )
 
             assert imessage_result == "ok"
-            assert captured_payload.get("messages")
-            imessage_system_content = str(captured_payload["messages"][0]["content"])
-            assert IMESSAGE_SYSTEM_PROMPT_SUFFIX in imessage_system_content
+            initial_payload = captured_payloads[0]
+            assert initial_payload.get("max_tokens") != FINAL_RESPONSE_MAX_TOKENS, (
+                f"Initial payload must NOT use the capped {FINAL_RESPONSE_MAX_TOKENS} limit "
+                f"(which truncates tool-call responses for complex requests); "
+                f"got max_tokens={initial_payload.get('max_tokens')}"
+            )
+            assert initial_payload.get("max_tokens") == 32768
+            imessage_system_content = str(initial_payload["messages"][0]["content"])
+            assert (
+                "iMessage" not in imessage_system_content
+                or "phone screen" not in imessage_system_content
+            )
 
             telegram_result = await handler.handle(
                 {"messages": [{"role": "user", "content": "Quick status?"}]},
@@ -462,11 +471,18 @@ async def test_imessage_session_injects_mobile_prompt_defaults() -> None:
             )
 
             assert telegram_result == "ok"
-            assert captured_payload.get("messages")
-            telegram_system_content = str(captured_payload["messages"][0]["content"])
-            assert IMESSAGE_SYSTEM_PROMPT_SUFFIX not in telegram_system_content
+            tg_initial_payload = captured_payloads[1]
+            assert tg_initial_payload.get("max_tokens") != FINAL_RESPONSE_MAX_TOKENS
+            assert tg_initial_payload.get("max_tokens") == 32768
+            tg_system_content = str(tg_initial_payload["messages"][0]["content"])
+            assert (
+                "iMessage" not in tg_system_content
+                or "phone screen" not in tg_system_content
+            )
 
-        print("✓ iMessage session prompt defaults are injected conditionally")
+        print(
+            "✓ Initial responses use full max_tokens (4096) so tool calls are not truncated"
+        )
     finally:
         if os.path.exists(tmp.name):
             os.remove(tmp.name)
@@ -631,6 +647,57 @@ async def test_handle_strips_delivery_directives_from_response() -> None:
             os.remove(tmp.name)
 
 
+async def test_handle_strips_internal_prompt_residue_from_response() -> None:
+    print("=== Test: handle strips internal prompt residue from response ===")
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+    tmp.close()
+
+    try:
+        _, handler = _create_store_and_handler(tmp.name)
+
+        leaked_response = (
+            "first reply. "
+            "Tool execution is mandatory. "
+            "No more loops, no more narration — just the reaction."
+        )
+
+        with (
+            patch.object(
+                handler.memory_store, "search_memories", new=AsyncMock(return_value=[])
+            ),
+            patch(
+                "handler.api_call_with_retry",
+                new=AsyncMock(
+                    return_value={
+                        "id": "fake",
+                        "choices": [{"message": {"role": "assistant"}}],
+                    }
+                ),
+            ),
+            patch(
+                "handler.process_response", new=AsyncMock(return_value=leaked_response)
+            ),
+        ):
+            result = await handler.handle(
+                {"messages": [{"role": "user", "content": "Respond briefly"}]},
+                session_id="tg_1001",
+            )
+
+        assert result == "first reply."
+
+        history = handler.memory_store.get_conversation_history(
+            session_id="tg_1001",
+            limit=5,
+        )
+        assistant_rows = [row for row in history if row.get("role") == "assistant"]
+        assert assistant_rows
+        assert assistant_rows[0].get("content") == "first reply."
+        print("✓ internal prompt residue is removed from visible responses and memory")
+    finally:
+        if os.path.exists(tmp.name):
+            os.remove(tmp.name)
+
+
 async def main() -> int:
     await test_auto_memory_cadence_bounds()
     await test_dream_profile_and_consolidation_helpers()
@@ -641,6 +708,7 @@ async def main() -> int:
     await test_imessage_handle_ids_are_injected_and_persisted()
     await test_handle_injects_request_freshness_token()
     await test_handle_strips_delivery_directives_from_response()
+    await test_handle_strips_internal_prompt_residue_from_response()
     print("\nAll memory-maintenance tests passed")
     return 0
 

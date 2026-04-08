@@ -99,6 +99,15 @@ def test_detect_invalid_sendblue_typing_webhook_type_error() -> None:
             },
         }
     )
+    assert _is_sendblue_invalid_typing_webhook_type_error(
+        {
+            "success": False,
+            "data": {
+                "status": "ERROR",
+                "message": "Invalid webhook type. Must be one of: receive, call_log",
+            },
+        }
+    )
     assert not _is_sendblue_invalid_typing_webhook_type_error(
         {"status": 500, "error": "temporary error"}
     )
@@ -207,6 +216,52 @@ async def test_send_imessage_normalizes_content_before_send() -> None:
     assert result.get("success") is True
     assert fake_session.payload is not None
     assert fake_session.payload.get("content") == "line one\r\rline two"
+
+
+async def test_send_imessage_skips_empty_payload() -> None:
+    """send_imessage should not call Sendblue when there is nothing to send."""
+
+    class _FakeSession:
+        def __init__(self):
+            self.post_calls = 0
+
+        def post(self, _url: str, json=None, headers=None):
+            self.post_calls += 1
+            raise AssertionError("send_imessage should skip empty payloads")
+
+    previous_api_key = os.environ.get("SENDBLUE_API_KEY")
+    previous_api_secret = os.environ.get("SENDBLUE_API_SECRET")
+    previous_number = os.environ.get("SENDBLUE_NUMBER")
+
+    os.environ["SENDBLUE_API_KEY"] = "test-key"
+    os.environ["SENDBLUE_API_SECRET"] = "test-secret"
+    os.environ["SENDBLUE_NUMBER"] = "+15550001111"
+
+    fake_session = _FakeSession()
+    try:
+        result = await send_imessage(
+            "+15551234567",
+            "",
+            session=fake_session,
+        )
+    finally:
+        if previous_api_key is None:
+            os.environ.pop("SENDBLUE_API_KEY", None)
+        else:
+            os.environ["SENDBLUE_API_KEY"] = previous_api_key
+
+        if previous_api_secret is None:
+            os.environ.pop("SENDBLUE_API_SECRET", None)
+        else:
+            os.environ["SENDBLUE_API_SECRET"] = previous_api_secret
+
+        if previous_number is None:
+            os.environ.pop("SENDBLUE_NUMBER", None)
+        else:
+            os.environ["SENDBLUE_NUMBER"] = previous_number
+
+    assert result == {"success": True, "skipped": True, "reason": "empty payload"}
+    assert fake_session.post_calls == 0
 
 
 async def test_send_reaction_posts_expected_payload() -> None:
@@ -895,6 +950,7 @@ async def main() -> int:
     test_split_outbound_message_chunks_ignores_typing_directives()
     test_sendblue_unread_detection()
     await test_send_imessage_normalizes_content_before_send()
+    await test_send_imessage_skips_empty_payload()
     await test_send_reaction_posts_expected_payload()
     await test_auto_tapback_sends_when_relevant_and_random_passes()
     await test_send_imessage_sends_explicit_message_blocks_separately()
