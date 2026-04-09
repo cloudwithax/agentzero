@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BRUTAL DICE - 3D Digital Roller</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@300;500;700&display=swap');
+        
+        :root {
+            --concrete-gray: #2a2a2a;
+            --concrete-light: #3a3a3a;
+            --neon-cyan: #00ffff;
+            --neon-magenta: #ff00ff;
+            --neon-yellow: #ffff00;
+            --shadow-deep: rgba(0, 0, 0, 0.8);
+            --glow-cyan: 0 0 20px #00ffff, 0 0 40px #00ffff;
+            --glow-magenta: 0 0 20px #ff00ff, 0 0 40px #ff00ff;
+        }
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Rajdhani', monospace;
+            background: linear-gradient(135deg, var(--concrete-gray) 0%, #1a1a1a 100%);
+            color: var(--neon-cyan);
+            min-height: 100vh;
+            overflow-x: hidden;
+            position: relative;
+        }
+        
+        body::before {
+            content: '';
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: 
+                repeating-linear-gradient(
+                    0deg,
+                    transparent,
+                    transparent 2px,
+                    rgba(0, 255, 255, 0.03) 2px,
+                    rgba(0, 255, 255, 0.03) 4px
+                ),
+                repeating-linear-gradient(
+                    90deg,
+                    transparent,
+                    transparent 2px,
+                    rgba(255, 0, 255, 0.03) 2px,
+                    rgba(255, 0, 255, 0.03) 4px
+                );
+            pointer-events: none;
+            z-index: 1;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 2rem;
+            position: relative;
+            z-index: 2;
+        }
+        
+        h1 {
+            font-family: 'Orbitron', monospace;
+            font-size: clamp(3rem, 8vw, 6rem);
+            font-weight: 900;
+            text-align: center;
+            margin-bottom: 1rem;
+            background: linear-gradient(45deg, var(--neon-cyan), var(--neon-magenta), var(--neon-yellow));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            text-shadow: var(--glow-cyan);
+            animation: titlePulse 3s ease-in-out infinite alternate;
+        }
+        
+        @keyframes titlePulse {
+            0% { filter: brightness(1) saturate(1); }
+            100% { filter: brightness(1.2) saturate(1.3); }
+        }
+        
+        .subtitle {
+            text-align: center;
+            font-size: 1.2rem;
+            margin-bottom: 3rem;
+            opacity: 0.8;
+            text-transform: uppercase;
+            letter-spacing: 3px;
+        }
+        
+        .dice-container {
+            perspective: 1000px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 400px;
+            margin-bottom: 3rem;
+        }
+        
+        .dice {
+            width: 120px;
+            height: 120px;
+            position: relative;
+            transform-style: preserve-3d;
+            transition: transform 0.6s cubic-bezier(0.68, -0.55, 0.265, 1.55);
+        }
+        
+        .dice.rolling {
+            animation: brutalRoll 2s ease-out;
+        }
+        
+        @keyframes brutalRoll {
+            0% { transform: rotateX(0deg) rotateY(0deg) rotateZ(0deg); }
+            25% { transform: rotateX(720deg) rotateY(360deg) rotateZ(180deg) scale(1.2); }
+            50% { transform: rotateX(1440deg) rotateY(720deg) rotateZ(360deg) scale(0.8); }
+            75% { transform: rotateX(2160deg) rotateY(1080deg) rotateZ(540deg) scale(1.1); }
+            100% { transform: rotateX(var(--final-x)) rotateY(var(--final-y)) rotateZ(var(--final-z)) scale(1); }
+        }
+        
+        .dice-face {
+            position: absolute;
+            width: 120px;
+            height: 120px;
+            background: linear-gradient(135deg, var(--concrete-light), var(--concrete-gray));
+            border: 3px solid var(--neon-cyan);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-family: 'Orbitron', monospace;
+            font-size: 2rem;
+            font-weight: 900;
+            color: var(--neon-cyan);
+            text-shadow: var(--glow-cyan);
+            box-shadow: 
+                inset 0 0 20px rgba(0, 255, 255, 0.2),
+                0 0 30px rgba(0, 255, 255, 0.3);
+        }
+        
+        .dice-face.front { transform: translateZ(60px); }
+        .dice-face.back { transform: rotateY(180deg) translateZ(60px); }
+        .dice-face.right { transform: rotateY(90deg) translateZ(60px); }
+        .dice-face.left { transform: rotateY(-90deg) translateZ(60px); }
+        .dice-face.top { transform: rotateX(90deg) translateZ(60px); }
+        .dice-face.bottom { transform: rotateX(-90deg) translateZ(60px); }
+        
+        .controls {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 2rem;
+        }
+        
+        .roll-button {
+            font-family: 'Orbitron', monospace;
+            font-size: 1.5rem;
+            font-weight: 700;
+            padding: 1rem 3rem;
+            background: linear-gradient(45deg, var(--neon-cyan), var(--neon-magenta));
+            border: none;
+            color: var(--concrete-gray);
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            cursor: pointer;
+            position: relative;
+            overflow: hidden;
+            transition: all 0.3s ease;
+            box-shadow: 
+                0 10px 30px rgba(0, 255, 255, 0.3),
+                inset 0 0 20px rgba(255, 255, 255, 0.1);
+        }
+        
+        .roll-button:hover {
+            transform: translateY(-3px) scale(1.05);
+            box-shadow: 
+                0 15px 40px rgba(0, 255, 255, 0.5),
+                inset 0 0 30px rgba(255, 255, 255, 0.2);
+        }
+        
+        .roll-button:active {
+            transform: translateY(-1px) scale(0.98);
+        }
+        
+        .roll-button::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.4), transparent);
+            transition: left 0.5s;
+        }
+        
+        .roll-button:hover::before {
+            left: 100%;
+        }
+        
+        .result-display {
+            font-family: 'Orbitron', monospace;
+            font-size: 3rem;
+            font-weight: 900;
+            color: var(--neon-yellow);
+            text-shadow: var(--glow-magenta);
+            margin-top: 2rem;
+            opacity: 0;
+            transform: scale(0.5);
+            transition: all 0.5s cubic-bezier(0.68, -0.55, 0.265, 1.55);
+        }
+        
+        .result-display.show {
+            opacity: 1;
+            transform: scale(1);
+        }
+        
+        .dice-selector {
+            display: flex;
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+        
+        .dice-type {
+            padding: 0.5rem 1rem;
+            background: var(--concrete-light);
+            border: 2px solid var(--neon-cyan);
+            color: var(--neon-cyan);
+            font-family: 'Rajdhani', monospace;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        
+        .dice-type:hover,
+        .dice-type.active {
+            background: var(--neon-cyan);
+            color: var(--concrete-gray);
+            box-shadow: var(--glow-cyan);
+        }
+        
+        .stats {
+            margin-top: 3rem;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+        }
+        
+        .stat-card {
+            background: var(--concrete-light);
+            padding: 1.5rem;
+            border: 2px solid var(--neon-magenta);
+            text-align: center;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .stat-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 3px;
+            background: linear-gradient(90deg, var(--neon-cyan), var(--neon-magenta), var(--neon-yellow));
+        }
+        
+        .stat-label {
+            font-size: 0.9rem;
+            opacity: 0.7;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 0.5rem;
+        }
+        
+        .stat-value {
+            font-family: 'Orbitron', monospace;
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: var(--neon-magenta);
+        }
+        
+        @media (max-width: 768px) {
+            .container {
+                padding: 1rem;
+            }
+            
+            .dice {
+                width: 80px;
+                height: 80px;
+            }
+            
+            .dice-face {
+                width: 80px;
+                height: 80px;
+                font-size: 1.5rem;
+            }
+            
+            .dice-face.front { transform: translateZ(40px); }
+            .dice-face.back { transform: rotateY(180deg) translateZ(40px); }
+            .dice-face.right { transform: rotateY(90deg) translateZ(40px); }
+            .dice-face.left { transform: rotateY(-90deg) translateZ(40px); }
+            .dice-face.top { transform: rotateX(90deg) translateZ(40px); }
+            .dice-face.bottom { transform: rotateX(-90deg) translateZ(40px); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>BRUTAL DICE</h1>
+        <p class="subtitle">DIGITAL CHAOS GENERATOR</p>
+        
+        <div class="dice-container">
+            <div class="dice" id="dice">
+                <div class="dice-face front">1</div>
+                <div class="dice-face back">6</div>
+                <div class="dice-face right">2</div>
+                <div class="dice-face left">5</div>
+                <div class="dice-face top">3</div>
+                <div class="dice-face bottom">4</div>
+            </div>
+        </div>
+        
+        <div class="controls">
+            <div class="dice-selector">
+                <div class="dice-type active" data-sides="6">D6</div>
+                <div class="dice-type" data-sides="20">D20</div>
+                <div class="dice-type" data-sides="12">D12</div>
+                <div class="dice-type" data-sides="8">D8</div>
+                <div class="dice-type" data-sides="4">D4</div>
+                <div class="dice-type" data-sides="10">D10</div>
+            </div>
+            
+            <button class="roll-button" id="rollButton">ROLL BRUTAL</button>
+            
+            <div class="result-display" id="resultDisplay"></div>
+        </div>
+        
+        <div class="stats">
+            <div class="stat-card">
+                <div class="stat-label">Total Rolls</div>
+                <div class="stat-value" id="totalRolls">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Average</div>
+                <div class="stat-value" id="average">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Last Roll</div>
+                <div class="stat-value" id="lastRoll">-</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Highest</div>
+                <div class="stat-value" id="highest">0</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        class BrutalDiceRoller {
+            constructor() {
+                this.dice = document.getElementById('dice');
+                this.rollButton = document.getElementById('rollButton');
+                this.resultDisplay = document.getElementById('resultDisplay');
+                this.currentSides = 6;
+                this.rolls = [];
+                this.isRolling = false;
+                
+                this.rotationMap = {
+                    1: { x: 0, y: 0, z: 0 },
+                    2: { x: 0, y: -90, z: 0 },
+                    3: { x: -90, y: 0, z: 0 },
+                    4: { x: 90, y: 0, z: 0 },
+                    5: { x: 0, y: 90, z: 0 },
+                    6: { x: 0, y: 180, z: 0 }
+                };
+                
+                this.init();
+            }
+            
+            init() {
+                this.rollButton.addEventListener('click', () => this.roll());
+                this.setupDiceSelector();
+                this.updateStats();
+            }
+            
+            setupDiceSelector() {
+                const diceTypes = document.querySelectorAll('.dice-type');
+                diceTypes.forEach(type => {
+                    type.addEventListener('click', () => {
+                        diceTypes.forEach(t => t.classList.remove('active'));
+                        type.classList.add('active');
+                        this.currentSides = parseInt(type.dataset.sides);
+                        this.updateDiceFaces();
+                    });
+                });
+            }
+            
+            updateDiceFaces() {
+                const faces = this.dice.querySelectorAll('.dice-face');
+                if (this.currentSides === 6) {
+                    faces.forEach((face, index) => {
+                        const values = [1, 6, 2, 5, 3, 4];
+                        face.textContent = values[index];
+                    });
+                } else {
+                    faces.forEach((face, index) => {
+                        face.textContent = index + 1;
+                    });
+                }
+            }
+            
+            roll() {
+                if (this.isRolling) return;
+                
+                this.isRolling = true;
+                this.rollButton.disabled = true;
+                this.resultDisplay.classList.remove('show');
+                
+                const result = Math.floor(Math.random() * this.currentSides) + 1;
+                
+                this.dice.classList.add('rolling');
+                
+                setTimeout(() => {
+                    this.dice.classList.remove('rolling');
+                    this.showResult(result);
+                    this.updateStats(result);
+                    this.isRolling = false;
+                    this.rollButton.disabled = false;
+                }, 2000);
+            }
+            
+            showResult(result) {
+                this.resultDisplay.textContent = `RESULT: ${result}`;
+                this.resultDisplay.classList.add('show');
+                
+                if (this.currentSides === 6 && result <= 6) {
+                    const rotation = this.rotationMap[result];
+                    this.dice.style.setProperty('--final-x', `${rotation.x}deg`);
+                    this.dice.style.setProperty('--final-y', `${rotation.y}deg`);
+                    this.dice.style.setProperty('--final-z', `${rotation.z}deg`);
+                    this.dice.style.transform = `rotateX(${rotation.x}deg) rotateY(${rotation.y}deg) rotateZ(${rotation.z}deg)`;
+                } else {
+                    const randomX = Math.random() * 360;
+                    const randomY = Math.random() * 360;
+                    const randomZ = Math.random() * 360;
+                    this.dice.style.setProperty('--final-x', `${randomX}deg`);
+                    this.dice.style.setProperty('--final-y', `${randomY}deg`);
+                    this.dice.style.setProperty('--final-z', `${randomZ}deg`);
+                    this.dice.style.transform = `rotateX(${randomX}deg) rotateY(${randomY}deg) rotateZ(${randomZ}deg)`;
+                }
+            }
+            
+            updateStats(result) {
+                if (result) {
+                    this.rolls.push(result);
+                }
+                
+                const totalRolls = this.rolls.length;
+                const average = totalRolls > 0 ? (this.rolls.reduce((a, b) => a + b, 0) / totalRolls).toFixed(1) : 0;
+                const highest = totalRolls > 0 ? Math.max(...this.rolls) : 0;
+                const lastRoll = totalRolls > 0 ? this.rolls[this.rolls.length - 1] : '-';
+                
+                document.getElementById('totalRolls').textContent = totalRolls;
+                document.getElementById('average').textContent = average;
+                document.getElementById('lastRoll').textContent = lastRoll;
+                document.getElementById('highest').textContent = highest;
+            }
+        }
+        
+        document.addEventListener('DOMContentLoaded', () => {
+            new BrutalDiceRoller();
+        });
+    </script>
+</body>
+</html>
