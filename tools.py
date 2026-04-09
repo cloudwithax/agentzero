@@ -221,7 +221,9 @@ async def grep_tool(
         matches = []
         include_patterns = []
         if include:
-            include_patterns = [item.strip() for item in str(include).split(",") if item.strip()]
+            include_patterns = [
+                item.strip() for item in str(include).split(",") if item.strip()
+            ]
 
         max_match_count = None
         if max_matches is not None:
@@ -917,6 +919,28 @@ async def activate_skill_tool(name: str):
         return {"success": False, "error": str(e)}
 
 
+async def add_skill_tool(url: str, auto_activate: bool = True):
+    """Fetch a skill from a URL, scan for injection attacks, and install it.
+
+    The skill content is validated against the prompt-injection-defense scanner
+    before being written to disk.  If the content passes validation it is
+    persisted in the user skills directory and automatically activated for the
+    current session.
+    """
+    if skill_registry is None:
+        return {"success": False, "error": "Skill registry is not configured"}
+
+    try:
+        session_id = _runtime_session_id.get()
+        return await skill_registry.add_skill_from_url(
+            url=str(url or "").strip(),
+            session_id=session_id,
+            auto_activate=bool(auto_activate),
+        )
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 async def send_tapback_tool(
     message_handle: str,
     reaction: str,
@@ -982,6 +1006,66 @@ async def acp_register_service_tool(
         return {"success": False, "error": str(e)}
 
 
+async def store_credential_tool(key: str, value: str, description: str = ""):
+    """Store a credential (API key, token, password, etc.) in the encrypted vault.
+
+    Values are encrypted at rest using Fernet symmetric encryption. The key is
+    a human-readable name you can use to retrieve the credential later.
+
+    Args:
+        key: A unique name for this credential (e.g. 'github_token', 'aws_secret_key')
+        value: The secret value to store
+        description: Optional description of what this credential is for
+    """
+    try:
+        if memory_store is None:
+            return {"success": False, "error": "Memory store not initialized"}
+        metadata = {}
+        if description:
+            metadata["description"] = str(description).strip()
+        return memory_store.store_credential(key=key, value=value, metadata=metadata)
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+async def get_credential_tool(key: str):
+    """Retrieve a stored credential from the encrypted vault by its key name.
+
+    Args:
+        key: The name of the credential to retrieve
+    """
+    try:
+        if memory_store is None:
+            return {"success": False, "error": "Memory store not initialized"}
+        return memory_store.get_credential(key=key)
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+async def delete_credential_tool(key: str):
+    """Delete a stored credential from the encrypted vault.
+
+    Args:
+        key: The name of the credential to delete
+    """
+    try:
+        if memory_store is None:
+            return {"success": False, "error": "Memory store not initialized"}
+        return memory_store.delete_credential(key=key)
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+async def list_credentials_tool():
+    """List all stored credential keys (values are never exposed in listings)."""
+    try:
+        if memory_store is None:
+            return {"success": False, "error": "Memory store not initialized"}
+        return memory_store.list_credentials()
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 async def acp_discover_peers_tool(
     query_type: str = "all",
     query_value: Optional[str] = None,
@@ -998,13 +1082,15 @@ async def acp_discover_peers_tool(
 
         profiles = []
         for peer in peers:
-            profiles.append({
-                "agent_id": peer.agent_id,
-                "agent_name": peer.agent_name,
-                "capabilities": peer.capabilities,
-                "endpoints": peer.endpoints,
-                "supported_protocols": peer.supported_protocols,
-            })
+            profiles.append(
+                {
+                    "agent_id": peer.agent_id,
+                    "agent_name": peer.agent_name,
+                    "capabilities": peer.capabilities,
+                    "endpoints": peer.endpoints,
+                    "supported_protocols": peer.supported_protocols,
+                }
+            )
 
         return {
             "success": True,
@@ -1115,12 +1201,13 @@ TOOLS = {
     "generate_image": generate_image_tool,
     "create_image": generate_image_tool,  # Alias
     "activate_skill": activate_skill_tool,
+    "add_skill": add_skill_tool,
     "send_tapback": send_tapback_tool,
     "send_reaction": send_tapback_tool,  # Alias for clarity
     "consortium_start": consortium_start_tool,
     "consortium_stop": consortium_stop_tool,
     "consortium_status": consortium_status_tool,
-"reminder_create": reminder_create_tool,
+    "reminder_create": reminder_create_tool,
     "reminder_list": reminder_list_tool,
     "reminder_status": reminder_status_tool,
     "reminder_cancel": reminder_cancel_tool,
@@ -1132,6 +1219,11 @@ TOOLS = {
     "acp_send_message": acp_send_message_tool,
     "acp_get_registry": acp_get_registry_tool,
     "acp_list_peers": acp_list_peers_tool,
+    # Credential vault tools
+    "store_credential": store_credential_tool,
+    "get_credential": get_credential_tool,
+    "delete_credential": delete_credential_tool,
+    "list_credentials": list_credentials_tool,
 }
 
 
@@ -1162,6 +1254,7 @@ def validate_tool_args(func_name: str, func_args: dict) -> tuple:
         "generate_image": ["prompt", "filename"],
         "create_image": ["prompt", "filename"],
         "activate_skill": ["name"],
+        "add_skill": ["url"],
         "send_tapback": ["message_handle", "reaction"],
         "send_reaction": ["message_handle", "reaction"],
         "consortium_start": ["task"],
@@ -1173,11 +1266,20 @@ def validate_tool_args(func_name: str, func_args: dict) -> tuple:
         "reminder_cancel": ["task_id"],
         "reminder_run_now": ["task_id"],
         "consortium_agree": [],
-        "acp_register_service": ["service_name", "capabilities", "description", "endpoint"],
+        "acp_register_service": [
+            "service_name",
+            "capabilities",
+            "description",
+            "endpoint",
+        ],
         "acp_discover_peers": [],
         "acp_send_message": ["recipient_id", "message"],
         "acp_get_registry": [],
         "acp_list_peers": [],
+        "store_credential": ["key", "value"],
+        "get_credential": ["key"],
+        "delete_credential": ["key"],
+        "list_credentials": [],
     }
 
     if func_name in required_params:

@@ -1507,6 +1507,40 @@ def _remember_processed_sendblue_handle(
     )
 
 
+import hashlib
+
+_SENDBLUE_CONTENT_DEDUP_WINDOW: int = 30
+
+
+def _make_sendblue_content_dedup_key(
+    sender_number: str,
+    content: str,
+) -> str:
+    """Build a stable dedup key from sender + content so the same inbound
+    message arriving via different webhook paths (with different or missing
+    handles) is still detected as a duplicate."""
+    raw = f"{sender_number}:{(content or '').strip()}"
+    return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:20]
+
+
+def _remember_processed_sendblue_content(
+    processed_content_keys: set[str],
+    sender_number: str,
+    content: str,
+    dedup_ttl_seconds: int,
+) -> None:
+    """Track processed (sender, content) pairs and expire after TTL."""
+    if not sender_number or not (content or "").strip():
+        return
+    key = _make_sendblue_content_dedup_key(sender_number, content)
+    processed_content_keys.add(key)
+    ttl = min(dedup_ttl_seconds, _SENDBLUE_CONTENT_DEDUP_WINDOW)
+    asyncio.get_running_loop().call_later(
+        ttl,
+        lambda k=key: processed_content_keys.discard(k),
+    )
+
+
 def _schedule_sendblue_pending_flush_locked(
     pending_sendblue_messages: dict[str, dict[str, Any]],
     sender_number: str,
@@ -3111,6 +3145,7 @@ async def start_sendblue_webhook_server(
     app = web.Application()
     own_number = os.environ.get("SENDBLUE_NUMBER")
     processed_handles: set[str] = set()
+    processed_content_keys: set[str] = set()
     dedup_ttl_seconds = _env_int(
         "SENDBLUE_DEDUP_TTL_SECONDS",
         60,
@@ -3201,6 +3236,21 @@ async def start_sendblue_webhook_server(
                     message_handle,
                     dedup_ttl_seconds,
                 )
+
+            content_dedup_key = _make_sendblue_content_dedup_key(sender_number, content)
+            if content_dedup_key in processed_content_keys:
+                logger.info(
+                    "Ignoring duplicate Sendblue webhook (content-dedup): %s → %s",
+                    sender_number,
+                    content[:80],
+                )
+                return web.Response(status=200, text="OK")
+            _remember_processed_sendblue_content(
+                processed_content_keys,
+                sender_number,
+                content,
+                dedup_ttl_seconds,
+            )
 
             # Process asynchronously so we can quickly return 200 OK
             if sender_number:
@@ -3363,6 +3413,7 @@ async def start_sendblue_bot(handler: AgentHandler):
     interval = int(os.environ.get("SENDBLUE_POLL_INTERVAL", "10"))
     last_check = datetime.utcnow()
     processed_handles: set[str] = set()
+    processed_content_keys: set[str] = set()
     dedup_ttl_seconds = _env_int(
         "SENDBLUE_DEDUP_TTL_SECONDS",
         60,
@@ -3416,6 +3467,21 @@ async def start_sendblue_bot(handler: AgentHandler):
                             message_handle,
                             dedup_ttl_seconds,
                         )
+
+                    content_dedup_key = _make_sendblue_content_dedup_key(num, content)
+                    if content_dedup_key in processed_content_keys:
+                        logger.info(
+                            "Ignoring duplicate Sendblue polled message (content-dedup): %s → %s",
+                            num,
+                            content[:80],
+                        )
+                        continue
+                    _remember_processed_sendblue_content(
+                        processed_content_keys,
+                        num,
+                        content,
+                        dedup_ttl_seconds,
+                    )
 
                     user_content = await _build_imessage_user_content(
                         content,

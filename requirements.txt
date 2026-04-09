@@ -4,3 +4,4 @@ python-telegram-bot
 python-dotenv
 nvidia-riva-client
 strip-markdown
+cryptography

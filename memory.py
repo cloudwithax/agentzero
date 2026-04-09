@@ -1,5 +1,6 @@
 """Memory system for persistent storage and retrieval."""
 
+import base64
 import json
 import math
 import os
@@ -10,6 +11,15 @@ from typing import Any, Optional
 
 import aiohttp
 import numpy as np
+
+try:
+    from cryptography.fernet import Fernet, InvalidToken
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+    _CRYPTO_AVAILABLE = True
+except ImportError:
+    _CRYPTO_AVAILABLE = False
 
 
 @dataclass
@@ -156,8 +166,199 @@ class MemoryStore:
         """
         )
 
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS credentials (
+                key TEXT PRIMARY KEY,
+                encrypted_value BLOB NOT NULL,
+                metadata TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """
+        )
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_credentials_updated
+            ON credentials(updated_at)
+        """
+        )
+
         conn.commit()
         conn.close()
+
+    @staticmethod
+    def _derive_fernet_key(password: str, salt: bytes) -> bytes:
+        if not _CRYPTO_AVAILABLE:
+            raise RuntimeError(
+                "cryptography package is required for credential encryption"
+            )
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=600_000,
+        )
+        return base64.urlsafe_b64encode(kdf.derive(password.encode("utf-8")))
+
+    def _get_or_create_encryption_key(self) -> tuple[Fernet, bytes]:
+        if not _CRYPTO_AVAILABLE:
+            raise RuntimeError(
+                "cryptography package is required for credential encryption"
+            )
+        key_b64 = os.environ.get("CREDENTIALS_ENCRYPTION_KEY", "").strip()
+        if key_b64:
+            try:
+                return Fernet(key_b64.encode("utf-8")), b""
+            except Exception:
+                pass
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT value FROM agent_state WHERE key = 'credentials.encryption_key'"
+        )
+        row = cursor.fetchone()
+        if row:
+            stored = row[0]
+            if isinstance(stored, str):
+                stored = stored.strip('"')
+            try:
+                fernet = Fernet(stored.encode("utf-8"))
+                conn.close()
+                return fernet, b""
+            except Exception:
+                pass
+        new_key = Fernet.generate_key()
+        cursor.execute(
+            """
+            INSERT INTO agent_state (key, value, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(key)
+            DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+        """,
+            ("credentials.encryption_key", new_key.decode("utf-8")),
+        )
+        conn.commit()
+        conn.close()
+        return Fernet(new_key), b""
+
+    def _encrypt_value(self, plaintext: str) -> str:
+        fernet, _ = self._get_or_create_encryption_key()
+        return fernet.encrypt(plaintext.encode("utf-8")).decode("utf-8")
+
+    def _decrypt_value(self, ciphertext: str) -> str:
+        fernet, _ = self._get_or_create_encryption_key()
+        return fernet.decrypt(ciphertext.encode("utf-8")).decode("utf-8")
+
+    def store_credential(
+        self,
+        key: str,
+        value: str,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        key = str(key or "").strip()
+        if not key:
+            return {"success": False, "error": "key must be a non-empty string"}
+        value = str(value or "")
+        if not value:
+            return {"success": False, "error": "value must be a non-empty string"}
+        if not _CRYPTO_AVAILABLE:
+            return {
+                "success": False,
+                "error": "cryptography package not installed; cannot encrypt credentials",
+            }
+        try:
+            encrypted = self._encrypt_value(value)
+        except Exception as exc:
+            return {"success": False, "error": f"encryption failed: {exc}"}
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO credentials (key, encrypted_value, metadata, updated_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(key)
+            DO UPDATE SET encrypted_value = excluded.encrypted_value,
+                          metadata = excluded.metadata,
+                          updated_at = CURRENT_TIMESTAMP
+        """,
+            (key, encrypted, json.dumps(metadata or {})),
+        )
+        conn.commit()
+        conn.close()
+        return {"success": True, "key": key}
+
+    def get_credential(self, key: str) -> dict[str, Any]:
+        key = str(key or "").strip()
+        if not key:
+            return {"success": False, "error": "key must be a non-empty string"}
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT encrypted_value, metadata, created_at, updated_at FROM credentials WHERE key = ?",
+            (key,),
+        )
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            return {"success": False, "error": f"credential '{key}' not found"}
+        encrypted_value, metadata_blob, created_at, updated_at = row
+        if not _CRYPTO_AVAILABLE:
+            return {
+                "success": False,
+                "error": "cryptography package not installed; cannot decrypt credentials",
+            }
+        try:
+            decrypted = self._decrypt_value(encrypted_value)
+        except InvalidToken:
+            return {
+                "success": False,
+                "error": "decryption failed: invalid encryption key or corrupted data",
+            }
+        except Exception as exc:
+            return {"success": False, "error": f"decryption failed: {exc}"}
+        return {
+            "success": True,
+            "key": key,
+            "value": decrypted,
+            "metadata": self._parse_metadata_blob(metadata_blob),
+            "created_at": created_at,
+            "updated_at": updated_at,
+        }
+
+    def delete_credential(self, key: str) -> dict[str, Any]:
+        key = str(key or "").strip()
+        if not key:
+            return {"success": False, "error": "key must be a non-empty string"}
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM credentials WHERE key = ?", (key,))
+        deleted = cursor.rowcount > 0
+        conn.commit()
+        conn.close()
+        if deleted:
+            return {"success": True, "key": key}
+        return {"success": False, "error": f"credential '{key}' not found"}
+
+    def list_credentials(self) -> dict[str, Any]:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT key, metadata, created_at, updated_at FROM credentials ORDER BY key"
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        entries = []
+        for key, metadata_blob, created_at, updated_at in rows:
+            entries.append(
+                {
+                    "key": key,
+                    "metadata": self._parse_metadata_blob(metadata_blob),
+                    "created_at": created_at,
+                    "updated_at": updated_at,
+                }
+            )
+        return {"success": True, "count": len(entries), "credentials": entries}
 
     @staticmethod
     def _parse_metadata_blob(metadata_blob: Optional[str]) -> dict[str, Any]:

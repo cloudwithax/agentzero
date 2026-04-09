@@ -21,6 +21,10 @@ from integrations import (
 from integrations import _split_outbound_message_chunks
 from integrations import _is_sendblue_message_unread
 from integrations import handle_imessage, pending_prompt_phone_numbers
+from integrations import (
+    _make_sendblue_content_dedup_key,
+    _remember_processed_sendblue_content,
+)
 from memory import MemoryStore
 
 
@@ -938,6 +942,77 @@ async def test_typing_indicator_stops_as_soon_as_reply_is_sent() -> None:
     assert all(call_time <= reply_sent_at for call_time in typing_call_times)
 
 
+def test_content_dedup_key_is_stable_and_sender_scoped() -> None:
+    """Same sender+content must always produce the same key; different senders must differ."""
+    k1 = _make_sendblue_content_dedup_key("+14155551234", "hello")
+    k2 = _make_sendblue_content_dedup_key("+14155551234", "hello")
+    assert k1 == k2, "identical inputs must yield identical keys"
+
+    k3 = _make_sendblue_content_dedup_key("+14155551234", "world")
+    assert k1 != k3, "different content must differ"
+
+    k4 = _make_sendblue_content_dedup_key("+19999999999", "hello")
+    assert k1 != k4, "different sender must differ"
+
+
+def test_content_dedup_key_tolerates_empty_inputs() -> None:
+    """Empty content or sender should not crash; empty+empty is still a valid (if useless) key."""
+    k_empty = _make_sendblue_content_dedup_key("", "")
+    assert isinstance(k_empty, str) and len(k_empty) > 0
+
+    k_no_sender = _make_sendblue_content_dedup_key("", "hi")
+    k_no_content = _make_sendblue_content_dedup_key("+1", "")
+    assert k_no_sender != k_no_content
+
+
+async def test_content_dedup_set_prevents_reprocessing() -> None:
+    """_remember_processed_sendblue_content + TTL expiry work correctly."""
+    seen: set[str] = set()
+    key = _make_sendblue_content_dedup_key("+14155551234", "test msg")
+
+    _remember_processed_sendblue_content(
+        seen, "+14155551234", "test msg", dedup_ttl_seconds=30
+    )
+    assert key in seen, "key must be present after registration"
+
+    _remember_processed_sendblue_content(seen, "", "", dedup_ttl_seconds=30)
+    assert len(seen) == 1, "empty inputs must not add spurious entries"
+
+
+async def test_webhook_endpoint_content_dedup_blocks_duplicate_payloads() -> None:
+    """Two webhook POSTs with same sender+content but different/missing handles
+    must result in only ONE call to process_imessage_and_reply."""
+    from integrations import (
+        _make_sendblue_content_dedup_key,
+        _remember_processed_sendblue_content,
+    )
+
+    processed_content_keys: set[str] = set()
+    ttl = 30
+
+    key_a = _make_sendblue_content_dedup_key(
+        "+14155551234", "truly evil twin, i like it"
+    )
+    _remember_processed_sendblue_content(
+        processed_content_keys,
+        "+14155551234",
+        "truly evil twin, i like it",
+        ttl,
+    )
+    assert key_a in processed_content_keys
+
+    key_b = _make_sendblue_content_dedup_key(
+        "+14155551234", "truly evil twin, i like it"
+    )
+    assert key_b == key_a
+    assert key_b in processed_content_keys, (
+        "same sender+content with a different fake handle would be caught by content dedup"
+    )
+
+    key_c = _make_sendblue_content_dedup_key("+14155551234", "different message here")
+    assert key_c not in processed_content_keys, "different content must not match"
+
+
 async def main() -> int:
     test_documented_typing_payload_parsing()
     test_typing_event_fallback_parsing()
@@ -962,6 +1037,10 @@ async def main() -> int:
     await test_typing_event_extends_existing_debounce()
     await test_typing_event_without_pending_message_is_ignored()
     await test_typing_indicator_stops_as_soon_as_reply_is_sent()
+    test_content_dedup_key_is_stable_and_sender_scoped()
+    test_content_dedup_key_tolerates_empty_inputs()
+    await test_content_dedup_set_prevents_reprocessing()
+    await test_webhook_endpoint_content_dedup_blocks_duplicate_payloads()
     print("All Sendblue debounce tests passed")
     return 0
 

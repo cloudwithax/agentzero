@@ -5,6 +5,7 @@ Implements progressive-disclosure behavior aligned with agentskills.io:
 - Load minimal catalog metadata into prompt context
 - Activate skill instructions on demand
 - Keep activated skills available per session without duplicate injections
+- Fetch and install skills from remote URLs with injection scanning
 """
 
 from __future__ import annotations
@@ -179,7 +180,9 @@ def _parse_frontmatter_fallback(frontmatter_text: str) -> dict[str, Any]:
     return parsed
 
 
-def _split_skill_markdown(raw_text: str) -> tuple[dict[str, Any], str] | tuple[None, str]:
+def _split_skill_markdown(
+    raw_text: str,
+) -> tuple[dict[str, Any], str] | tuple[None, str]:
     """Split SKILL.md into frontmatter and markdown body."""
     lines = raw_text.splitlines()
     if not lines or lines[0].strip() != SKILL_FRONTMATTER_DELIM:
@@ -200,7 +203,9 @@ def _split_skill_markdown(raw_text: str) -> tuple[dict[str, Any], str] | tuple[N
     frontmatter: dict[str, Any]
     if yaml is not None:
         try:
-            loaded = yaml.safe_load(frontmatter_text) if frontmatter_text.strip() else {}
+            loaded = (
+                yaml.safe_load(frontmatter_text) if frontmatter_text.strip() else {}
+            )
             if loaded is None:
                 loaded = {}
             if not isinstance(loaded, dict):
@@ -310,7 +315,9 @@ class SkillRegistry:
         max_resource_files: int = DEFAULT_MAX_RESOURCE_FILES,
         refresh_interval_seconds: int = DEFAULT_REFRESH_INTERVAL_SECONDS,
     ):
-        self.client_name = str(client_name or "agentzero").strip().lower() or "agentzero"
+        self.client_name = (
+            str(client_name or "agentzero").strip().lower() or "agentzero"
+        )
         self.project_root = os.path.abspath(project_root or os.getcwd())
         self.user_home = os.path.abspath(os.path.expanduser(user_home or "~"))
 
@@ -362,7 +369,9 @@ class SkillRegistry:
         """Return ordered discovery roots. Earlier roots win on name collisions."""
         roots: list[tuple[str, str]] = []
 
-        project_native = os.path.join(self.project_root, f".{self.client_name}", "skills")
+        project_native = os.path.join(
+            self.project_root, f".{self.client_name}", "skills"
+        )
         project_shared = os.path.join(self.project_root, ".agents", "skills")
         project_claude = os.path.join(self.project_root, ".claude", "skills")
 
@@ -421,9 +430,7 @@ class SkillRegistry:
                 dirnames[:] = []
                 continue
 
-            dirnames[:] = sorted(
-                [d for d in dirnames if not self._should_skip_dir(d)]
-            )
+            dirnames[:] = sorted([d for d in dirnames if not self._should_skip_dir(d)])
 
             if SKILL_FILE_NAME in filenames:
                 skill_dirs.append(current_root)
@@ -632,7 +639,9 @@ class SkillRegistry:
                 continue
 
             for root, dirnames, filenames in os.walk(base, topdown=True):
-                dirnames[:] = sorted([d for d in dirnames if not self._should_skip_dir(d)])
+                dirnames[:] = sorted(
+                    [d for d in dirnames if not self._should_skip_dir(d)]
+                )
                 for filename in sorted(filenames):
                     abs_path = os.path.join(root, filename)
                     rel = os.path.relpath(abs_path, skill.skill_dir)
@@ -656,7 +665,9 @@ class SkillRegistry:
 
         lines.append("")
         lines.append(f"Skill directory: {skill.skill_dir}")
-        lines.append("Relative paths in this skill are relative to the skill directory.")
+        lines.append(
+            "Relative paths in this skill are relative to the skill directory."
+        )
 
         if skill.compatibility:
             lines.append(f"Compatibility: {skill.compatibility}")
@@ -712,7 +723,9 @@ class SkillRegistry:
             wrapped = self._build_wrapped_skill_content(skill)
 
             if normalized_session:
-                self._active_by_session.setdefault(normalized_session, {})[skill.name] = wrapped
+                self._active_by_session.setdefault(normalized_session, {})[
+                    skill.name
+                ] = wrapped
 
         return {
             "success": True,
@@ -757,3 +770,177 @@ class SkillRegistry:
 
         with self._lock:
             self._active_by_session.pop(normalized_session, None)
+
+    async def add_skill_from_url(
+        self,
+        url: str,
+        session_id: Optional[str] = None,
+        auto_activate: bool = True,
+    ) -> dict[str, Any]:
+        """Fetch a SKILL.md from a remote URL, scan for injection, and install it.
+
+        The skill is written to the user-level native skills directory
+        (``~/.agentzero/skills/<name>/SKILL.md``) so it persists across
+        restarts and is picked up by future discovery scans.
+        """
+        from injection_scanner import scan_for_injection
+
+        url = (url or "").strip()
+        if not url:
+            return {"success": False, "error": "URL is required"}
+
+        if not re.match(r"^https?://", url, re.IGNORECASE):
+            return {
+                "success": False,
+                "error": "URL must start with http:// or https://",
+            }
+
+        try:
+            import aiohttp
+
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                    headers={"User-Agent": "AgentZero-SkillFetcher/1.0"},
+                ) as resp:
+                    if resp.status != 200:
+                        return {
+                            "success": False,
+                            "error": f"Failed to fetch URL (HTTP {resp.status})",
+                        }
+                    raw_text = await resp.text()
+        except Exception as exc:
+            return {"success": False, "error": f"Failed to fetch URL: {exc}"}
+
+        if not raw_text or not raw_text.strip():
+            return {"success": False, "error": "Fetched content is empty"}
+
+        scan_result = scan_for_injection(raw_text)
+        if scan_result.is_critical:
+            return {
+                "success": False,
+                "error": (
+                    f"Content failed prompt-injection scan (score={scan_result.score:.3f}, "
+                    f"threat={scan_result.threat_level}). "
+                    f"Detected patterns: {scan_result.details}"
+                ),
+                "scan_score": scan_result.score,
+                "threat_level": scan_result.threat_level,
+            }
+
+        if scan_result.is_suspicious:
+            return {
+                "success": False,
+                "error": (
+                    f"Content flagged as suspicious by prompt-injection scan "
+                    f"(score={scan_result.score:.3f}, threat={scan_result.threat_level}). "
+                    f"Review the skill manually before installing. "
+                    f"Details: {scan_result.details}"
+                ),
+                "scan_score": scan_result.score,
+                "threat_level": scan_result.threat_level,
+            }
+
+        parsed_frontmatter, body_or_error = _split_skill_markdown(raw_text)
+        if parsed_frontmatter is None:
+            return {
+                "success": False,
+                "error": f"Content is not valid SKILL.md format: {body_or_error}",
+            }
+
+        frontmatter = parsed_frontmatter
+        body = body_or_error
+
+        tentative_name = str(frontmatter.get("name", "")).strip()
+        if not tentative_name:
+            return {
+                "success": False,
+                "error": "SKILL.md frontmatter must include a 'name' field",
+            }
+
+        parent_dir_name = re.sub(
+            r"[^a-z0-9-]", "", tentative_name.lower().replace(" ", "-")
+        )
+        if not parent_dir_name:
+            return {
+                "success": False,
+                "error": f"Could not derive a valid directory name from skill name '{tentative_name}'",
+            }
+
+        frontmatter["name"] = parent_dir_name
+
+        valid, validation_error, normalized = _validate_skill_frontmatter(
+            frontmatter=frontmatter,
+            parent_dir_name=parent_dir_name,
+        )
+        if not valid:
+            return {
+                "success": False,
+                "error": f"SKILL.md validation failed: {validation_error}",
+            }
+
+        skill_name = str(normalized["name"])
+
+        if skill_name in self.disabled_skills:
+            return {
+                "success": False,
+                "error": f"Skill '{skill_name}' is disabled by configuration",
+            }
+
+        user_native = os.path.join(self.user_home, f".{self.client_name}", "skills")
+        skill_dir = os.path.join(user_native, skill_name)
+        skill_md_path = os.path.join(skill_dir, SKILL_FILE_NAME)
+
+        try:
+            os.makedirs(skill_dir, exist_ok=True)
+            with open(skill_md_path, "w", encoding="utf-8") as handle:
+                handle.write(raw_text)
+        except Exception as exc:
+            return {
+                "success": False,
+                "error": f"Failed to write skill to disk: {exc}",
+            }
+
+        definition, build_error = self._build_skill_definition(
+            skill_dir=skill_dir,
+            scope="user",
+            source_root=user_native,
+        )
+        if build_error or definition is None:
+            try:
+                os.remove(skill_md_path)
+                os.rmdir(skill_dir)
+            except Exception:
+                pass
+            return {
+                "success": False,
+                "error": f"Skill was written but failed to load: {build_error}",
+            }
+
+        with self._lock:
+            self._skills[skill_name] = definition
+
+        result: dict[str, Any] = {
+            "success": True,
+            "name": skill_name,
+            "description": definition.description,
+            "skill_dir": skill_dir,
+            "scan_score": scan_result.score,
+            "threat_level": scan_result.threat_level,
+        }
+
+        if auto_activate and session_id:
+            activation = self.activate_skill(
+                name=skill_name,
+                session_id=session_id,
+                source="user",
+            )
+            result["activated"] = activation.get("success", False)
+            result["activation_message"] = activation.get(
+                "message", activation.get("error", "")
+            )
+            if activation.get("content"):
+                result["content"] = activation["content"]
+
+        return result

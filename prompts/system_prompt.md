@@ -146,6 +146,18 @@ Users can also explicitly activate skills with `/skill-name` or `$skill-name`. T
 
 ---
 
+You have access to skill installation from URLs. It allows you to fetch, validate, and install skills from remote URLs.
+
+To add a skill from a URL, use `add_skill()` with the following parameters:
+  - url: (string) The HTTPS or HTTP URL pointing to a SKILL.md file
+  - auto_activate: (boolean, optional) Automatically activate for current session (default: true)
+
+When a user mentions a URL that looks like a skill file (e.g. ends in .md, contains "skill"), use `add_skill()` to fetch and install it. The content will be automatically scanned for prompt-injection attacks before installation — if it fails the scan, you will be told why.
+
+IMPORTANT: Always use `add_skill()` when the user provides a URL to a skill file. Do not just fetch the URL with webfetch — the `add_skill` tool handles injection scanning, validation, persistent installation, and session activation in one step.
+
+---
+
 You have access to task management. It allows you to create and track multi-step todo lists.
 
 To create or update a todo list, use `todowrite()` with the following parameters:

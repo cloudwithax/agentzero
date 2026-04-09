@@ -140,13 +140,26 @@ def _build_consortium_agree_tool_schema() -> dict[str, Any]:
     }
 
 
-# Configuration
-BASE_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
-API_KEY = os.environ.get(
-    "NVIDIA_API_KEY",
-    "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",
-)
-MODEL_ID = os.environ.get("MODEL_ID", "moonshotai/kimi-k2-instruct-0905")
+# Configuration — OpenAI-compatible client endpoint takes priority over NVIDIA
+_OPENAI_CLIENT_BASE_URL = os.environ.get("OPENAI_CLIENT_BASE_URL", "").strip()
+_OPENAI_CLIENT_API_KEY = os.environ.get("OPENAI_CLIENT_API_KEY", "").strip()
+_OPENAI_CLIENT_MODEL = os.environ.get("OPENAI_CLIENT_MODEL", "").strip()
+
+if _OPENAI_CLIENT_BASE_URL and _OPENAI_CLIENT_API_KEY:
+    BASE_URL = _OPENAI_CLIENT_BASE_URL.rstrip("/")
+    if not BASE_URL.endswith("/chat/completions"):
+        BASE_URL = BASE_URL + "/chat/completions"
+    API_KEY = _OPENAI_CLIENT_API_KEY
+    MODEL_ID = _OPENAI_CLIENT_MODEL or os.environ.get(
+        "MODEL_ID", "moonshotai/kimi-k2-instruct-0905"
+    )
+else:
+    BASE_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+    API_KEY = os.environ.get(
+        "NVIDIA_API_KEY",
+        "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",
+    )
+    MODEL_ID = os.environ.get("MODEL_ID", "moonshotai/kimi-k2-instruct-0905")
 CONSORTIUM_MODEL_ID = os.environ.get("CONSORTIUM_MODEL", MODEL_ID).strip() or MODEL_ID
 
 # Workspace — all agent-created files must live here.
@@ -526,6 +539,31 @@ BASE_PAYLOAD = {
         {
             "type": "function",
             "function": {
+                "name": "add_skill",
+                "description": (
+                    "Fetch a skill from a URL, scan it for prompt-injection attacks, "
+                    "and install it for the current and future sessions. Use when the user "
+                    "mentions a URL to a SKILL.md or asks you to add/install a skill from a link."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "HTTPS or HTTP URL pointing to a SKILL.md file",
+                        },
+                        "auto_activate": {
+                            "type": "boolean",
+                            "description": "Automatically activate the skill for this session after install (default: true)",
+                        },
+                    },
+                    "required": ["url"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "send_tapback",
                 "description": "Send an iMessage tapback reaction to a specific inbound Sendblue message",
                 "parameters": {
@@ -831,6 +869,76 @@ BASE_PAYLOAD = {
             "function": {
                 "name": "acp_list_peers",
                 "description": "List all known peers in the ACP network",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "store_credential",
+                "description": "Store a credential (API key, token, password, etc.) in the encrypted vault. Values are encrypted at rest.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "key": {
+                            "type": "string",
+                            "description": "A unique name for this credential (e.g. 'github_token', 'aws_secret_key')",
+                        },
+                        "value": {
+                            "type": "string",
+                            "description": "The secret value to store",
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Optional description of what this credential is for",
+                        },
+                    },
+                    "required": ["key", "value"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_credential",
+                "description": "Retrieve a stored credential from the encrypted vault by its key name",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "key": {
+                            "type": "string",
+                            "description": "The name of the credential to retrieve",
+                        }
+                    },
+                    "required": ["key"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "delete_credential",
+                "description": "Delete a stored credential from the encrypted vault",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "key": {
+                            "type": "string",
+                            "description": "The name of the credential to delete",
+                        }
+                    },
+                    "required": ["key"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_credentials",
+                "description": "List all stored credential keys (values are never exposed in listings)",
                 "parameters": {
                     "type": "object",
                     "properties": {},
@@ -2431,6 +2539,46 @@ class AgentHandler:
         """Return a unique token for the current visible response generation."""
         return uuid.uuid4().hex
 
+    _SKILL_URL_PATTERN = re.compile(
+        r"https?://\S*?skill\S*?\.md(?:\b|[?#]|$)",
+        re.IGNORECASE,
+    )
+    _GENERAL_MD_URL_PATTERN = re.compile(
+        r"https?://\S+?\.md(?:\b|[?#]|$)",
+        re.IGNORECASE,
+    )
+
+    def _detect_skill_url_hint(self, user_query: str) -> str:
+        """Return a prompt hint when the user message contains a skill-related URL."""
+        if not user_query:
+            return ""
+
+        has_skill_url = bool(self._SKILL_URL_PATTERN.search(user_query))
+        has_md_url = bool(self._GENERAL_MD_URL_PATTERN.search(user_query))
+
+        if not has_skill_url and not has_md_url:
+            return ""
+
+        lines = [
+            "\n\n[Skill URL Detected]:",
+            "The user's message contains a URL that may point to a skill definition.",
+            "Use the `add_skill` tool with that URL to fetch, validate, and install the skill.",
+            "The tool will automatically scan the content for prompt-injection attacks before installing.",
+            "After a successful install, you can also `activate_skill` if you need the instructions immediately.",
+        ]
+
+        if has_skill_url:
+            match = self._SKILL_URL_PATTERN.search(user_query)
+            if match:
+                lines.append(f"Detected URL: {match.group(0)}")
+
+        if has_md_url and not has_skill_url:
+            match = self._GENERAL_MD_URL_PATTERN.search(user_query)
+            if match:
+                lines.append(f"Detected URL: {match.group(0)}")
+
+        return "\n".join(lines)
+
     def _get_session_prompt_suffix(self, session_id: Optional[str]) -> str:
         """Return channel-specific prompt guidance for the active session."""
         if not session_id:
@@ -2925,6 +3073,11 @@ class AgentHandler:
                 )
             except Exception:
                 logger.exception("Failed building skills context")
+
+        if user_query:
+            skill_url_hint = self._detect_skill_url_hint(user_query)
+            if skill_url_hint:
+                skills_catalog_context = (skills_catalog_context or "") + skill_url_hint
 
         # Add task plan context if available
         plan_context = ""
