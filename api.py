@@ -55,6 +55,7 @@ TOOL_LEAK_PATTERNS = [
     "tool_calls",
     "<|tool_call|>",
     "<|tool_calls|>",
+    "<function_",
 ]
 
 # Matches fenced code blocks (``` ... ```) and inline code (`...`).
@@ -99,6 +100,8 @@ def detect_tool_leak(content: str) -> bool:
     # Extra guard for raw shell command dumps without explicit tool_calls.
     stripped = content_lower.strip()
     if stripped.startswith("curl ") or stripped.startswith("curl -x"):
+        return True
+    if _re.search(r"<[a-z_][\w]*\([^<>]*\)>", stripped):
         return True
 
     return False
@@ -195,6 +198,82 @@ def _parse_json_tool_calls_blob(blob: str) -> list[dict[str, Any]]:
     return []
 
 
+def _coerce_xml_parameter_value(raw_value: str) -> Any:
+    """Coerce simple XML parameter text into a JSON-like Python value."""
+    value = raw_value.strip()
+    if not value:
+        return ""
+
+    if re.fullmatch(r"-?\d+", value):
+        try:
+            return int(value)
+        except Exception:
+            return value
+
+    if re.fullmatch(r"-?\d+\.\d+", value):
+        try:
+            return float(value)
+        except Exception:
+            return value
+
+    lowered = value.lower()
+    if lowered in {"true", "false", "null"}:
+        try:
+            return json.loads(lowered)
+        except Exception:
+            return value
+
+    if value.startswith("{") or value.startswith("[") or value.startswith('"'):
+        try:
+            return json.loads(value)
+        except Exception:
+            return value
+
+    return value
+
+
+def _parse_xml_tool_call_blob(blob: str) -> list[dict[str, Any]]:
+    """Parse XML-style function markup emitted by some executor models."""
+    stripped = blob.strip()
+    match = re.fullmatch(
+        r"(?is)<function_(?P<name>[a-zA-Z_][\w-]*)>\s*(?P<body>.*?)\s*</function_(?P=name)>",
+        stripped,
+    )
+    if not match:
+        return []
+
+    tool_name = match.group("name").replace("-", "_")
+    if tool_name not in TOOLS:
+        return []
+
+    body = match.group("body").strip()
+    parameters: dict[str, Any] = {}
+    for param_match in re.finditer(
+        r'(?is)<parameter\s+name=["\'](?P<name>[^"\']+)["\']\s*>(?P<value>.*?)</parameter>',
+        body,
+    ):
+        param_name = param_match.group("name").strip()
+        if not param_name:
+            continue
+        parameters[param_name] = _coerce_xml_parameter_value(
+            param_match.group("value")
+        )
+
+    if not parameters and body:
+        return []
+
+    return [
+        {
+            "id": "inferred_xml_1",
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "arguments": json.dumps(parameters),
+            },
+        }
+    ]
+
+
 def infer_tool_calls_from_content(content: str) -> list[dict[str, Any]]:
     """Infer strict fallback tool calls when model emits command blocks as plain text.
 
@@ -219,6 +298,10 @@ def infer_tool_calls_from_content(content: str) -> list[dict[str, Any]]:
                     },
                 }
             ]
+
+    xml_calls = _parse_xml_tool_call_blob(content)
+    if xml_calls:
+        return xml_calls
 
     return _parse_json_tool_calls_blob(content)
 

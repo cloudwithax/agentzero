@@ -19,7 +19,7 @@ from urllib.parse import urlparse
 import aiohttp
 from aiohttp import web
 
-from handler import AgentHandler
+from handler import AgentHandler, PRIMARY_MODEL_ID
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +29,11 @@ pending_prompt_phone_numbers: Dict[str, bool] = {}
 pending_telegram_media_groups: Dict[str, dict[str, Any]] = {}
 telegram_media_group_lock = asyncio.Lock()
 session_delivery_targets: Dict[str, dict[str, Any]] = {}
+
+_processed_telegram_update_ids: set[int] = set()
+_telegram_content_dedup_keys: set[str] = set()
+_TELEGRAM_DEDUP_TTL_SECONDS = 60
+_TELEGRAM_CONTENT_DEDUP_WINDOW = 30
 
 # Valid multimodal models for image inputs.
 MULTIMODAL_MODEL_IDS = {
@@ -66,6 +71,17 @@ SENDBLUE_TAPBACK_VALID_REACTIONS = {
     "emphasize",
     "question",
 }
+TELEGRAM_REACTION_EMOJI_MAP = {
+    "like": "👍",
+    "love": "❤️",
+    "dislike": "👎",
+    "laugh": "😂",
+    "emphasize": "🔥",
+    "question": "🤔",
+}
+TELEGRAM_REACTION_VALID_TYPES = set(TELEGRAM_REACTION_EMOJI_MAP.keys())
+TELEGRAM_AUTO_REACTION_ENABLED_DEFAULT = True
+TELEGRAM_AUTO_REACTION_PROBABILITY_DEFAULT = 0.2
 SENDBLUE_TAPBACK_LAUGH_PATTERN = re.compile(
     r"\b(?:lol|lmao|lmfao|rofl|haha+|hehe+)\b",
     re.IGNORECASE,
@@ -510,15 +526,34 @@ def _max_image_attachments_per_message() -> int:
     )
 
 
-def _voice_memo_transcription_enabled() -> bool:
-    """Allow disabling Sendblue voice memo transcription for troubleshooting."""
-    return _to_bool(os.environ.get("SENDBLUE_VOICE_MEMO_TRANSCRIPTION_ENABLED", "1"))
+def _voice_memo_env(
+    config_prefix: str,
+    suffix: str,
+    default: str,
+) -> str:
+    """Resolve voice-memo config with channel-specific override and Sendblue fallback."""
+    normalized_prefix = (config_prefix or "SENDBLUE").strip().upper() or "SENDBLUE"
+    specific_key = f"{normalized_prefix}_{suffix}"
+    if specific_key in os.environ:
+        return os.environ.get(specific_key, default)
+
+    fallback_key = f"SENDBLUE_{suffix}"
+    return os.environ.get(fallback_key, default)
 
 
-def _voice_memo_max_bytes() -> int:
+def _voice_memo_transcription_enabled(config_prefix: str = "SENDBLUE") -> bool:
+    """Allow disabling voice memo transcription for troubleshooting."""
+    return _to_bool(
+        _voice_memo_env(config_prefix, "VOICE_MEMO_TRANSCRIPTION_ENABLED", "1")
+    )
+
+
+def _voice_memo_max_bytes(config_prefix: str = "SENDBLUE") -> int:
     """Resolve max accepted voice memo size from env with sane defaults."""
-    raw_value = os.environ.get(
-        "SENDBLUE_VOICE_MEMO_MAX_BYTES", str(VOICE_MEMO_MAX_BYTES_DEFAULT)
+    raw_value = _voice_memo_env(
+        config_prefix,
+        "VOICE_MEMO_MAX_BYTES",
+        str(VOICE_MEMO_MAX_BYTES_DEFAULT),
     )
     try:
         parsed = int(raw_value)
@@ -527,7 +562,8 @@ def _voice_memo_max_bytes() -> int:
         return parsed
     except (TypeError, ValueError):
         logger.warning(
-            "Invalid SENDBLUE_VOICE_MEMO_MAX_BYTES=%r, defaulting to %s",
+            "Invalid %s_VOICE_MEMO_MAX_BYTES=%r, defaulting to %s",
+            (config_prefix or "SENDBLUE").strip().upper() or "SENDBLUE",
             raw_value,
             VOICE_MEMO_MAX_BYTES_DEFAULT,
         )
@@ -713,11 +749,14 @@ def _is_native_imessage_m4a(filename: str, content_type: str | None) -> bool:
 def _convert_m4a_audio_with_ffmpeg_sync(
     audio_bytes: bytes,
     filename: str,
+    config_prefix: str = "SENDBLUE",
 ) -> tuple[bytes, str, str] | None:
     """Convert m4a/caf voice memo bytes to WAV using ffmpeg for ASR compatibility."""
     ffmpeg_bin = (
-        os.environ.get(
-            "SENDBLUE_VOICE_MEMO_FFMPEG_BIN", VOICE_MEMO_FFMPEG_BIN_DEFAULT
+        _voice_memo_env(
+            config_prefix,
+            "VOICE_MEMO_FFMPEG_BIN",
+            VOICE_MEMO_FFMPEG_BIN_DEFAULT,
         ).strip()
         or VOICE_MEMO_FFMPEG_BIN_DEFAULT
     )
@@ -868,6 +907,8 @@ async def _transcribe_audio_bytes_with_whisper(
     audio_bytes: bytes,
     filename: str,
     content_type: str | None,
+    *,
+    config_prefix: str = "SENDBLUE",
 ) -> str | None:
     """Transcribe audio bytes through NVIDIA's hosted Riva ASR endpoint."""
     api_key = os.environ.get("NVIDIA_API_KEY", "").strip()
@@ -877,24 +918,32 @@ async def _transcribe_audio_bytes_with_whisper(
         )
         return None
 
-    grpc_server = os.environ.get(
-        "SENDBLUE_VOICE_MEMO_GRPC_SERVER", NVIDIA_WHISPER_GRPC_SERVER
+    grpc_server = _voice_memo_env(
+        config_prefix,
+        "VOICE_MEMO_GRPC_SERVER",
+        NVIDIA_WHISPER_GRPC_SERVER,
     ).strip()
     if not grpc_server:
         grpc_server = NVIDIA_WHISPER_GRPC_SERVER
 
-    function_id = os.environ.get(
-        "SENDBLUE_VOICE_MEMO_FUNCTION_ID", NVIDIA_WHISPER_FUNCTION_ID
+    function_id = _voice_memo_env(
+        config_prefix,
+        "VOICE_MEMO_FUNCTION_ID",
+        NVIDIA_WHISPER_FUNCTION_ID,
     ).strip()
     if not function_id:
         function_id = NVIDIA_WHISPER_FUNCTION_ID
 
-    language_code = os.environ.get("SENDBLUE_VOICE_MEMO_LANGUAGE", "en-US").strip()
+    language_code = _voice_memo_env(
+        config_prefix,
+        "VOICE_MEMO_LANGUAGE",
+        "en-US",
+    ).strip()
     if not language_code:
         language_code = "en-US"
 
     # Optional model-name override. Most hosted calls route by function-id metadata.
-    model_name = os.environ.get("SENDBLUE_VOICE_MEMO_MODEL", "").strip()
+    model_name = _voice_memo_env(config_prefix, "VOICE_MEMO_MODEL", "").strip()
 
     loop = asyncio.get_running_loop()
     transcript = await loop.run_in_executor(
@@ -918,6 +967,7 @@ async def _transcribe_audio_bytes_with_whisper(
         _convert_m4a_audio_with_ffmpeg_sync,
         audio_bytes,
         filename,
+        config_prefix,
     )
     if not converted_payload:
         return None
@@ -940,9 +990,11 @@ async def _transcribe_voice_memo_attachment_url(
     session: aiohttp.ClientSession,
     source_url: str,
     index: int,
+    *,
+    config_prefix: str = "SENDBLUE",
 ) -> str | None:
     """Download an audio attachment URL and transcribe it with Whisper."""
-    max_bytes = _voice_memo_max_bytes()
+    max_bytes = _voice_memo_max_bytes(config_prefix)
 
     try:
         async with session.get(source_url) as source_response:
@@ -985,21 +1037,24 @@ async def _transcribe_voice_memo_attachment_url(
             audio_bytes,
             filename,
             content_type,
+            config_prefix=config_prefix,
         )
     except Exception as e:
         logger.warning("Failed to transcribe voice memo URL %s: %s", source_url, e)
         return None
 
 
-async def _transcribe_sendblue_voice_memos(
+async def _transcribe_voice_memo_attachments(
     text: str,
     attachment_urls: list[str],
+    *,
+    config_prefix: str = "SENDBLUE",
 ) -> tuple[str, list[str]]:
     """Transcribe audio attachments and remove them from image attachment flow."""
     normalized_text = (text or "").strip()
     normalized_attachments = _normalize_attachment_urls(attachment_urls)
 
-    if not normalized_attachments or not _voice_memo_transcription_enabled():
+    if not normalized_attachments or not _voice_memo_transcription_enabled(config_prefix):
         return normalized_text, normalized_attachments
 
     voice_memo_urls, passthrough_urls = _split_voice_memo_attachments(
@@ -1016,6 +1071,7 @@ async def _transcribe_sendblue_voice_memos(
                 session,
                 voice_memo_url,
                 index,
+                config_prefix=config_prefix,
             )
             if transcript:
                 transcripts.append(transcript)
@@ -1030,11 +1086,23 @@ async def _transcribe_sendblue_voice_memos(
     return merged_text, passthrough_urls
 
 
+async def _transcribe_sendblue_voice_memos(
+    text: str,
+    attachment_urls: list[str],
+) -> tuple[str, list[str]]:
+    """Transcribe Sendblue audio attachments and remove them from image flow."""
+    return await _transcribe_voice_memo_attachments(
+        text,
+        attachment_urls,
+        config_prefix="SENDBLUE",
+    )
+
+
 async def _backfill_untranscribed_voice_memo_conversations(
     handler: AgentHandler,
 ) -> dict[str, int | str]:
     """Retry transcription for legacy conversation rows with unresolved voice memo URLs."""
-    if not _voice_memo_transcription_enabled():
+    if not _voice_memo_transcription_enabled("SENDBLUE"):
         return {
             "scanned": 0,
             "updated": 0,
@@ -1140,6 +1208,7 @@ async def _backfill_untranscribed_voice_memo_conversations(
                     session,
                     source_url,
                     index,
+                    config_prefix="SENDBLUE",
                 )
                 if transcript:
                     recovered_transcripts.append(transcript)
@@ -1541,6 +1610,54 @@ def _remember_processed_sendblue_content(
     )
 
 
+def _remember_processed_telegram_update_id(update_id: int) -> None:
+    """Track a processed Telegram update ID with TTL-based expiry."""
+    if update_id is None:
+        return
+    _processed_telegram_update_ids.add(update_id)
+    asyncio.get_running_loop().call_later(
+        _TELEGRAM_DEDUP_TTL_SECONDS,
+        lambda uid=update_id: _processed_telegram_update_ids.discard(uid),
+    )
+
+
+def _make_telegram_content_dedup_key(user_id: int, content: str) -> str:
+    """Build a stable dedup key from user_id + text for Telegram messages."""
+    raw = f"{user_id}:{(content or '').strip()}"
+    return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:20]
+
+
+def _remember_processed_telegram_content(user_id: int, content: str) -> None:
+    """Track processed Telegram (user_id, content) pairs with expiry."""
+    if not user_id or not (content or "").strip():
+        return
+    key = _make_telegram_content_dedup_key(user_id, content)
+    _telegram_content_dedup_keys.add(key)
+    asyncio.get_running_loop().call_later(
+        _TELEGRAM_CONTENT_DEDUP_WINDOW,
+        lambda k=key: _telegram_content_dedup_keys.discard(k),
+    )
+
+
+def _is_telegram_duplicate(update_id: int, user_id: int, text: str) -> bool:
+    """Check whether a Telegram update has already been processed."""
+    if update_id is not None and update_id in _processed_telegram_update_ids:
+        return True
+    if not text or not user_id:
+        return False
+    key = _make_telegram_content_dedup_key(user_id, text)
+    if key in _telegram_content_dedup_keys:
+        return True
+    return False
+
+
+def _mark_telegram_processed(update_id: int, user_id: int, text: str) -> None:
+    """Mark a Telegram message as processed in both dedup trackers."""
+    _remember_processed_telegram_update_id(update_id)
+    if text and user_id:
+        _remember_processed_telegram_content(user_id, text)
+
+
 def _schedule_sendblue_pending_flush_locked(
     pending_sendblue_messages: dict[str, dict[str, Any]],
     sender_number: str,
@@ -1666,7 +1783,7 @@ async def _has_pending_sendblue_message(
 
 
 def _model_supports_multimodal() -> bool:
-    model_id = os.environ.get("MODEL_ID", "").strip().lower()
+    model_id = PRIMARY_MODEL_ID.lower()
     return model_id in MULTIMODAL_MODEL_IDS
 
 
@@ -2112,7 +2229,7 @@ async def _telegram_file_url(bot: Any, file_id: str) -> str | None:
 
 
 async def _extract_telegram_attachment_urls(message: Any, bot: Any) -> list[str]:
-    """Extract image attachment URLs from a Telegram message."""
+    """Extract image/audio attachment URLs from a Telegram message."""
     urls: list[str] = []
 
     if message.photo:
@@ -2120,16 +2237,42 @@ async def _extract_telegram_attachment_urls(message: Any, bot: Any) -> list[str]
         if photo_url:
             urls.append(photo_url)
 
+    if getattr(message, "voice", None):
+        voice_url = await _telegram_file_url(bot, message.voice.file_id)
+        if voice_url:
+            urls.append(voice_url)
+
+    if getattr(message, "audio", None):
+        audio_url = await _telegram_file_url(bot, message.audio.file_id)
+        if audio_url:
+            urls.append(audio_url)
+
     if (
         message.document
         and isinstance(message.document.mime_type, str)
-        and message.document.mime_type.startswith("image/")
+        and (
+            message.document.mime_type.startswith("image/")
+            or message.document.mime_type.startswith("audio/")
+        )
     ):
         doc_url = await _telegram_file_url(bot, message.document.file_id)
         if doc_url:
             urls.append(doc_url)
 
     return _normalize_attachment_urls(urls)
+
+
+async def _build_telegram_user_content(
+    text: str,
+    attachment_urls: list[str],
+) -> str | list[dict[str, Any]]:
+    """Build Telegram user content, including optional voice-note transcription."""
+    merged_text, filtered_attachments = await _transcribe_voice_memo_attachments(
+        text,
+        attachment_urls,
+        config_prefix="TELEGRAM",
+    )
+    return await _build_user_message_content_async(merged_text, filtered_attachments)
 
 
 async def _send_telegram_response(
@@ -2163,6 +2306,122 @@ async def _send_telegram_response(
         await bot.send_media_group(chat_id=chat_id, media=media_group)
 
 
+def _telegram_auto_reaction_enabled() -> bool:
+    """Allow disabling Telegram auto-reactions for troubleshooting."""
+    return _to_bool(
+        os.environ.get(
+            "TELEGRAM_AUTO_REACTION_ENABLED",
+            "1" if TELEGRAM_AUTO_REACTION_ENABLED_DEFAULT else "0",
+        )
+    )
+
+
+def _telegram_auto_reaction_probability() -> float:
+    """Resolve Telegram auto-reaction probability from env with sane defaults."""
+    return _env_float(
+        "TELEGRAM_AUTO_REACTION_PROBABILITY",
+        TELEGRAM_AUTO_REACTION_PROBABILITY_DEFAULT,
+        minimum=0.0,
+        maximum=1.0,
+    )
+
+
+async def send_telegram_reaction(
+    chat_id: int,
+    message_id: int,
+    reaction: str,
+    *,
+    bot: Any | None = None,
+) -> dict[str, Any]:
+    """Send a Telegram emoji reaction for a specific inbound message."""
+    try:
+        normalized_chat_id = int(chat_id)
+    except (TypeError, ValueError):
+        return {"success": False, "error": "chat_id must be an integer"}
+
+    try:
+        normalized_message_id = int(message_id)
+    except (TypeError, ValueError):
+        return {"success": False, "error": "message_id must be an integer"}
+
+    normalized_reaction = (reaction or "").strip().lower()
+    emoji = TELEGRAM_REACTION_EMOJI_MAP.get(normalized_reaction)
+    if not emoji:
+        return {
+            "success": False,
+            "error": (
+                "Invalid reaction. Must be one of: "
+                + ", ".join(sorted(TELEGRAM_REACTION_VALID_TYPES))
+            ),
+        }
+
+    if bot is None:
+        bot = await _build_fallback_telegram_bot()
+    if bot is None:
+        return {"success": False, "error": "No Telegram bot available"}
+
+    try:
+        from telegram import ReactionTypeEmoji
+
+        applied = await bot.set_message_reaction(
+            chat_id=normalized_chat_id,
+            message_id=normalized_message_id,
+            reaction=[ReactionTypeEmoji(emoji=emoji)],
+        )
+        return {
+            "success": bool(applied),
+            "chat_id": normalized_chat_id,
+            "message_id": normalized_message_id,
+            "reaction": normalized_reaction,
+            "emoji": emoji,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+async def _maybe_send_random_telegram_reaction(
+    chat_id: int,
+    message_id: int,
+    message_text: str,
+    *,
+    bot: Any | None = None,
+) -> dict[str, Any] | None:
+    """Randomly send an appropriate Telegram reaction for relevant inbound text."""
+    normalized_text = (message_text or "").strip()
+    if (
+        not normalized_text
+        or not _telegram_auto_reaction_enabled()
+        or random.random() > _telegram_auto_reaction_probability()
+    ):
+        return None
+
+    reaction = _choose_sendblue_tapback_reaction(normalized_text)
+    if not reaction:
+        return None
+
+    result = await send_telegram_reaction(
+        chat_id=chat_id,
+        message_id=message_id,
+        reaction=reaction,
+        bot=bot,
+    )
+    if result.get("success"):
+        logger.debug(
+            "Sent Telegram auto reaction=%s for chat_id=%s message_id=%s",
+            reaction,
+            chat_id,
+            message_id,
+        )
+    else:
+        logger.debug(
+            "Failed Telegram auto reaction for chat_id=%s message_id=%s: %s",
+            chat_id,
+            message_id,
+            result,
+        )
+    return result
+
+
 async def _process_telegram_message(
     handler: Any,
     user_id: int,
@@ -2170,6 +2429,8 @@ async def _process_telegram_message(
     text: str,
     attachment_urls: list[str],
     bot: Any,
+    *,
+    request_metadata: Optional[dict[str, Any]] = None,
 ) -> None:
     """Process a Telegram user message and send text/media reply."""
     session_id = f"tg_{user_id}"
@@ -2220,7 +2481,7 @@ async def _process_telegram_message(
                 )
             return
 
-    user_content = await _build_user_message_content_async(
+    user_content = await _build_telegram_user_content(
         normalized_text,
         attachment_urls,
     )
@@ -2233,11 +2494,45 @@ async def _process_telegram_message(
             return
         await _send_telegram_response(bot, chat_id, interim_text, interim_attachments)
 
-    response = await handler.handle(
-        {"messages": [{"role": "user", "content": user_content}]},
-        session_id=session_id,
-        interim_response_callback=_send_interim_response,
-    )
+    stop_typing = asyncio.Event()
+
+    async def _typing_loop() -> None:
+        try:
+            while not stop_typing.is_set():
+                try:
+                    await asyncio.wait_for(stop_typing.wait(), timeout=4.0)
+                except asyncio.TimeoutError:
+                    if stop_typing.is_set():
+                        break
+                    await bot.send_chat_action(chat_id=chat_id, action="typing")
+                    continue
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logger.debug(
+                "Telegram typing indicator loop failed for chat_id=%s: %s",
+                chat_id,
+                e,
+            )
+
+    await bot.send_chat_action(chat_id=chat_id, action="typing")
+    typing_task = asyncio.create_task(_typing_loop())
+
+    try:
+        response = await handler.handle(
+            {"messages": [{"role": "user", "content": user_content}]},
+            session_id=session_id,
+            interim_response_callback=_send_interim_response,
+            request_metadata=request_metadata,
+        )
+    finally:
+        stop_typing.set()
+        typing_task.cancel()
+        try:
+            await asyncio.wait_for(typing_task, timeout=1.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass
+
     response_text, response_attachments = _extract_agent_response_payload(response)
     await _send_telegram_response(bot, chat_id, response_text, response_attachments)
 
@@ -2266,6 +2561,7 @@ async def _queue_telegram_media_group(
                 "messages": [],
                 "user_id": update.effective_user.id,
                 "chat_id": update.effective_chat.id,
+                "message_id": update.message.message_id,
                 "task": None,
             }
             pending_telegram_media_groups[group_key] = group
@@ -2294,9 +2590,14 @@ async def _queue_telegram_media_group(
                 if not text and not attachments:
                     return
 
-                await context.bot.send_chat_action(
-                    chat_id=payload["chat_id"], action="typing"
-                )
+                message_id = payload.get("message_id")
+                if isinstance(message_id, int) and message_id > 0:
+                    await _maybe_send_random_telegram_reaction(
+                        payload["chat_id"],
+                        message_id,
+                        text,
+                        bot=context.bot,
+                    )
                 await _process_telegram_message(
                     handler,
                     user_id=payload["user_id"],
@@ -2304,6 +2605,12 @@ async def _queue_telegram_media_group(
                     text=text,
                     attachment_urls=attachments,
                     bot=context.bot,
+                    request_metadata={
+                        "telegram_chat_id": payload["chat_id"],
+                        "telegram_message_id": message_id,
+                    }
+                    if isinstance(message_id, int) and message_id > 0
+                    else None,
                 )
 
             group["task"] = asyncio.create_task(_flush_group())
@@ -3623,7 +3930,16 @@ async def telegram_unknown_command(
             )
         return
 
-    await update.message.chat.send_action(action="typing")
+    request_metadata = {
+        "telegram_chat_id": update.effective_chat.id,
+        "telegram_message_id": update.message.message_id,
+    }
+    await _maybe_send_random_telegram_reaction(
+        update.effective_chat.id,
+        update.message.message_id,
+        remaining_text,
+        bot=context.bot,
+    )
     await _process_telegram_message(
         handler,
         user_id=update.effective_user.id,
@@ -3631,6 +3947,7 @@ async def telegram_unknown_command(
         text=remaining_text,
         attachment_urls=[],
         bot=context.bot,
+        request_metadata=request_metadata,
     )
 
 
@@ -3681,8 +3998,25 @@ async def telegram_handle_msg(
     if not text and not attachments:
         return
 
-    # Normal message handling
-    await update.message.chat.send_action(action="typing")
+    if _is_telegram_duplicate(update.update_id, user_id, text):
+        logger.debug(
+            "Skipping duplicate Telegram update_id=%s from user_id=%s",
+            update.update_id,
+            user_id,
+        )
+        return
+    _mark_telegram_processed(update.update_id, user_id, text)
+
+    request_metadata = {
+        "telegram_chat_id": chat_id,
+        "telegram_message_id": update.message.message_id,
+    }
+    await _maybe_send_random_telegram_reaction(
+        chat_id,
+        update.message.message_id,
+        text,
+        bot=context.bot,
+    )
     await _process_telegram_message(
         handler,
         user_id=user_id,
@@ -3690,6 +4024,7 @@ async def telegram_handle_msg(
         text=text,
         attachment_urls=attachments,
         bot=context.bot,
+        request_metadata=request_metadata,
     )
 
 

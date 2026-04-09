@@ -556,6 +556,72 @@ async def test_imessage_handle_ids_are_injected_and_persisted() -> None:
             os.remove(tmp.name)
 
 
+async def test_telegram_reaction_targets_are_injected_and_persisted() -> None:
+    print("=== Test: Telegram reaction targets are injected and persisted ===")
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+    tmp.close()
+
+    try:
+        store, handler = _create_store_and_handler(tmp.name)
+        session_id = "tg_4242"
+
+        store.add_conversation_message(
+            role="user",
+            content="Earlier Telegram inbound message",
+            session_id=session_id,
+            metadata={"telegram_chat_id": 4242, "telegram_message_id": 111},
+        )
+
+        captured_payload: dict[str, object] = {}
+
+        async def _fake_api_call(_session, _url, payload, _headers, **_kwargs):
+            captured_payload["messages"] = payload.get("messages", [])
+            return {"id": "fake", "choices": [{"message": {"role": "assistant"}}]}
+
+        with (
+            patch.object(
+                handler.memory_store, "search_memories", new=AsyncMock(return_value=[])
+            ),
+            patch(
+                "handler.api_call_with_retry", new=AsyncMock(side_effect=_fake_api_call)
+            ),
+            patch("handler.process_response", new=AsyncMock(return_value="ok")),
+        ):
+            result = await handler.handle(
+                {"messages": [{"role": "user", "content": "React to this one"}]},
+                session_id=session_id,
+                request_metadata={
+                    "telegram_chat_id": 4242,
+                    "telegram_message_id": 222,
+                },
+            )
+
+        assert result == "ok"
+        assert captured_payload.get("messages")
+
+        system_content = str(captured_payload["messages"][0]["content"])
+        assert "Available Telegram reaction targets" in system_content
+        assert "chat_id=4242; message_id=222" in system_content
+        assert "chat_id=4242; message_id=111" in system_content
+
+        history = store.get_conversation_history(session_id=session_id, limit=10)
+        matching_user_rows = [
+            message
+            for message in history
+            if message.get("role") == "user"
+            and message.get("content") == "React to this one"
+        ]
+        assert matching_user_rows
+        latest_user_row = matching_user_rows[0]
+        assert latest_user_row.get("metadata", {}).get("telegram_chat_id") == 4242
+        assert latest_user_row.get("metadata", {}).get("telegram_message_id") == 222
+
+        print("✓ Telegram reaction targets are visible to the model and stored")
+    finally:
+        if os.path.exists(tmp.name):
+            os.remove(tmp.name)
+
+
 async def test_handle_injects_request_freshness_token() -> None:
     print("=== Test: request freshness token is injected into system prompt ===")
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
@@ -706,6 +772,7 @@ async def main() -> int:
     await test_cross_channel_recall_is_injected_into_handle_context()
     await test_imessage_session_injects_mobile_prompt_defaults()
     await test_imessage_handle_ids_are_injected_and_persisted()
+    await test_telegram_reaction_targets_are_injected_and_persisted()
     await test_handle_injects_request_freshness_token()
     await test_handle_strips_delivery_directives_from_response()
     await test_handle_strips_internal_prompt_residue_from_response()

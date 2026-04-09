@@ -22,10 +22,12 @@ async def test_tools_work():
     print("✓ read supports model-style limit slicing")
 
     sliced_with_offset = await TOOLS["read"](filepath="AGENTS.md", offset=1, limit=1)
-    assert sliced_with_offset["success"], f"Read offset slice failed: {sliced_with_offset}"
-    assert sliced_with_offset["content"].startswith("# AgentZero"), (
-        f"Unexpected offset slice: {sliced_with_offset}"
-    )
+    assert sliced_with_offset[
+        "success"
+    ], f"Read offset slice failed: {sliced_with_offset}"
+    assert sliced_with_offset["content"].startswith(
+        "# AgentZero"
+    ), f"Unexpected offset slice: {sliced_with_offset}"
     print("✓ read supports human-friendly offset slicing")
 
     # Test glob
@@ -47,9 +49,9 @@ async def test_tools_work():
         max_matches=1,
     )
     assert include_result["success"], f"Grep include failed: {include_result}"
-    assert len(include_result["matches"]) == 1, (
-        f"Unexpected grep include matches: {include_result}"
-    )
+    assert (
+        len(include_result["matches"]) == 1
+    ), f"Unexpected grep include matches: {include_result}"
     print("✓ grep supports include/max_matches arguments")
 
     # Test bash
@@ -68,6 +70,9 @@ async def test_tools_work():
     assert "reminder_cancel" in TOOLS
     assert "reminder_run_now" in TOOLS
     assert "send_tapback" in TOOLS
+    assert "send_telegram_reaction" in TOOLS
+    assert "consult_advisor" in TOOLS
+    assert "consult_reviewer" in TOOLS
     print("✓ consortium management tools are registered")
 
     print("All tools functional!\n")
@@ -91,6 +96,11 @@ async def test_payload_isolation():
     assert "reminder_cancel" in tool_names, "reminder_cancel missing from payload"
     assert "reminder_run_now" in tool_names, "reminder_run_now missing from payload"
     assert "send_tapback" in tool_names, "send_tapback missing from payload"
+    assert (
+        "send_telegram_reaction" in tool_names
+    ), "send_telegram_reaction missing from payload"
+    assert "consult_advisor" in tool_names, "consult_advisor missing from payload"
+    assert "consult_reviewer" in tool_names, "consult_reviewer missing from payload"
     assert "consortium_agree" not in tool_names, "consortium_agree should not be public"
 
     # Simulate what handle() does

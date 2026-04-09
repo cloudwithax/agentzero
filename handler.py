@@ -20,7 +20,9 @@ from skills import SkillRegistry
 from reminder_tasks import ReminderScheduler
 from tools import (
     reset_tool_runtime_session,
+    set_advisor_controller,
     set_consortium_controller,
+    set_reviewer_controller,
     set_reminder_controller,
     set_tool_runtime_session,
     set_acp_agent,
@@ -31,6 +33,7 @@ from prompt_templates import get_template
 logger = logging.getLogger(__name__)
 
 IMESSAGE_HANDLE_CONTEXT_LIMIT = 50
+TELEGRAM_REACTION_CONTEXT_LIMIT = 50
 REQUEST_FRESHNESS_INSTRUCTION = (
     "[Request Freshness]: This turn includes a one-time freshness token to discourage "
     "cache reuse and repeated phrasing. Treat the request as new and answer independently."
@@ -150,7 +153,7 @@ if _OPENAI_CLIENT_BASE_URL and _OPENAI_CLIENT_API_KEY:
     if not BASE_URL.endswith("/chat/completions"):
         BASE_URL = BASE_URL + "/chat/completions"
     API_KEY = _OPENAI_CLIENT_API_KEY
-    MODEL_ID = _OPENAI_CLIENT_MODEL or os.environ.get(
+    _DEFAULT_MODEL_ID = _OPENAI_CLIENT_MODEL or os.environ.get(
         "MODEL_ID", "moonshotai/kimi-k2-instruct-0905"
     )
 else:
@@ -159,7 +162,26 @@ else:
         "NVIDIA_API_KEY",
         "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",
     )
-    MODEL_ID = os.environ.get("MODEL_ID", "moonshotai/kimi-k2-instruct-0905")
+    _DEFAULT_MODEL_ID = os.environ.get("MODEL_ID", "moonshotai/kimi-k2-instruct-0905")
+
+EXECUTOR_MODEL_ID = (
+    os.environ.get("EXECUTOR_MODEL", "").strip()
+    or os.environ.get("PREFLIGHT_MODEL", "").strip()
+    or _DEFAULT_MODEL_ID
+)
+ADVISOR_MODEL_ID = (
+    os.environ.get("ADVISOR_MODEL", "").strip()
+    or os.environ.get("MAIN_MODEL", "").strip()
+    or _DEFAULT_MODEL_ID
+)
+REVIEWER_MODEL_ID = (
+    os.environ.get("REVIEWER_MODEL", "").strip()
+    or os.environ.get("ADVISOR_MODEL", "").strip()
+    or os.environ.get("MAIN_MODEL", "").strip()
+    or _DEFAULT_MODEL_ID
+)
+PRIMARY_MODEL_ID = ADVISOR_MODEL_ID
+MODEL_ID = PRIMARY_MODEL_ID
 CONSORTIUM_MODEL_ID = os.environ.get("CONSORTIUM_MODEL", MODEL_ID).strip() or MODEL_ID
 
 # Workspace — all agent-created files must live here.
@@ -168,6 +190,10 @@ _DEFAULT_WORKSPACE = os.path.join(
 )
 AGENT_WORKSPACE = os.path.normpath(
     os.environ.get("AGENT_WORKSPACE", _DEFAULT_WORKSPACE).strip() or _DEFAULT_WORKSPACE
+)
+ADVISOR_RESPONSE_MAX_TOKENS = int(os.environ.get("ADVISOR_RESPONSE_MAX_TOKENS", "1200"))
+REVIEWER_RESPONSE_MAX_TOKENS = int(
+    os.environ.get("REVIEWER_RESPONSE_MAX_TOKENS", "1400")
 )
 
 # Base payload template (do not mutate globally)
@@ -591,6 +617,91 @@ BASE_PAYLOAD = {
                         },
                     },
                     "required": ["message_handle", "reaction"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "send_telegram_reaction",
+                "description": "Send a Telegram emoji reaction to a specific inbound Telegram message",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "chat_id": {
+                            "type": "integer",
+                            "description": "Telegram chat ID where the inbound message was received",
+                        },
+                        "message_id": {
+                            "type": "integer",
+                            "description": "Telegram message ID to react to",
+                        },
+                        "reaction": {
+                            "type": "string",
+                            "enum": [
+                                "love",
+                                "like",
+                                "dislike",
+                                "laugh",
+                                "emphasize",
+                                "question",
+                            ],
+                            "description": "Telegram reaction type",
+                        },
+                    },
+                    "required": ["chat_id", "message_id", "reaction"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "consult_advisor",
+                "description": (
+                    "Consult the advisor model for a concise strategy when you hit a hard "
+                    "decision, branching choice, architecture tradeoff, or repeated failure "
+                    "mid-run. The advisor reads the same shared context and returns a plan; "
+                    "after the tool result, continue executing yourself."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "question": {
+                            "type": "string",
+                            "description": "The exact decision or blocker you need the advisor to resolve",
+                        },
+                        "context": {
+                            "type": "string",
+                            "description": "Optional extra context, options under consideration, or recent failed attempts",
+                        },
+                    },
+                    "required": ["question"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "consult_reviewer",
+                "description": (
+                    "Consult the reviewer model for a concise implementation review focused "
+                    "on bugs, regressions, missing validation, and residual risks. Use this "
+                    "after inspection or implementation work when you want a fast risk pass "
+                    "before finalizing."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "question": {
+                            "type": "string",
+                            "description": "The exact thing you want the reviewer to evaluate",
+                        },
+                        "context": {
+                            "type": "string",
+                            "description": "Optional extra context, change summary, known risks, or open questions",
+                        },
+                    },
+                    "required": ["question"],
                 },
             },
         },
@@ -1078,6 +1189,8 @@ class AgentHandler:
             ai_runner=self._run_direct_ai_inference,
             delivery_callback=self._deliver_reminder_output,
         )
+        set_advisor_controller(self)
+        set_reviewer_controller(self)
         set_consortium_controller(self)
         set_reminder_controller(self)
         set_acp_agent(acp_agent)
@@ -1171,6 +1284,166 @@ class AgentHandler:
 
         return (output or "").strip()
 
+    async def consult_advisor(
+        self,
+        question: str,
+        context: str = "",
+        session_id: Optional[str] = None,
+        shared_messages: Optional[list[dict[str, Any]]] = None,
+    ) -> dict[str, Any]:
+        """Consult the advisor model using the current turn's shared context."""
+        normalized_question = str(question or "").strip()
+        if not normalized_question:
+            return {"success": False, "error": "question is required"}
+
+        runtime_messages = [
+            dict(message)
+            for message in (shared_messages or [])
+            if isinstance(message, dict)
+        ]
+        base_system_content = ""
+        non_system_messages: list[dict[str, Any]] = []
+
+        for message in runtime_messages:
+            if message.get("role") == "system" and not base_system_content:
+                base_system_content = _content_to_text(message.get("content", ""))
+                continue
+            non_system_messages.append(message)
+
+        advisor_system_content = get_template(
+            "advisor_consultation",
+            {
+                "base_system_content": base_system_content,
+                "session_id": session_id or "",
+            },
+        )
+        consultation_request = (
+            "[Executor consultation request]\n"
+            f"Decision needed: {normalized_question}\n"
+            f"Additional context: {str(context or '').strip() or 'None provided.'}\n\n"
+            "Return a concise operational memo for the executor with these exact sections:\n"
+            "Decision:\nWhy:\nNext steps:\nRisks:\n"
+        )
+
+        payload = BASE_PAYLOAD.copy()
+        payload["model"] = ADVISOR_MODEL_ID
+        payload["tools"] = []
+        payload["max_tokens"] = ADVISOR_RESPONSE_MAX_TOKENS
+        payload["messages"] = [
+            {"role": "system", "content": advisor_system_content},
+            *non_system_messages,
+            {"role": "user", "content": consultation_request},
+        ]
+
+        async with aiohttp.ClientSession() as session:
+            response_data = await api_call_with_retry(
+                session,
+                BASE_URL,
+                payload,
+                {"Authorization": f"Bearer {API_KEY}"},
+            )
+
+        if "error" in response_data:
+            error_msg = response_data["error"].get("message", "Unknown API error")
+            return {"success": False, "error": error_msg}
+
+        choices = response_data.get("choices") or []
+        if not choices:
+            return {"success": False, "error": "No response from advisor model"}
+
+        advice = safe_strip_markdown(
+            _content_to_text(choices[0].get("message", {}).get("content", ""))
+        ).strip()
+        if not advice:
+            return {"success": False, "error": "Advisor returned empty advice"}
+
+        return {
+            "success": True,
+            "advisor_model": ADVISOR_MODEL_ID,
+            "question": normalized_question,
+            "advice": advice,
+        }
+
+    async def consult_reviewer(
+        self,
+        question: str,
+        context: str = "",
+        session_id: Optional[str] = None,
+        shared_messages: Optional[list[dict[str, Any]]] = None,
+    ) -> dict[str, Any]:
+        """Consult the reviewer model using the current turn's shared context."""
+        normalized_question = str(question or "").strip()
+        if not normalized_question:
+            return {"success": False, "error": "question is required"}
+
+        runtime_messages = [
+            dict(message)
+            for message in (shared_messages or [])
+            if isinstance(message, dict)
+        ]
+        base_system_content = ""
+        non_system_messages: list[dict[str, Any]] = []
+
+        for message in runtime_messages:
+            if message.get("role") == "system" and not base_system_content:
+                base_system_content = _content_to_text(message.get("content", ""))
+                continue
+            non_system_messages.append(message)
+
+        reviewer_system_content = get_template(
+            "reviewer_consultation",
+            {
+                "base_system_content": base_system_content,
+                "session_id": session_id or "",
+            },
+        )
+        review_request = (
+            "[Executor review request]\n"
+            f"Review target: {normalized_question}\n"
+            f"Additional context: {str(context or '').strip() or 'None provided.'}\n\n"
+            "Return a concise operational memo for the executor with these exact sections:\n"
+            "Verdict:\nFindings:\nFixes:\nResidual risks:\n"
+        )
+
+        payload = BASE_PAYLOAD.copy()
+        payload["model"] = REVIEWER_MODEL_ID
+        payload["tools"] = []
+        payload["max_tokens"] = REVIEWER_RESPONSE_MAX_TOKENS
+        payload["messages"] = [
+            {"role": "system", "content": reviewer_system_content},
+            *non_system_messages,
+            {"role": "user", "content": review_request},
+        ]
+
+        async with aiohttp.ClientSession() as session:
+            response_data = await api_call_with_retry(
+                session,
+                BASE_URL,
+                payload,
+                {"Authorization": f"Bearer {API_KEY}"},
+            )
+
+        if "error" in response_data:
+            error_msg = response_data["error"].get("message", "Unknown API error")
+            return {"success": False, "error": error_msg}
+
+        choices = response_data.get("choices") or []
+        if not choices:
+            return {"success": False, "error": "No response from reviewer model"}
+
+        review = safe_strip_markdown(
+            _content_to_text(choices[0].get("message", {}).get("content", ""))
+        ).strip()
+        if not review:
+            return {"success": False, "error": "Reviewer returned empty review"}
+
+        return {
+            "success": True,
+            "reviewer_model": REVIEWER_MODEL_ID,
+            "question": normalized_question,
+            "review": review,
+        }
+
     async def _deliver_reminder_output(
         self,
         session_id: str,
@@ -1204,12 +1477,13 @@ class AgentHandler:
         visible_text = _strip_internal_prompt_residue(visible_text)
         if (
             session_id
-            and session_id.startswith("imessage_")
+            and session_id.startswith(("imessage_", "tg_"))
             and self._BARE_REACTION_RE.match(visible_text.strip())
         ):
             logger.warning(
-                "Suppressing bare reaction word '%s' from outbound iMessage "
-                "delivery — tapbacks must use send_tapback tool.",
+                "Suppressing bare reaction word '%s' from outbound mobile "
+                "delivery — reactions must use send_tapback or "
+                "send_telegram_reaction.",
                 visible_text.strip(),
             )
             return ""
@@ -1824,6 +2098,23 @@ class AgentHandler:
         if isinstance(part_index, int) and part_index >= 0:
             normalized["part_index"] = part_index
 
+        telegram_chat_id = request_metadata.get("telegram_chat_id")
+        if isinstance(telegram_chat_id, str):
+            candidate = telegram_chat_id.strip()
+            if candidate.lstrip("-").isdigit():
+                telegram_chat_id = int(candidate)
+        if isinstance(telegram_chat_id, int):
+            normalized["telegram_chat_id"] = telegram_chat_id
+
+        telegram_message_id = request_metadata.get("telegram_message_id")
+        if (
+            isinstance(telegram_message_id, str)
+            and telegram_message_id.strip().isdigit()
+        ):
+            telegram_message_id = int(telegram_message_id.strip())
+        if isinstance(telegram_message_id, int) and telegram_message_id > 0:
+            normalized["telegram_message_id"] = telegram_message_id
+
         return normalized
 
     @staticmethod
@@ -1917,6 +2208,94 @@ class AgentHandler:
             "\n\n"
             "[Available iMessage tapback handles from current and recent messages]:\n"
             "Use these exact message_handle values when calling send_tapback. Include part_index when present.\n"
+            + "\n".join(lines)
+            + "\n"
+        )
+
+    @staticmethod
+    def _build_telegram_reaction_context_line(
+        entry_index: int,
+        chat_id: int,
+        message_id: int,
+        content: str,
+        label: str,
+    ) -> str:
+        """Format one Telegram reaction target line for the system prompt."""
+        normalized_content = re.sub(r"\s+", " ", (content or "").strip())
+        if len(normalized_content) > 160:
+            normalized_content = f"{normalized_content[:157]}..."
+
+        prefix = f"{entry_index}. {label}: chat_id={chat_id}; message_id={message_id}"
+        if normalized_content:
+            return f'{prefix}; message="{normalized_content}"'
+        return prefix
+
+    def _build_telegram_reaction_context(
+        self,
+        user_query: str,
+        session_id: Optional[str],
+        request_metadata: Optional[dict[str, Any]],
+    ) -> str:
+        """Expose Telegram message IDs so send_telegram_reaction can be called concretely."""
+        if not session_id or not session_id.startswith("tg_"):
+            return ""
+
+        normalized_request_metadata = self._normalize_request_metadata(request_metadata)
+        history = self.memory_store.get_conversation_history(
+            session_id=session_id,
+            limit=TELEGRAM_REACTION_CONTEXT_LIMIT,
+        )
+
+        lines: list[str] = []
+        seen_targets: set[tuple[int, int]] = set()
+
+        current_chat_id = normalized_request_metadata.get("telegram_chat_id")
+        current_message_id = normalized_request_metadata.get("telegram_message_id")
+        if isinstance(current_chat_id, int) and isinstance(current_message_id, int):
+            target = (current_chat_id, current_message_id)
+            seen_targets.add(target)
+            lines.append(
+                self._build_telegram_reaction_context_line(
+                    entry_index=len(lines) + 1,
+                    chat_id=current_chat_id,
+                    message_id=current_message_id,
+                    content=user_query,
+                    label="current inbound message",
+                )
+            )
+
+        for message in history:
+            if str(message.get("role", "")).strip().lower() != "user":
+                continue
+
+            metadata = self._normalize_request_metadata(message.get("metadata"))
+            chat_id = metadata.get("telegram_chat_id")
+            message_id = metadata.get("telegram_message_id")
+            if not isinstance(chat_id, int) or not isinstance(message_id, int):
+                continue
+
+            target = (chat_id, message_id)
+            if target in seen_targets:
+                continue
+
+            seen_targets.add(target)
+            lines.append(
+                self._build_telegram_reaction_context_line(
+                    entry_index=len(lines) + 1,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    content=_content_to_text(message.get("content", "")),
+                    label="recent inbound message",
+                )
+            )
+
+        if not lines:
+            return ""
+
+        return (
+            "\n\n"
+            "[Available Telegram reaction targets from current and recent messages]:\n"
+            "Use these exact chat_id/message_id values when calling send_telegram_reaction.\n"
             + "\n".join(lines)
             + "\n"
         )
@@ -2507,6 +2886,7 @@ class AgentHandler:
         custom_prompt: str,
         memory_context: str,
         plan_context: str,
+        consultation_context: str,
         example_context: str,
         skills_catalog_context: str = "",
         active_skills_context: str = "",
@@ -2530,10 +2910,56 @@ class AgentHandler:
                 else "You are a helpful AI assistant with persistent memory."
             ),
             "plan_context": plan_context,
+            "consultation_context": consultation_context,
             "example_context": example_context,
         }
 
         return get_template("system_prompt", context)
+
+    def _build_consultation_context(
+        self,
+        user_query: str,
+        task: Optional[Any],
+        task_plan: Optional[Any],
+    ) -> str:
+        """Describe primary-model routing and when consultation is appropriate."""
+        if not user_query:
+            return ""
+
+        step_count = len(task_plan.steps) if task_plan and getattr(task_plan, "steps", None) else 0
+        query_length = len(user_query.strip())
+        task_type = str(getattr(task, "type", "generic") or "generic").lower()
+
+        complex_task = (
+            step_count >= 3
+            or query_length >= 180
+            or task_type in {"coding", "research", "analysis", "comparison"}
+        )
+
+        lines = [
+            "\n\n[Execution Architecture]:",
+            f"Primary model for this turn: advisor ({PRIMARY_MODEL_ID}).",
+            "All user-facing channels should stay on the advisor-capable primary model by default.",
+        ]
+
+        if complex_task:
+            lines.extend(
+                [
+                    "This request appears complex enough to use the primary-model-plus-review pattern.",
+                    "Stay on the advisor-capable primary model for the actual work.",
+                    "Use consult_advisor() only if you want a second strategic pass.",
+                    "Use consult_reviewer() after non-trivial implementation or before finalizing risky work.",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "This request appears low-complexity. Prefer staying entirely on the advisor-capable primary model unless you hit a real blocker.",
+                    "Do not escalate to consultation tools unless strategy or risk genuinely requires it.",
+                ]
+            )
+
+        return "\n".join(lines)
 
     def _build_request_freshness_token(self) -> str:
         """Return a unique token for the current visible response generation."""
@@ -2727,12 +3153,12 @@ class AgentHandler:
                 "custom_prompt": custom_prompt,
                 "session_prompt_suffix": session_prompt_suffix,
                 "memory_context": memory_context.strip() if memory_context else "",
-                "skills_catalog_context": skills_catalog_context.strip()
-                if skills_catalog_context
-                else "",
-                "active_skills_context": active_skills_context.strip()
-                if active_skills_context
-                else "",
+                "skills_catalog_context": (
+                    skills_catalog_context.strip() if skills_catalog_context else ""
+                ),
+                "active_skills_context": (
+                    active_skills_context.strip() if active_skills_context else ""
+                ),
                 "request_freshness_token": request_freshness_token,
             },
         )
@@ -2874,12 +3300,12 @@ class AgentHandler:
                 "custom_prompt": custom_prompt,
                 "session_prompt_suffix": session_prompt_suffix,
                 "memory_context": memory_context.strip() if memory_context else "",
-                "skills_catalog_context": skills_catalog_context.strip()
-                if skills_catalog_context
-                else "",
-                "active_skills_context": active_skills_context.strip()
-                if active_skills_context
-                else "",
+                "skills_catalog_context": (
+                    skills_catalog_context.strip() if skills_catalog_context else ""
+                ),
+                "active_skills_context": (
+                    active_skills_context.strip() if active_skills_context else ""
+                ),
                 "request_freshness_token": request_freshness_token,
             },
         )
@@ -3047,6 +3473,18 @@ class AgentHandler:
             except Exception as e:
                 logger.warning(f"Failed to build iMessage handle context: {e}")
 
+        if user_query:
+            try:
+                telegram_reaction_context = self._build_telegram_reaction_context(
+                    user_query=user_query,
+                    session_id=session_id,
+                    request_metadata=normalized_request_metadata,
+                )
+                if telegram_reaction_context:
+                    memory_context += telegram_reaction_context
+            except Exception as e:
+                logger.warning(f"Failed to build Telegram reaction context: {e}")
+
         # Get few-shot examples for the task type
         few_shot_examples = []
         if task:
@@ -3087,6 +3525,12 @@ class AgentHandler:
             for i, step in enumerate(task_plan.steps, 1):
                 plan_context += f"{i}. {step.description}\n"
 
+        consultation_context = self._build_consultation_context(
+            user_query=user_query,
+            task=task,
+            task_plan=task_plan,
+        )
+
         # Add few-shot examples if available
         example_context = ""
         if few_shot_examples:
@@ -3101,6 +3545,7 @@ class AgentHandler:
             custom_prompt=custom_prompt,
             memory_context=memory_context,
             plan_context=plan_context,
+            consultation_context=consultation_context,
             example_context=example_context,
             skills_catalog_context=skills_catalog_context,
             active_skills_context=active_skills_context,

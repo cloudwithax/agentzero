@@ -11,9 +11,11 @@ from api import (
     _apply_cache_busting_headers,
     api_call_with_retry,
     execute_tool_calls,
+    infer_tool_calls_from_content,
     process_response,
 )
 from handler import BASE_URL, API_KEY, BASE_PAYLOAD, FINAL_RESPONSE_MAX_TOKENS
+from prompt_templates import get_template
 
 
 def test_cache_busting_headers_are_applied() -> None:
@@ -30,6 +32,50 @@ def test_cache_busting_headers_are_applied() -> None:
     assert first["X-Request-Id"]
     assert second["X-Request-Id"]
     assert first["X-Request-Id"] != second["X-Request-Id"]
+    print("  ✓ Passed")
+
+
+def test_system_prompt_distinguishes_repo_paths_from_workspace_paths() -> None:
+    """The prompt should tell the executor not to look for repo code under workspace/."""
+    print("Test 0aa: System prompt repo path guidance")
+
+    rendered = get_template(
+        "system_prompt",
+        {
+            "current_time": "2026-04-09 12:00:00",
+            "workspace_path": "/home/clxud/agentzero/workspace",
+            "identity": "You are a helpful AI assistant.",
+        },
+    )
+
+    assert "Repository code path rule:" in rendered
+    assert "Do NOT assume repository files live under" in rendered
+    assert "handler.py" in rendered
+    assert "agentic_loop.py" in rendered
+    assert "consult_reviewer()" in rendered
+    assert "All normal user-facing turns run on the advisor model by default." in rendered
+    assert "TOOL RESULTS ARE GROUND TRUTH:" in rendered
+    assert "Do not self-reject or manually \"safety review\" a user-provided skill URL" in rendered
+    print("  ✓ Passed")
+
+
+def test_infer_tool_calls_from_xml_function_markup() -> None:
+    """XML-style function markup should recover into a real tool call."""
+    print("Test 0ab: Recover XML function markup")
+
+    inferred = infer_tool_calls_from_content(
+        """
+<function_activate_skill>
+<parameter name="name">frontend-design</parameter>
+</function_activate_skill>
+""".strip()
+    )
+
+    assert len(inferred) == 1
+    assert inferred[0]["function"]["name"] == "activate_skill"
+    assert json.loads(inferred[0]["function"]["arguments"]) == {
+        "name": "frontend-design"
+    }
     print("  ✓ Passed")
 
 
@@ -179,9 +225,9 @@ async def test_api_call_with_retry_streams_tool_calls():
 
     tool_calls = response_data["choices"][0]["message"].get("tool_calls") or []
     assert len(tool_calls) == 1, f"Unexpected tool calls: {tool_calls}"
-    assert tool_calls[0]["function"]["name"] == "bash", (
-        f"Unexpected tool call: {tool_calls[0]}"
-    )
+    assert (
+        tool_calls[0]["function"]["name"] == "bash"
+    ), f"Unexpected tool call: {tool_calls[0]}"
     assert tool_calls[0]["function"]["arguments"] == '{"command": "echo hi"}'
     print("  ✓ Passed")
 
@@ -604,9 +650,9 @@ async def test_message_history_preservation():
 
     # Messages should be extended with assistant tool_calls + tool result
     # Original: 2 messages, after: 2 + 1 (assistant) + 1 (tool) = 4
-    assert len(messages) == original_len + 2, (
-        f"Messages not extended properly: {len(messages)}"
-    )
+    assert (
+        len(messages) == original_len + 2
+    ), f"Messages not extended properly: {len(messages)}"
     assert messages[2].get("tool_calls") is not None, "Missing tool_calls"
     assert messages[3]["role"] == "tool", "Missing tool result"
 
@@ -669,9 +715,9 @@ async def test_tool_leak_retry():
     )
 
     assert content == "All set, I fixed it.", f"Unexpected content: {content}"
-    assert mock_session.calls == 1, (
-        f"Expected one follow-up call, got {mock_session.calls}"
-    )
+    assert (
+        mock_session.calls == 1
+    ), f"Expected one follow-up call, got {mock_session.calls}"
     tool_results = [m for m in messages if m.get("role") == "tool"]
     assert len(tool_results) == 1, "Expected inferred bash tool result in history"
     print("  ✓ Passed")
@@ -723,9 +769,9 @@ async def test_tool_leak_fallback():
         max_tool_leak_retries=1,
     )
 
-    assert "internal formatting issue" in content.lower(), (
-        f"Unexpected content: {content}"
-    )
+    assert (
+        "internal formatting issue" in content.lower()
+    ), f"Unexpected content: {content}"
     print("  ✓ Passed")
 
 
@@ -788,12 +834,12 @@ async def test_json_tool_call_recovery():
         first_response, messages, mock_session, BASE_URL, API_KEY, BASE_PAYLOAD.copy()
     )
 
-    assert content == "Recovered and executed successfully.", (
-        f"Unexpected content: {content}"
-    )
-    assert mock_session.calls == 1, (
-        f"Expected one follow-up call, got {mock_session.calls}"
-    )
+    assert (
+        content == "Recovered and executed successfully."
+    ), f"Unexpected content: {content}"
+    assert (
+        mock_session.calls == 1
+    ), f"Expected one follow-up call, got {mock_session.calls}"
     tool_results = [m for m in messages if m.get("role") == "tool"]
     assert len(tool_results) == 1, "Expected recovered tool result in history"
     print("  ✓ Passed")
@@ -1051,6 +1097,232 @@ async def test_initial_payload_has_sufficient_max_tokens_for_complex_requests() 
         tmp.unlink(missing_ok=True)
 
 
+async def test_consult_advisor_uses_advisor_model_and_shared_context() -> None:
+    """Advisor consultations should use the advisor model, no tools, and shared context."""
+    print("Test 14: consult_advisor uses advisor model and shared context")
+
+    from handler import ADVISOR_MODEL_ID, AgentHandler
+    from memory import EnhancedMemoryStore
+    from capabilities import CapabilityProfile, AdaptiveFormatter
+    from examples import AdaptiveFewShotManager, ExampleBank
+    from planning import TaskPlanner, TaskAnalyzer
+
+    tmp = Path("/tmp/test_consult_advisor_regression.db")
+    tmp.touch()
+
+    try:
+        store = EnhancedMemoryStore(db_path=str(tmp), api_key="test")
+        profile = CapabilityProfile(set(), model_name="test")
+        planner = TaskPlanner(profile)
+        analyzer = TaskAnalyzer()
+        formatter = AdaptiveFormatter(profile)
+        examples_manager = AdaptiveFewShotManager(ExampleBank())
+
+        handler_instance = AgentHandler(
+            memory_store=store,
+            capability_profile=profile,
+            example_bank=examples_manager,
+            task_planner=planner,
+            task_analyzer=analyzer,
+            adaptive_formatter=formatter,
+        )
+
+        captured_payloads: list[dict[str, object]] = []
+
+        async def _capture_payload(_session, _url, payload, _headers, **_kw):
+            captured_payloads.append(dict(payload))
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": (
+                                "Decision:\nAdd the advisor tool before editing the loop.\n"
+                                "Why:\nIt gives the executor a stable contract to call.\n"
+                                "Next steps:\n1. Register the tool.\n2. Wire shared context.\n"
+                                "Risks:\nAvoid losing live turn context."
+                            ),
+                        }
+                    }
+                ]
+            }
+
+        shared_messages = [
+            {"role": "system", "content": "Base executor system prompt."},
+            {
+                "role": "user",
+                "content": "Make advisor consultation the default pattern.",
+            },
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_read",
+                        "type": "function",
+                        "function": {
+                            "name": "read",
+                            "arguments": json.dumps({"filepath": "agentic_loop.py"}),
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_read",
+                "content": json.dumps({"success": True, "content": "loop contents"}),
+            },
+        ]
+
+        with patch(
+            "handler.api_call_with_retry",
+            new=AsyncMock(side_effect=_capture_payload),
+        ):
+            result = await handler_instance.consult_advisor(
+                question="What is the least risky implementation order?",
+                context="I need the smallest coherent change set.",
+                session_id="advisor_test_session",
+                shared_messages=shared_messages,
+            )
+
+        assert result["success"] is True, f"Unexpected advisor result: {result}"
+        assert result["advisor_model"] == ADVISOR_MODEL_ID
+        assert captured_payloads, "Expected one advisor payload"
+
+        payload = captured_payloads[0]
+        assert payload["model"] == ADVISOR_MODEL_ID
+        assert payload["tools"] == []
+        payload_messages = payload["messages"]
+        assert payload_messages[0]["role"] == "system"
+        assert "executor/advisor strategy" in payload_messages[0]["content"]
+        assert any(message.get("role") == "tool" for message in payload_messages)
+        assert any(message.get("tool_calls") for message in payload_messages)
+        assert payload_messages[-1]["role"] == "user"
+        assert (
+            "Decision needed: What is the least risky implementation order?"
+            in payload_messages[-1]["content"]
+        )
+        assert "smallest coherent change set" in payload_messages[-1]["content"]
+        assert result["advice"].startswith("Decision:"), result["advice"]
+
+        print("  ✓ Passed")
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+async def test_consult_reviewer_uses_reviewer_model_and_shared_context() -> None:
+    """Reviewer consultations should use the reviewer model, no tools, and shared context."""
+    print("Test 15: consult_reviewer uses reviewer model and shared context")
+
+    from handler import REVIEWER_MODEL_ID, AgentHandler
+    from memory import EnhancedMemoryStore
+    from capabilities import CapabilityProfile, AdaptiveFormatter
+    from examples import AdaptiveFewShotManager, ExampleBank
+    from planning import TaskPlanner, TaskAnalyzer
+
+    tmp = Path("/tmp/test_consult_reviewer_regression.db")
+    tmp.touch()
+
+    try:
+        store = EnhancedMemoryStore(db_path=str(tmp), api_key="test")
+        profile = CapabilityProfile(set(), model_name="test")
+        planner = TaskPlanner(profile)
+        analyzer = TaskAnalyzer()
+        formatter = AdaptiveFormatter(profile)
+        examples_manager = AdaptiveFewShotManager(ExampleBank())
+
+        handler_instance = AgentHandler(
+            memory_store=store,
+            capability_profile=profile,
+            example_bank=examples_manager,
+            task_planner=planner,
+            task_analyzer=analyzer,
+            adaptive_formatter=formatter,
+        )
+
+        captured_payloads: list[dict[str, object]] = []
+
+        async def _capture_payload(_session, _url, payload, _headers, **_kw):
+            captured_payloads.append(dict(payload))
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": (
+                                "Verdict:\nThe implementation slice is coherent.\n"
+                                "Findings:\nShared context is the main risk boundary.\n"
+                                "Fixes:\nMirror advisor plumbing first.\n"
+                                "Residual risks:\nDo not auto-invoke until telemetry exists."
+                            ),
+                        }
+                    }
+                ]
+            }
+
+        shared_messages = [
+            {"role": "system", "content": "Base executor system prompt."},
+            {
+                "role": "user",
+                "content": "Implement consult_reviewer with the smallest viable slice.",
+            },
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_read",
+                        "type": "function",
+                        "function": {
+                            "name": "read",
+                            "arguments": json.dumps({"filepath": "handler.py"}),
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_read",
+                "content": json.dumps({"success": True, "content": "handler contents"}),
+            },
+        ]
+
+        with patch(
+            "handler.api_call_with_retry",
+            new=AsyncMock(side_effect=_capture_payload),
+        ):
+            result = await handler_instance.consult_reviewer(
+                question="Review the first consult_reviewer implementation slice.",
+                context="Goal: mirror advisor plumbing without auto-invocation.",
+                session_id="reviewer_test_session",
+                shared_messages=shared_messages,
+            )
+
+        assert result["success"] is True, f"Unexpected reviewer result: {result}"
+        assert result["reviewer_model"] == REVIEWER_MODEL_ID
+        assert captured_payloads, "Expected one reviewer payload"
+
+        payload = captured_payloads[0]
+        assert payload["model"] == REVIEWER_MODEL_ID
+        assert payload["tools"] == []
+        payload_messages = payload["messages"]
+        assert payload_messages[0]["role"] == "system"
+        assert "reviewer model" in payload_messages[0]["content"]
+        assert any(message.get("role") == "tool" for message in payload_messages)
+        assert any(message.get("tool_calls") for message in payload_messages)
+        assert payload_messages[-1]["role"] == "user"
+        assert (
+            "Review target: Review the first consult_reviewer implementation slice."
+            in payload_messages[-1]["content"]
+        )
+        assert "mirror advisor plumbing" in payload_messages[-1]["content"]
+        assert result["review"].startswith("Verdict:"), result["review"]
+
+        print("  ✓ Passed")
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 async def main():
     print("=" * 60)
     print("Testing process_response - Edge Cases")
@@ -1058,6 +1330,7 @@ async def main():
     print()
 
     test_cache_busting_headers_are_applied()
+    test_system_prompt_distinguishes_repo_paths_from_workspace_paths()
 
     await test_api_call_with_retry_streams_text_deltas()
     await test_api_call_with_retry_streams_tool_calls()
@@ -1075,6 +1348,8 @@ async def main():
     await test_json_tool_call_recovery()
     await test_complex_multi_round_agentic_flow()
     await test_initial_payload_has_sufficient_max_tokens_for_complex_requests()
+    await test_consult_advisor_uses_advisor_model_and_shared_context()
+    await test_consult_reviewer_uses_reviewer_model_and_shared_context()
 
     print()
     print("=" * 60)

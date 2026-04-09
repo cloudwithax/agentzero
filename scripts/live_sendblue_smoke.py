@@ -105,9 +105,11 @@ async def run_smoke(
 
     sendblue_posts: list[dict[str, Any]] = []
     tool_rounds: list[list[str]] = []
+    loop_response_snapshots: list[dict[str, Any]] = []
     started_at = time.time()
 
     original_execute_tool_calls = agentic_loop.execute_tool_calls
+    original_api_call_with_retry = agentic_loop.api_call_with_retry
 
     async def wrapped_execute_tool_calls(message, allowed_tool_names=None):
         tool_rounds.append(
@@ -120,6 +122,36 @@ async def run_smoke(
             message,
             allowed_tool_names=allowed_tool_names,
         )
+
+    async def wrapped_api_call_with_retry(*args, **kwargs):
+        response_data = await original_api_call_with_retry(*args, **kwargs)
+        choices = response_data.get("choices") or []
+        if choices:
+            message = choices[0].get("message", {}) or {}
+            content_text = agentic_loop._message_content_to_text(
+                message.get("content", "")
+            )
+            tool_calls = message.get("tool_calls") or []
+            loop_response_snapshots.append(
+                {
+                    "content": content_text,
+                    "has_tool_calls": bool(tool_calls),
+                    "tool_call_names": [
+                        tool_call.get("function", {}).get("name", "")
+                        for tool_call in tool_calls
+                    ],
+                    "pseudo_tool_syntax": agentic_loop.contains_pseudo_tool_syntax(
+                        content_text
+                    ),
+                    "action_intent_narration": (
+                        agentic_loop.contains_action_intent_narration(content_text)
+                    ),
+                    "hard_decision_language": (
+                        agentic_loop.contains_hard_decision_language(content_text)
+                    ),
+                }
+            )
+        return response_data
 
     try:
         real_client_session = aiohttp.ClientSession
@@ -135,6 +167,10 @@ async def run_smoke(
             patch(
                 "integrations._maybe_send_random_sendblue_tapback",
                 return_value=None,
+            ),
+            patch(
+                "agentic_loop.api_call_with_retry",
+                side_effect=wrapped_api_call_with_retry,
             ),
             patch(
                 "agentic_loop.execute_tool_calls",
@@ -173,6 +209,33 @@ async def run_smoke(
     final_payload = outbound_messages[-1]["json"] if outbound_messages else {}
     final_content = str(final_payload.get("content", ""))
     flat_tool_names = [name for round_names in tool_rounds for name in round_names if name]
+    text_only_before_tool = []
+    for snapshot in loop_response_snapshots:
+        if snapshot["has_tool_calls"]:
+            break
+        text_only_before_tool.append(snapshot)
+
+    telemetry = {
+        "loop_response_count": len(loop_response_snapshots),
+        "text_only_rounds_before_first_tool": len(text_only_before_tool),
+        "pseudo_tool_rounds_before_first_tool": sum(
+            1 for snapshot in text_only_before_tool if snapshot["pseudo_tool_syntax"]
+        ),
+        "action_intent_rounds_before_first_tool": sum(
+            1
+            for snapshot in text_only_before_tool
+            if snapshot["action_intent_narration"]
+        ),
+        "hard_decision_rounds_before_first_tool": sum(
+            1
+            for snapshot in text_only_before_tool
+            if snapshot["hard_decision_language"]
+        ),
+        "needed_recovery_before_tools": bool(text_only_before_tool),
+        "recovered_to_tool_execution": bool(text_only_before_tool and tool_rounds),
+        "consult_advisor_seen": "consult_advisor" in set(flat_tool_names),
+        "consult_reviewer_seen": "consult_reviewer" in set(flat_tool_names),
+    }
 
     normalized_final_content = final_content.lower()
     normalized_tools = set(flat_tool_names)
@@ -204,6 +267,8 @@ async def run_smoke(
         "outbound_message_count": len(outbound_messages),
         "final_outbound_content": final_content,
         "conversation_history": conversation_history,
+        "agentic_metrics": telemetry,
+        "loop_response_snapshots": loop_response_snapshots,
     }
 
 

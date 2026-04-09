@@ -19,7 +19,7 @@ from examples import ExampleBank, AdaptiveFewShotManager  # noqa: E402
 from planning import TaskPlanner, TaskAnalyzer  # noqa: E402
 from skills import SkillRegistry  # noqa: E402
 from tools import set_memory_store, set_skill_registry, set_acp_agent, set_agent_workspace  # noqa: E402
-from handler import AgentHandler  # noqa: E402
+from handler import AgentHandler, PRIMARY_MODEL_ID  # noqa: E402
 from integrations import run_telegram_bot_async, start_sendblue_bot  # noqa: E402
 from openai_compat_server import start_openai_compatible_server  # noqa: E402
 from acp import ACPAgent  # noqa: E402
@@ -38,9 +38,8 @@ if requested_log_level and not isinstance(
 ):
     logger.warning("Invalid LOG_LEVEL=%r, defaulting to INFO", requested_log_level)
 
-# Configuration - API key and model ID from environment variables with fallbacks
+# Configuration - API key from environment variables with fallbacks
 API_KEY = os.environ.get("NVIDIA_API_KEY", "")
-MODEL_ID = os.environ.get("MODEL_ID", "moonshotai/kimi-k2-instruct-0905")
 PID_FILE = "agentzero.pid"
 
 
@@ -298,7 +297,7 @@ def initialize_agent() -> tuple[AgentHandler, ACPAgent]:
             Capability.SELF_CORRECTION,
             Capability.STRUCTURED_OUTPUT,
         },
-        model_name=MODEL_ID,
+        model_name=PRIMARY_MODEL_ID,
     )
 
     # Initialize task planner

@@ -67,11 +67,19 @@ def _resolve_write_path(filepath: str) -> tuple[str, str | None]:
 memory_store: Optional[EnhancedMemoryStore] = None
 consortium_controller: Any = None
 reminder_controller: Any = None
+advisor_controller: Any = None
+reviewer_controller: Any = None
 skill_registry: Any = None
 acp_agent: Any = None
 _runtime_session_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "runtime_session_id",
     default=None,
+)
+_runtime_messages: contextvars.ContextVar[Optional[list[dict[str, Any]]]] = (
+    contextvars.ContextVar(
+        "runtime_messages",
+        default=None,
+    )
 )
 
 
@@ -99,6 +107,18 @@ def set_reminder_controller(controller: Any):
     reminder_controller = controller
 
 
+def set_advisor_controller(controller: Any):
+    """Set the advisor controller used by consult_advisor tool calls."""
+    global advisor_controller
+    advisor_controller = controller
+
+
+def set_reviewer_controller(controller: Any):
+    """Set the reviewer controller used by consult_reviewer tool calls."""
+    global reviewer_controller
+    reviewer_controller = controller
+
+
 def set_skill_registry(registry: Any):
     """Set the skill registry used by skill activation tools."""
     global skill_registry
@@ -120,6 +140,21 @@ def set_tool_runtime_session(session_id: Optional[str]):
 def reset_tool_runtime_session(token: contextvars.Token):
     """Restore previous tool runtime session context."""
     _runtime_session_id.reset(token)
+
+
+def set_tool_runtime_messages(messages: Optional[list[dict[str, Any]]]):
+    """Bind the current turn's shared messages for tools that need live context."""
+    normalized: Optional[list[dict[str, Any]]] = None
+    if messages:
+        normalized = [
+            dict(message) for message in messages if isinstance(message, dict)
+        ]
+    return _runtime_messages.set(normalized)
+
+
+def reset_tool_runtime_messages(token: contextvars.Token):
+    """Restore previous shared-message runtime context."""
+    _runtime_messages.reset(token)
 
 
 # File tools
@@ -587,6 +622,38 @@ async def consortium_status_tool(task_id: Optional[str] = None):
         return {"success": False, "error": str(e)}
 
 
+async def consult_advisor_tool(question: str, context: str = ""):
+    """Consult the advisor model for a concise plan on a hard decision."""
+    try:
+        if advisor_controller is None:
+            return {"success": False, "error": "Advisor controller not initialized"}
+
+        return await advisor_controller.consult_advisor(
+            question=question,
+            context=context,
+            session_id=_runtime_session_id.get(),
+            shared_messages=_runtime_messages.get(),
+        )
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+async def consult_reviewer_tool(question: str, context: str = ""):
+    """Consult the reviewer model for a concise risk review."""
+    try:
+        if reviewer_controller is None:
+            return {"success": False, "error": "Reviewer controller not initialized"}
+
+        return await reviewer_controller.consult_reviewer(
+            question=question,
+            context=context,
+            session_id=_runtime_session_id.get(),
+            shared_messages=_runtime_messages.get(),
+        )
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 async def reminder_create_tool(
     cron: str,
     message: str = "",
@@ -981,6 +1048,46 @@ async def send_tapback_tool(
         return {"success": False, "error": str(e)}
 
 
+async def send_telegram_reaction_tool(
+    chat_id: int,
+    message_id: int,
+    reaction: str,
+):
+    """Send a Telegram emoji reaction to a specific message.
+
+    Args:
+        chat_id: Telegram chat ID where the message was sent
+        message_id: Telegram message ID to react to
+        reaction: Semantic reaction type: like, love, dislike, laugh, emphasize, question
+    """
+    try:
+        try:
+            from integrations import send_telegram_reaction
+        except Exception as import_error:
+            return {
+                "success": False,
+                "error": f"Telegram reaction integration unavailable: {import_error}",
+            }
+
+        try:
+            normalized_chat_id = int(chat_id)
+        except (TypeError, ValueError):
+            return {"success": False, "error": "chat_id must be an integer"}
+
+        try:
+            normalized_message_id = int(message_id)
+        except (TypeError, ValueError):
+            return {"success": False, "error": "message_id must be an integer"}
+
+        return await send_telegram_reaction(
+            chat_id=normalized_chat_id,
+            message_id=normalized_message_id,
+            reaction=str(reaction),
+        )
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 async def acp_register_service_tool(
     service_name: str,
     capabilities: str,
@@ -1203,7 +1310,10 @@ TOOLS = {
     "activate_skill": activate_skill_tool,
     "add_skill": add_skill_tool,
     "send_tapback": send_tapback_tool,
-    "send_reaction": send_tapback_tool,  # Alias for clarity
+    "send_reaction": send_tapback_tool,
+    "send_telegram_reaction": send_telegram_reaction_tool,
+    "consult_advisor": consult_advisor_tool,
+    "consult_reviewer": consult_reviewer_tool,
     "consortium_start": consortium_start_tool,
     "consortium_stop": consortium_stop_tool,
     "consortium_status": consortium_status_tool,
@@ -1257,6 +1367,9 @@ def validate_tool_args(func_name: str, func_args: dict) -> tuple:
         "add_skill": ["url"],
         "send_tapback": ["message_handle", "reaction"],
         "send_reaction": ["message_handle", "reaction"],
+        "send_telegram_reaction": ["chat_id", "message_id", "reaction"],
+        "consult_advisor": ["question"],
+        "consult_reviewer": ["question"],
         "consortium_start": ["task"],
         "consortium_stop": ["task_id"],
         "consortium_status": [],

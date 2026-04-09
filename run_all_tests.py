@@ -15,6 +15,7 @@ tests = [
     # "tests/test_tool_calling_flow.py", # mock is currently broken out of scope
     "tests/test_setprompt_command.py",
     "tests/test_telegram_message_flow.py",
+    "tests/test_telegram_voice_memo.py",
     "tests/test_multimodal_integrations.py",
     "tests/test_sendblue_debounce.py",
     "tests/test_sendblue_voice_memo.py",
