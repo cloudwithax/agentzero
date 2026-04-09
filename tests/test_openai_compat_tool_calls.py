@@ -9,7 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from aiohttp.test_utils import TestClient, TestServer
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 from openai_compat_server import create_openai_compatible_app
 

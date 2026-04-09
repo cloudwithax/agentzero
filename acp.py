@@ -12,15 +12,13 @@ import json
 import logging
 import os
 import secrets
-import socket
 import struct
 import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple, Type
+from typing import Any, Dict, List, Optional, Set, Tuple, Type
 import aiohttp
 
 logger = logging.getLogger(__name__)
@@ -29,19 +27,12 @@ logger = logging.getLogger(__name__)
 # Try to import cryptography; provide fallback if unavailable
 CRYPTOGRAPHY_AVAILABLE = True
 try:
-    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import rsa, padding
-    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-    from cryptography.hazmat.backends import default_backend
 except ImportError:
     CRYPTOGRAPHY_AVAILABLE = False
     hashes = None  # type: ignore[assignment]
-    serialization = None  # type: ignore[assignment]
     padding = None  # type: ignore[assignment]
-    Cipher = None  # type: ignore[assignment]
-    algorithms = None  # type: ignore[assignment]
-    modes = None  # type: ignore[assignment]
-    default_backend = None  # type: ignore[assignment]
     logger.warning("cryptography module not available; ACP security features limited")
 
 
@@ -474,23 +465,6 @@ class ProtocolRegistry:
 
     def list_protocols(self) -> List[str]:
         return list(self._protocols.keys())
-
-
-@dataclass
-class ConnectionInfo:
-    """Connection endpoint information."""
-    host: str
-    port: int
-    protocol: str = "tcp"
-    secure: bool = False
-
-
-@dataclass
-class AgentIdentity:
-    """Agent identity for ACP communication."""
-    agent_id: str
-    identity_key: Any
-    secret_key: bytes
 
 
 class ServiceRegistry:

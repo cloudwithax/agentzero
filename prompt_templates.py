@@ -6,7 +6,6 @@ Template syntax:
   - {{#if variable}}...{{/if}} - Conditional block (renders if variable is truthy and non-empty)
 """
 
-import os
 from pathlib import Path
 import re
 from typing import Dict, Any, Optional

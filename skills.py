@@ -850,7 +850,6 @@ class SkillRegistry:
             }
 
         frontmatter = parsed_frontmatter
-        body = body_or_error
 
         tentative_name = str(frontmatter.get("name", "")).strip()
         if not tentative_name:

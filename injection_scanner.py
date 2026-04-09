@@ -12,7 +12,6 @@ import html as html_module
 import re
 import unicodedata
 from dataclasses import dataclass, field
-from typing import Any
 from urllib.parse import unquote
 
 

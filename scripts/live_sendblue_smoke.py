@@ -4,7 +4,6 @@
 import argparse
 import asyncio
 import json
-import os
 import time
 from typing import Any
 from unittest.mock import patch
@@ -15,7 +14,7 @@ from dotenv import load_dotenv
 load_dotenv(".env")
 
 import agentic_loop
-import integrations
+import integrations  # noqa: F401 — used in patch() string targets
 from integrations import process_imessage_and_reply
 from main import initialize_agent
 

@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from injection_scanner import InjectionScanResult, PatternMatch, scan_for_injection
+from injection_scanner import scan_for_injection
 
 
 def test_scan_clean_text():

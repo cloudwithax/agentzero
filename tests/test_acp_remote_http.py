@@ -1,7 +1,6 @@
 """Test ACP remote HTTP peer discovery and messaging."""
 
 import asyncio
-import json
 import sys
 import os
 

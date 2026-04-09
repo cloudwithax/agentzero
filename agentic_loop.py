@@ -277,11 +277,6 @@ def response_claims_failed_targets_succeeded(
     if re.search(r"(?i)\b(?:both\s+targets|both\s+destinations|functionally\s+complete)\b", text):
         return True
 
-    success_nearby_patterns = [
-        re.compile(r"(?i)\b(?:succeeded|successful|pushed|published|deployed|verified|up-to-date|complete|done)\b.{0,80}\b"),
-        re.compile(r"(?i)\b.{0,80}\b(?:succeeded|successful|pushed|published|deployed|verified|up-to-date|complete|done)\b"),
-    ]
-
     target_tokens: set[str] = set()
     for summary in failure_summaries:
         lowered = summary.lower()
