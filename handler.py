@@ -19,6 +19,10 @@ from api import api_call_with_retry, process_response, safe_strip_markdown
 from skills import SkillRegistry
 from reminder_tasks import ReminderScheduler
 from tools import (
+    extract_assistant_name_from_user_text,
+    extract_assistant_name_from_memory_content,
+    extract_user_name_from_memory_content,
+    normalize_memory_candidate_from_user_text,
     reset_tool_runtime_session,
     set_advisor_controller,
     set_consortium_controller,
@@ -54,6 +58,9 @@ INTERNAL_PROMPT_RESIDUE_PATTERNS = (
     re.compile(r"(?i)(?:^|[\s\n])tool execution is mandatory[.!]?"),
     re.compile(r"(?i)(?:^|[\s\n])act,\s*don't narrate[.!]?"),
     re.compile(r"(?i)(?:^|[\s\n])do not narrate(?: what you will do)?[.!]?"),
+    re.compile(
+        r"(?im)^[ \t>*_`~-]*(?:send_tapback|send_telegram_reaction|send_reaction)\s*:[^\n]*$"
+    ),
 )
 
 
@@ -398,13 +405,13 @@ BASE_PAYLOAD = {
             "type": "function",
             "function": {
                 "name": "remember",
-                "description": "Store important information in persistent memory for future reference",
+                "description": "Store important information in persistent memory for future reference. Keep the subject correct: if the user names or renames the assistant, remember that as assistant identity, not as a user fact.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "content": {
                             "type": "string",
-                            "description": "The information to remember",
+                            "description": "The information to remember, written from the correct subject perspective",
                         },
                         "topics": {
                             "type": "array",
@@ -1098,6 +1105,25 @@ CROSS_CHANNEL_CONTEXT_MAX_MESSAGES = max(
 CROSS_CHANNEL_SESSION_LOOKUP_LIMIT = max(
     1,
     int(os.environ.get("CROSS_CHANNEL_SESSION_LOOKUP_LIMIT", "10")),
+)
+SESSION_CONTINUITY_ENABLED = (
+    os.environ.get("SESSION_CONTINUITY_ENABLED", "1").strip() != "0"
+)
+SESSION_CONTINUITY_MEMORY_SCAN_LIMIT = max(
+    12,
+    int(os.environ.get("SESSION_CONTINUITY_MEMORY_SCAN_LIMIT", "60")),
+)
+SESSION_CONTINUITY_HISTORY_LOOKBACK = max(
+    2,
+    int(os.environ.get("SESSION_CONTINUITY_HISTORY_LOOKBACK", "8")),
+)
+SESSION_CONTINUITY_MAX_PROFILE_LINES = max(
+    1,
+    int(os.environ.get("SESSION_CONTINUITY_MAX_PROFILE_LINES", "4")),
+)
+SESSION_CONTINUITY_MAX_HISTORY_LINES = max(
+    1,
+    int(os.environ.get("SESSION_CONTINUITY_MAX_HISTORY_LINES", "4")),
 )
 
 DREAM_MODE_ENABLED = os.environ.get("MEMORY_DREAM_ENABLED", "1").strip() != "0"
@@ -1921,6 +1947,13 @@ class AgentHandler:
         return ""
 
     @staticmethod
+    def _is_persistent_messaging_session(session_id: Optional[str]) -> bool:
+        """Messaging channels behave like one ongoing thread per user identity."""
+        if not session_id:
+            return False
+        return session_id.startswith("imessage_") or session_id.startswith("tg_")
+
+    @staticmethod
     def _channel_session_prefix(channel_name: str) -> str:
         """Map canonical channel name to session ID prefix."""
         if channel_name == "telegram":
@@ -2077,6 +2110,326 @@ class AgentHandler:
             + "\n".join(lines)
             + "\n"
         )
+
+    @staticmethod
+    def _truncate_context_snippet(content: str, max_chars: int = 180) -> str:
+        """Normalize one memory/history snippet for system-prompt injection."""
+        normalized = re.sub(r"\s+", " ", (content or "").strip())
+        if len(normalized) > max_chars:
+            return f"{normalized[: max_chars - 3]}..."
+        return normalized
+
+    def _score_session_continuity_memory(
+        self,
+        memory: Any,
+        session_id: Optional[str],
+    ) -> float:
+        """Rank durable memories for continuity-first prompt injection."""
+        metadata = memory.metadata or {}
+        memory_type = str(metadata.get("type", "")).strip()
+        if memory_type not in {"explicit_memory", "auto_memory", "long_term_memory"}:
+            return float("-inf")
+        if not self._memory_matches_session_scope(memory, session_id=session_id):
+            return float("-inf")
+
+        score = {
+            "explicit_memory": 2.5,
+            "auto_memory": 1.5,
+            "long_term_memory": 3.5,
+        }.get(memory_type, 0.0)
+
+        memory_session_id = str(metadata.get("session_id", "")).strip()
+        if session_id and memory_session_id == session_id:
+            score += 4.0
+        elif session_id and memory_session_id:
+            score -= 2.0
+
+        importance = str(metadata.get("importance", "medium")).strip().lower()
+        score += {"high": 2.0, "medium": 1.0, "low": 0.25}.get(importance, 0.5)
+
+        significance = max(
+            0.0,
+            min(1.0, self._coerce_float(metadata.get("significance"), default=0.0)),
+        )
+        if memory_type == "long_term_memory":
+            significance = max(significance, 0.6)
+        score += significance * 2.5
+
+        normalized_content = (memory.content or "").strip().lower()
+        if any(
+            token in normalized_content
+            for token in (
+                "name",
+                "call me",
+                "prefer",
+                "likes",
+                "dislike",
+                "running joke",
+                "inside joke",
+                "project",
+                "working on",
+                "building",
+            )
+        ):
+            score += 0.75
+
+        created_at = self._parse_state_timestamp(getattr(memory, "created_at", None))
+        if created_at is not None:
+            now = (
+                datetime.datetime.now(created_at.tzinfo)
+                if created_at.tzinfo
+                else datetime.datetime.now()
+            )
+            age_days = max(0.0, (now - created_at).total_seconds() / 86400.0)
+            score += max(0.0, 1.5 - (age_days / 14.0))
+
+        return score
+
+    @staticmethod
+    def _extract_assistant_name_from_memory(memory: Any) -> str:
+        """Return configured assistant name from memory metadata/content when present."""
+        metadata = getattr(memory, "metadata", {}) or {}
+        if (
+            str(metadata.get("subject", "")).strip() == "assistant_identity"
+            and str(metadata.get("slot", "")).strip() == "assistant_name"
+        ):
+            candidate = str(metadata.get("assistant_name", "")).strip()
+            if candidate:
+                return candidate
+        return extract_assistant_name_from_memory_content(
+            str(getattr(memory, "content", "") or "")
+        )
+
+    def _collect_assistant_identity_names(
+        self,
+        memories: list[Any],
+        session_id: Optional[str],
+    ) -> dict[str, str]:
+        """Collect known assistant-name assignments keyed by normalized name."""
+        names: dict[str, str] = {}
+        for memory in memories:
+            if not self._memory_matches_session_scope(memory, session_id=session_id):
+                continue
+            assistant_name = self._extract_assistant_name_from_memory(memory)
+            normalized = self._normalize_memory_text(assistant_name)
+            if normalized and normalized not in names:
+                names[normalized] = assistant_name
+        return names
+
+    def _collect_assistant_identity_names_from_history(
+        self,
+        history: list[dict[str, Any]],
+    ) -> dict[str, str]:
+        """Infer assistant-name assignments directly from recent user turns."""
+        names: dict[str, str] = {}
+        for message in history:
+            if str(message.get("role", "")).strip().lower() != "user":
+                continue
+            assistant_name = extract_assistant_name_from_user_text(
+                _content_to_text(message.get("content", ""))
+            )
+            normalized = self._normalize_memory_text(assistant_name)
+            if normalized and normalized not in names:
+                names[normalized] = assistant_name
+        return names
+
+    def _merge_assistant_identity_names(
+        self,
+        memory_names: dict[str, str],
+        history_names: dict[str, str],
+    ) -> dict[str, str]:
+        """Prefer explicit memory-backed assistant identity, then recent history."""
+        merged = dict(memory_names)
+        for key, value in history_names.items():
+            merged.setdefault(key, value)
+        return merged
+
+    def _memory_conflicts_with_assistant_identity(
+        self,
+        memory: Any,
+        assistant_identity_names: dict[str, str],
+    ) -> bool:
+        """Skip stale user-name memories that contradict a known assistant name."""
+        if not assistant_identity_names:
+            return False
+        user_name = extract_user_name_from_memory_content(
+            str(getattr(memory, "content", "") or "")
+        )
+        if not user_name:
+            return False
+        normalized = self._normalize_memory_text(user_name)
+        return bool(normalized and normalized in assistant_identity_names)
+
+    def _build_assistant_identity_context(
+        self,
+        session_id: Optional[str],
+    ) -> str:
+        """Inject a direct assistant-identity note when a session has one."""
+        if not session_id:
+            return ""
+
+        try:
+            recent_memories = self.memory_store.get_recent_memories(
+                limit=SESSION_CONTINUITY_MEMORY_SCAN_LIMIT
+            )
+            recent_history = self.memory_store.get_conversation_history(
+                session_id=session_id,
+                limit=SESSION_CONTINUITY_HISTORY_LOOKBACK,
+            )
+        except Exception:
+            return ""
+
+        assistant_identity_names = self._merge_assistant_identity_names(
+            self._collect_assistant_identity_names(
+                recent_memories,
+                session_id=session_id,
+            ),
+            self._collect_assistant_identity_names_from_history(recent_history),
+        )
+        if not assistant_identity_names:
+            return ""
+
+        assistant_name = next(iter(assistant_identity_names.values()))
+        return (
+            "\n\n[Assistant identity note]:\n"
+            f"Your configured name in this session is {assistant_name}. "
+            "If the user says \"your name\" or addresses that name, they mean you, "
+            "not the user.\n"
+        )
+
+    def _memory_matches_session_scope(
+        self,
+        memory: Any,
+        session_id: Optional[str],
+    ) -> bool:
+        """Scope memory injection to the active messaging session to avoid user bleed."""
+        if not session_id or not self._is_persistent_messaging_session(session_id):
+            return True
+
+        metadata = getattr(memory, "metadata", {}) or {}
+        memory_session_id = str(metadata.get("session_id", "")).strip()
+        if not memory_session_id:
+            return False
+        return memory_session_id == session_id
+
+    def _build_session_continuity_context(
+        self,
+        session_id: Optional[str],
+    ) -> str:
+        """Build a proactive continuity brief from durable memories + recent history."""
+        if not SESSION_CONTINUITY_ENABLED or not session_id:
+            return ""
+
+        is_persistent_messaging = self._is_persistent_messaging_session(session_id)
+
+        try:
+            recent_history = self.memory_store.get_conversation_history(
+                session_id=session_id,
+                limit=SESSION_CONTINUITY_HISTORY_LOOKBACK,
+            )
+            recent_memories = self.memory_store.get_recent_memories(
+                limit=SESSION_CONTINUITY_MEMORY_SCAN_LIMIT
+            )
+        except Exception as e:
+            logger.warning("Failed to build session continuity context: %s", e)
+            return (
+                "\n\n[Session continuity status]:\n"
+                "Continuity lookup failed this turn. Do not invent familiarity. "
+                "If continuity matters to the reply, say you are having trouble "
+                "accessing your notes on the user and want to rebuild them quickly.\n"
+            )
+
+        assistant_identity_names = self._merge_assistant_identity_names(
+            self._collect_assistant_identity_names(
+                recent_memories,
+                session_id=session_id,
+            ),
+            self._collect_assistant_identity_names_from_history(recent_history),
+        )
+        scored_memories: list[tuple[float, Any]] = []
+        seen_memory_texts: set[str] = set()
+        for memory in recent_memories:
+            if self._memory_conflicts_with_assistant_identity(
+                memory,
+                assistant_identity_names,
+            ):
+                continue
+            score = self._score_session_continuity_memory(memory, session_id=session_id)
+            if score == float("-inf"):
+                continue
+
+            normalized_text = self._normalize_memory_text(memory.content)
+            if not normalized_text or normalized_text in seen_memory_texts:
+                continue
+
+            seen_memory_texts.add(normalized_text)
+            scored_memories.append((score, memory))
+
+        scored_memories.sort(key=lambda item: item[0], reverse=True)
+
+        profile_lines: list[str] = []
+        for _, memory in scored_memories[:SESSION_CONTINUITY_MAX_PROFILE_LINES]:
+            snippet = self._truncate_context_snippet(memory.content, max_chars=180)
+            if not snippet:
+                continue
+            profile_lines.append(f"{len(profile_lines) + 1}. {snippet}")
+
+        history_lines: list[str] = []
+        for message in reversed(recent_history[:SESSION_CONTINUITY_HISTORY_LOOKBACK]):
+            role = str(message.get("role", "")).strip().lower()
+            if role not in {"user", "assistant"}:
+                continue
+
+            snippet = self._truncate_context_snippet(
+                _content_to_text(message.get("content", "")),
+                max_chars=180,
+            )
+            if not snippet:
+                continue
+
+            history_lines.append(f"{len(history_lines) + 1}. {role}: {snippet}")
+            if len(history_lines) >= SESSION_CONTINUITY_MAX_HISTORY_LINES:
+                break
+
+        if not profile_lines and not history_lines:
+            if is_persistent_messaging:
+                return (
+                    "\n\n[Session continuity status]:\n"
+                    "This messaging channel is one persistent conversation by design. "
+                    "Do not treat this turn like a fresh thread or re-introduce yourself. "
+                    "If continuity notes are missing, acknowledge that plainly and continue "
+                    "without making the user re-establish the relationship from scratch.\n"
+                )
+            return (
+                "\n\n[Session continuity status]:\n"
+                "No continuity notes were found yet. Do not fake familiarity. "
+                "If continuity matters, acknowledge the gap plainly and warmly, then "
+                "rebuild context without making the user re-teach basic facts more than necessary.\n"
+            )
+
+        lines = [
+            "",
+            "",
+            "[Session continuity brief]:",
+            "Default stance: this is an ongoing relationship, not a cold start.",
+            "Use relevant continuity naturally. If the user is resuming prior work or conversation, lead with it instead of asking whether you remember.",
+            "In direct task mode, silently use this context unless saying it aloud genuinely helps.",
+        ]
+
+        if is_persistent_messaging:
+            lines.append(
+                "This iMessage/Telegram session is one persistent conversation by design. Do not act like each inbound message starts a new thread."
+            )
+
+        if profile_lines:
+            lines.append("Stable user/profile notes:")
+            lines.extend(profile_lines)
+
+        if history_lines:
+            lines.append("Recent conversation thread:")
+            lines.extend(history_lines)
+
+        return "\n".join(lines) + "\n"
 
     @staticmethod
     def _normalize_request_metadata(
@@ -2410,8 +2763,11 @@ class AgentHandler:
                 "role": "system",
                 "content": (
                     "Extract at most one durable memory from the latest user/assistant exchange. "
-                    "Only store stable preferences, long-term projects, personal facts, recurring constraints, "
-                    "or high-impact commitments. Ignore one-off requests and generic chatter. "
+                    "Only store durable identity/context such as preferred name, pronouns, tone or style preferences, "
+                    "running jokes, ongoing projects, personal facts, recurring constraints, relationship context, "
+                    "or high-impact commitments. Store facts from the correct subject perspective: "
+                    "if the user says something about the assistant like 'your name is Alice', "
+                    "store that as assistant identity, not as a user fact. Ignore one-off requests and generic chatter. "
                     "Respond with JSON only using this schema: "
                     '{"store": boolean, "content": string, "importance": "low"|"medium"|"high", '
                     '"topics": string[], "significance": number, "reason": string}.'
@@ -2511,7 +2867,13 @@ class AgentHandler:
             logger.info("Auto-memory skipped by extractor for session %s", session_id)
             return
 
-        content = str(candidate.get("content", "")).strip()
+        content, normalized_topics, inferred_metadata = (
+            normalize_memory_candidate_from_user_text(
+                content=str(candidate.get("content", "")).strip(),
+                user_text=user_query,
+                topics=candidate.get("topics", []),
+            )
+        )
         if self._is_duplicate_memory(content, session_id=session_id):
             logger.info("Auto-memory deduped for session %s", session_id)
             return
@@ -2526,13 +2888,14 @@ class AgentHandler:
             "cadence_reason": cadence.get("reason"),
             "cadence_ratio": cadence.get("ratio"),
         }
+        metadata.update(inferred_metadata)
         if candidate.get("reason"):
             metadata["extractor_reason"] = candidate["reason"]
 
         memory_id = await self.memory_store.add_memory(
             content=content,
             metadata=metadata,
-            topics=candidate.get("topics", []),
+            topics=normalized_topics,
             generate_embedding=True,
         )
         logger.info(
@@ -3010,9 +3373,7 @@ class AgentHandler:
         if not session_id:
             return ""
 
-        is_messaging = session_id.startswith("imessage_") or session_id.startswith(
-            "tg_"
-        )
+        is_messaging = self._is_persistent_messaging_session(session_id)
 
         if not is_messaging:
             return ""
@@ -3045,7 +3406,11 @@ class AgentHandler:
             "write code, search the web, execute tools, look something up), switch to "
             "efficient execution mode. Get the job done concisely. The conversational "
             "style above applies to casual, emotional, or storytelling exchanges — not "
-            "to directed work requests."
+            "to directed work requests.\n\n"
+            "7. PERSISTENT THREAD ASSUMPTION. iMessage and Telegram sessions here are "
+            "single ongoing conversations by design. Do not greet the user like a stranger, "
+            "do not re-introduce yourself, and do not treat each new inbound message as a "
+            "fresh thread unless the user explicitly resets the context."
         )
 
     async def _generate_consortium_acknowledgement(
@@ -3407,14 +3772,50 @@ class AgentHandler:
 
         # Retrieve relevant memories for context
         memory_context = ""
+        if session_id:
+            assistant_identity_context = self._build_assistant_identity_context(
+                session_id=session_id
+            )
+            if assistant_identity_context:
+                memory_context += assistant_identity_context
+
+            continuity_context = self._build_session_continuity_context(
+                session_id=session_id
+            )
+            if continuity_context:
+                memory_context += continuity_context
+
         if user_query:
             try:
+                assistant_identity_names = self._merge_assistant_identity_names(
+                    self._collect_assistant_identity_names(
+                        self.memory_store.get_recent_memories(
+                            limit=SESSION_CONTINUITY_MEMORY_SCAN_LIMIT
+                        ),
+                        session_id=session_id,
+                    ),
+                    self._collect_assistant_identity_names_from_history(
+                        self.memory_store.get_conversation_history(
+                            session_id=session_id,
+                            limit=SESSION_CONTINUITY_HISTORY_LOOKBACK,
+                        )
+                    ),
+                )
                 relevant_memories = await self.memory_store.search_memories(
                     query=user_query, top_k=8, threshold=0.15
                 )
                 if relevant_memories:
                     weighted_memories: list[tuple[Any, float, float, float]] = []
                     for memory, similarity in relevant_memories:
+                        if not self._memory_matches_session_scope(
+                            memory, session_id=session_id
+                        ):
+                            continue
+                        if self._memory_conflicts_with_assistant_identity(
+                            memory,
+                            assistant_identity_names,
+                        ):
+                            continue
                         metadata = memory.metadata or {}
                         significance = max(
                             0.0,
@@ -3434,7 +3835,7 @@ class AgentHandler:
                         )
 
                     weighted_memories.sort(key=lambda item: item[3], reverse=True)
-                    memory_context = (
+                    memory_context += (
                         "\n\n[Relevant memories from past conversations]:\n"
                     )
                     for i, (memory, _, significance, _) in enumerate(
@@ -3671,25 +4072,26 @@ class AgentHandler:
 
             content = self._finalize_visible_response(content, session_id)
 
-        # Store conversation in memory
-        if session_id and user_query:
-            self.memory_store.add_conversation_message(
-                role="user",
-                content=user_query,
-                session_id=session_id,
-                metadata=normalized_request_metadata or None,
-            )
-        if session_id and content:
-            self.memory_store.add_conversation_message(
-                role="assistant", content=content, session_id=session_id
-            )
+            # Persist the visible turn before post-response maintenance so
+            # cadence calculations see the latest exchange.
+            if session_id and user_query:
+                self.memory_store.add_conversation_message(
+                    role="user",
+                    content=user_query,
+                    session_id=session_id,
+                    metadata=normalized_request_metadata or None,
+                )
+            if session_id and content:
+                self.memory_store.add_conversation_message(
+                    role="assistant", content=content, session_id=session_id
+                )
 
-        await self._run_memory_maintenance(
-            session=session,
-            session_id=session_id,
-            user_query=user_query,
-            assistant_response=content,
-        )
+            await self._run_memory_maintenance(
+                session=session,
+                session_id=session_id,
+                user_query=user_query,
+                assistant_response=content,
+            )
 
         # Provide feedback on examples if task was completed
         if task and content and not content.startswith("Error:"):

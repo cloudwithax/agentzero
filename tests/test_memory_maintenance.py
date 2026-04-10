@@ -15,7 +15,7 @@ from handler import (
     FINAL_RESPONSE_MAX_TOKENS,
     REQUEST_FRESHNESS_INSTRUCTION,
 )
-from memory import EnhancedMemoryStore
+from memory import EnhancedMemoryStore, Memory
 from planning import TaskAnalyzer, TaskPlanner
 
 
@@ -423,6 +423,49 @@ async def test_cross_channel_recall_is_injected_into_handle_context() -> None:
             os.remove(tmp.name)
 
 
+async def test_rolling_context_preserves_same_second_message_order() -> None:
+    print("=== Test: rolling context preserves same-second message order ===")
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+    tmp.close()
+
+    try:
+        _, handler = _create_store_and_handler(tmp.name)
+        session_id = "tg_222"
+        timestamp = datetime.now().replace(microsecond=0)
+
+        _insert_conversation_at(
+            db_path=tmp.name,
+            session_id=session_id,
+            role="user",
+            content="First user message",
+            timestamp=timestamp,
+        )
+        _insert_conversation_at(
+            db_path=tmp.name,
+            session_id=session_id,
+            role="assistant",
+            content="First assistant reply",
+            timestamp=timestamp,
+        )
+
+        messages = handler._build_rolling_context(
+            system_message={"role": "system", "content": "sys"},
+            current_messages=[{"role": "user", "content": "Current prompt"}],
+            session_id=session_id,
+            context_window=4000,
+            buffer_tokens=100,
+        )
+
+        history_slice = messages[1:-1]
+        assert [message["role"] for message in history_slice] == ["user", "assistant"]
+        assert history_slice[0]["content"] == "First user message"
+        assert history_slice[1]["content"] == "First assistant reply"
+        print("✓ same-second history stays chronological inside rolling context")
+    finally:
+        if os.path.exists(tmp.name):
+            os.remove(tmp.name)
+
+
 async def test_imessage_session_injects_mobile_prompt_defaults() -> None:
     print("=== Test: iMessage sessions inject mobile prompt defaults ===")
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
@@ -464,6 +507,7 @@ async def test_imessage_session_injects_mobile_prompt_defaults() -> None:
                 "iMessage" not in imessage_system_content
                 or "phone screen" not in imessage_system_content
             )
+            assert "single ongoing conversations by design" in imessage_system_content
 
             telegram_result = await handler.handle(
                 {"messages": [{"role": "user", "content": "Quick status?"}]},
@@ -479,6 +523,7 @@ async def test_imessage_session_injects_mobile_prompt_defaults() -> None:
                 "iMessage" not in tg_system_content
                 or "phone screen" not in tg_system_content
             )
+            assert "single ongoing conversations by design" in tg_system_content
 
         print(
             "✓ Initial responses use full max_tokens (4096) so tool calls are not truncated"
@@ -622,6 +667,369 @@ async def test_telegram_reaction_targets_are_injected_and_persisted() -> None:
             os.remove(tmp.name)
 
 
+async def test_handle_injects_session_continuity_brief() -> None:
+    print("=== Test: session continuity brief is injected proactively ===")
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+    tmp.close()
+
+    try:
+        store, handler = _create_store_and_handler(tmp.name)
+        session_id = "tg_2024"
+
+        await store.add_memory(
+            content="User goes by Alice and prefers blunt, concise replies.",
+            metadata={
+                "type": "explicit_memory",
+                "importance": "high",
+                "session_id": session_id,
+            },
+            generate_embedding=False,
+        )
+        await store.add_memory(
+            content="We have an ongoing running joke about stranger-danger cold starts.",
+            metadata={
+                "type": "long_term_memory",
+                "significance": 0.9,
+                "session_id": session_id,
+            },
+            generate_embedding=False,
+        )
+        store.add_conversation_message(
+            role="user",
+            content="Last time we were redesigning the memory boot flow.",
+            session_id=session_id,
+        )
+        store.add_conversation_message(
+            role="assistant",
+            content="We agreed the agent should act like it knows the user already.",
+            session_id=session_id,
+        )
+
+        captured_payload: dict[str, object] = {}
+
+        async def _fake_api_call(_session, _url, payload, _headers, **_kwargs):
+            captured_payload["messages"] = payload.get("messages", [])
+            return {"id": "fake", "choices": [{"message": {"role": "assistant"}}]}
+
+        with (
+            patch.object(
+                handler.memory_store, "search_memories", new=AsyncMock(return_value=[])
+            ),
+            patch(
+                "handler.api_call_with_retry", new=AsyncMock(side_effect=_fake_api_call)
+            ),
+            patch("handler.process_response", new=AsyncMock(return_value="ok")),
+        ):
+            result = await handler.handle(
+                {"messages": [{"role": "user", "content": "Pick up where we left off."}]},
+                session_id=session_id,
+            )
+
+        assert result == "ok"
+        system_content = str(captured_payload["messages"][0]["content"])
+        assert "[Session continuity brief]:" in system_content
+        assert "persistent conversation by design" in system_content
+        assert "User goes by Alice and prefers blunt, concise replies." in system_content
+        assert "stranger-danger cold starts" in system_content
+        assert "Last time we were redesigning the memory boot flow." in system_content
+        print("✓ session continuity is injected before the user has to ask for it")
+    finally:
+        if os.path.exists(tmp.name):
+            os.remove(tmp.name)
+
+
+async def test_session_continuity_excludes_other_session_memories() -> None:
+    print("=== Test: session continuity excludes other-session memories ===")
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+    tmp.close()
+
+    try:
+        store, handler = _create_store_and_handler(tmp.name)
+        session_id = "tg_7070"
+
+        await store.add_memory(
+            content="Current Telegram user likes concise replies.",
+            metadata={
+                "type": "explicit_memory",
+                "importance": "high",
+                "session_id": session_id,
+            },
+            generate_embedding=False,
+        )
+        await store.add_memory(
+            content="Other session user is building crustyhub all weekend.",
+            metadata={
+                "type": "explicit_memory",
+                "importance": "high",
+                "session_id": "tg_other",
+            },
+            generate_embedding=False,
+        )
+        await store.add_memory(
+            content="Unscoped long-term memory that should not bleed into Telegram continuity.",
+            metadata={
+                "type": "long_term_memory",
+                "significance": 0.9,
+            },
+            generate_embedding=False,
+        )
+
+        context = handler._build_session_continuity_context(session_id=session_id)
+
+        assert "Current Telegram user likes concise replies." in context
+        assert "Other session user is building crustyhub all weekend." not in context
+        assert (
+            "Unscoped long-term memory that should not bleed into Telegram continuity."
+            not in context
+        )
+        print("✓ continuity brief is scoped to the active messaging session")
+    finally:
+        if os.path.exists(tmp.name):
+            os.remove(tmp.name)
+
+
+async def test_handle_injects_continuity_fallback_when_lookup_fails() -> None:
+    print("=== Test: continuity fallback is injected when lookup fails ===")
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+    tmp.close()
+
+    try:
+        _, handler = _create_store_and_handler(tmp.name)
+
+        captured_payload: dict[str, object] = {}
+
+        async def _fake_api_call(_session, _url, payload, _headers, **_kwargs):
+            captured_payload["messages"] = payload.get("messages", [])
+            return {"id": "fake", "choices": [{"message": {"role": "assistant"}}]}
+
+        with (
+            patch.object(
+                handler.memory_store, "get_recent_memories", side_effect=RuntimeError("db offline")
+            ),
+            patch.object(
+                handler.memory_store, "search_memories", new=AsyncMock(return_value=[])
+            ),
+            patch(
+                "handler.api_call_with_retry", new=AsyncMock(side_effect=_fake_api_call)
+            ),
+            patch("handler.process_response", new=AsyncMock(return_value="ok")),
+        ):
+            result = await handler.handle(
+                {"messages": [{"role": "user", "content": "Hey."}]},
+                session_id="tg_3030",
+            )
+
+        assert result == "ok"
+        system_content = str(captured_payload["messages"][0]["content"])
+        assert "[Session continuity status]:" in system_content
+        assert "having trouble accessing your notes on the user" in system_content
+        print("✓ continuity failures are surfaced honestly in the system prompt")
+    finally:
+        if os.path.exists(tmp.name):
+            os.remove(tmp.name)
+
+
+async def test_handle_filters_query_memories_to_active_messaging_session() -> None:
+    print("=== Test: query-memory injection is scoped to active messaging session ===")
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+    tmp.close()
+
+    try:
+        _, handler = _create_store_and_handler(tmp.name)
+
+        captured_payload: dict[str, object] = {}
+
+        async def _fake_api_call(_session, _url, payload, _headers, **_kwargs):
+            captured_payload["messages"] = payload.get("messages", [])
+            return {"id": "fake", "choices": [{"message": {"role": "assistant"}}]}
+
+        same_session_memory = Memory(
+            id=1,
+            content="Same-session preference: keep Telegram answers short.",
+            embedding=None,
+            metadata={"type": "explicit_memory", "session_id": "tg_scope"},
+            created_at=None,
+            updated_at=None,
+        )
+        other_session_memory = Memory(
+            id=2,
+            content="Other-session preference: always mention crustyhub.",
+            embedding=None,
+            metadata={"type": "explicit_memory", "session_id": "tg_other"},
+            created_at=None,
+            updated_at=None,
+        )
+
+        with (
+            patch.object(
+                handler.memory_store,
+                "search_memories",
+                new=AsyncMock(
+                    return_value=[
+                        (same_session_memory, 0.9),
+                        (other_session_memory, 0.95),
+                    ]
+                ),
+            ),
+            patch(
+                "handler.api_call_with_retry", new=AsyncMock(side_effect=_fake_api_call)
+            ),
+            patch("handler.process_response", new=AsyncMock(return_value="ok")),
+        ):
+            result = await handler.handle(
+                {"messages": [{"role": "user", "content": "Need context check."}]},
+                session_id="tg_scope",
+            )
+
+        assert result == "ok"
+        system_content = str(captured_payload["messages"][0]["content"])
+        assert "Same-session preference: keep Telegram answers short." in system_content
+        assert "Other-session preference: always mention crustyhub." not in system_content
+        print("✓ query-scoped memories no longer bleed across Telegram sessions")
+    finally:
+        if os.path.exists(tmp.name):
+            os.remove(tmp.name)
+
+
+async def test_handle_injects_assistant_identity_and_filters_conflicting_user_name_memory() -> None:
+    print("=== Test: assistant identity note suppresses conflicting user-name memory ===")
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+    tmp.close()
+
+    try:
+        store, handler = _create_store_and_handler(tmp.name)
+
+        captured_payload: dict[str, object] = {}
+
+        async def _fake_api_call(_session, _url, payload, _headers, **_kwargs):
+            captured_payload["messages"] = payload.get("messages", [])
+            return {"id": "fake", "choices": [{"message": {"role": "assistant"}}]}
+
+        await store.add_memory(
+            content="The assistant's name is Alice.",
+            metadata={
+                "type": "explicit_memory",
+                "importance": "high",
+                "session_id": "tg_identity",
+                "subject": "assistant_identity",
+                "slot": "assistant_name",
+                "assistant_name": "Alice",
+            },
+            generate_embedding=False,
+        )
+
+        conflicting_user_name = Memory(
+            id=1,
+            content="User's name is Alice.",
+            embedding=None,
+            metadata={"type": "explicit_memory", "session_id": "tg_identity"},
+            created_at=None,
+            updated_at=None,
+        )
+        assistant_name_memory = Memory(
+            id=2,
+            content="The assistant's name is Alice.",
+            embedding=None,
+            metadata={
+                "type": "explicit_memory",
+                "session_id": "tg_identity",
+                "subject": "assistant_identity",
+                "slot": "assistant_name",
+                "assistant_name": "Alice",
+            },
+            created_at=None,
+            updated_at=None,
+        )
+
+        with (
+            patch.object(
+                handler.memory_store,
+                "search_memories",
+                new=AsyncMock(
+                    return_value=[
+                        (conflicting_user_name, 0.95),
+                        (assistant_name_memory, 0.9),
+                    ]
+                ),
+            ),
+            patch(
+                "handler.api_call_with_retry", new=AsyncMock(side_effect=_fake_api_call)
+            ),
+            patch("handler.process_response", new=AsyncMock(return_value="ok")),
+        ):
+            result = await handler.handle(
+                {"messages": [{"role": "user", "content": "what's your name?"}]},
+                session_id="tg_identity",
+            )
+
+        assert result == "ok"
+        system_content = str(captured_payload["messages"][0]["content"])
+        assert "[Assistant identity note]:" in system_content
+        assert "Your configured name in this session is Alice." in system_content
+        assert "The assistant's name is Alice." in system_content
+        assert "User's name is Alice." not in system_content
+        print("✓ assistant identity note is injected and conflicting user-name memory is filtered")
+    finally:
+        if os.path.exists(tmp.name):
+            os.remove(tmp.name)
+
+
+async def test_handle_infers_assistant_identity_from_recent_history() -> None:
+    print("=== Test: assistant identity can be inferred from recent user history ===")
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+    tmp.close()
+
+    try:
+        store, handler = _create_store_and_handler(tmp.name)
+
+        store.add_conversation_message(
+            role="user",
+            content="your name is alice, remember that",
+            session_id="tg_identity_history",
+        )
+
+        captured_payload: dict[str, object] = {}
+
+        async def _fake_api_call(_session, _url, payload, _headers, **_kwargs):
+            captured_payload["messages"] = payload.get("messages", [])
+            return {"id": "fake", "choices": [{"message": {"role": "assistant"}}]}
+
+        conflicting_user_name = Memory(
+            id=3,
+            content="User's name is Alice.",
+            embedding=None,
+            metadata={"type": "explicit_memory", "session_id": "tg_identity_history"},
+            created_at=None,
+            updated_at=None,
+        )
+
+        with (
+            patch.object(
+                handler.memory_store,
+                "search_memories",
+                new=AsyncMock(return_value=[(conflicting_user_name, 0.95)]),
+            ),
+            patch(
+                "handler.api_call_with_retry", new=AsyncMock(side_effect=_fake_api_call)
+            ),
+            patch("handler.process_response", new=AsyncMock(return_value="ok")),
+        ):
+            result = await handler.handle(
+                {"messages": [{"role": "user", "content": "what's your name?"}]},
+                session_id="tg_identity_history",
+            )
+
+        assert result == "ok"
+        system_content = str(captured_payload["messages"][0]["content"])
+        assert "[Assistant identity note]:" in system_content
+        assert "Your configured name in this session is alice." in system_content
+        assert "User's name is Alice." not in system_content
+        print("✓ recent user history can rescue assistant identity before memory catches up")
+    finally:
+        if os.path.exists(tmp.name):
+            os.remove(tmp.name)
+
+
 async def test_handle_injects_request_freshness_token() -> None:
     print("=== Test: request freshness token is injected into system prompt ===")
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
@@ -657,6 +1065,104 @@ async def test_handle_injects_request_freshness_token() -> None:
         assert REQUEST_FRESHNESS_INSTRUCTION in system_content
         assert "[Freshness Token]:" in system_content
         print("✓ request freshness token is included in the visible-response prompt")
+    finally:
+        if os.path.exists(tmp.name):
+            os.remove(tmp.name)
+
+
+async def test_handle_runs_memory_maintenance_before_closing_http_session() -> None:
+    print("=== Test: memory maintenance runs before HTTP session closes ===")
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+    tmp.close()
+
+    try:
+        _, handler = _create_store_and_handler(tmp.name)
+
+        observed: dict[str, object] = {}
+
+        async def _fake_api_call(_session, _url, _payload, _headers, **_kwargs):
+            return {"id": "fake", "choices": [{"message": {"role": "assistant"}}]}
+
+        async def _assert_open_session(
+            session,
+            session_id,
+            user_query,
+            assistant_response,
+        ):
+            observed["session_closed"] = session.closed
+            observed["session_id"] = session_id
+            observed["assistant_response"] = assistant_response
+            assert session.closed is False
+
+        with (
+            patch.object(
+                handler.memory_store, "search_memories", new=AsyncMock(return_value=[])
+            ),
+            patch(
+                "handler.api_call_with_retry", new=AsyncMock(side_effect=_fake_api_call)
+            ),
+            patch("handler.process_response", new=AsyncMock(return_value="ok")),
+            patch.object(
+                handler,
+                "_run_memory_maintenance",
+                new=AsyncMock(side_effect=_assert_open_session),
+            ),
+        ):
+            result = await handler.handle(
+                {"messages": [{"role": "user", "content": "check session timing"}]},
+                session_id="tg_live_session",
+            )
+
+        assert result == "ok"
+        assert observed["session_closed"] is False
+        assert observed["session_id"] == "tg_live_session"
+        assert observed["assistant_response"] == "ok"
+
+        history = handler.memory_store.get_conversation_history(
+            session_id="tg_live_session",
+            limit=5,
+        )
+        assert [row["role"] for row in history[:2]] == ["assistant", "user"], history
+        print("✓ post-response maintenance sees a live HTTP session")
+    finally:
+        if os.path.exists(tmp.name):
+            os.remove(tmp.name)
+
+
+async def test_persistent_messaging_sessions_without_notes_still_avoid_thread_resets() -> None:
+    print("=== Test: messaging continuity fallback preserves one-thread assumption ===")
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+    tmp.close()
+
+    try:
+        _, handler = _create_store_and_handler(tmp.name)
+
+        captured_payload: dict[str, object] = {}
+
+        async def _fake_api_call(_session, _url, payload, _headers, **_kwargs):
+            captured_payload["messages"] = payload.get("messages", [])
+            return {"id": "fake", "choices": [{"message": {"role": "assistant"}}]}
+
+        with (
+            patch.object(
+                handler.memory_store, "search_memories", new=AsyncMock(return_value=[])
+            ),
+            patch(
+                "handler.api_call_with_retry", new=AsyncMock(side_effect=_fake_api_call)
+            ),
+            patch("handler.process_response", new=AsyncMock(return_value="ok")),
+        ):
+            result = await handler.handle(
+                {"messages": [{"role": "user", "content": "yo"}]},
+                session_id="imessage_+15550007777",
+            )
+
+        assert result == "ok"
+        system_content = str(captured_payload["messages"][0]["content"])
+        assert "[Session continuity status]:" in system_content
+        assert "one persistent conversation by design" in system_content
+        assert "fresh thread" in system_content
+        print("✓ messaging sessions keep persistent-thread guidance even without notes")
     finally:
         if os.path.exists(tmp.name):
             os.remove(tmp.name)
@@ -764,18 +1270,78 @@ async def test_handle_strips_internal_prompt_residue_from_response() -> None:
             os.remove(tmp.name)
 
 
+async def test_handle_strips_pseudo_reaction_directives_from_response() -> None:
+    print("=== Test: handle strips leaked pseudo reaction directives ===")
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+    tmp.close()
+
+    try:
+        _, handler = _create_store_and_handler(tmp.name)
+
+        leaked_response = (
+            "ayy let's go!\n\n"
+            "*send_telegram_reaction: chat_id=880978583, message_id=112, reaction=love*"
+        )
+
+        with (
+            patch.object(
+                handler.memory_store, "search_memories", new=AsyncMock(return_value=[])
+            ),
+            patch(
+                "handler.api_call_with_retry",
+                new=AsyncMock(
+                    return_value={
+                        "id": "fake",
+                        "choices": [{"message": {"role": "assistant"}}],
+                    }
+                ),
+            ),
+            patch(
+                "handler.process_response", new=AsyncMock(return_value=leaked_response)
+            ),
+        ):
+            result = await handler.handle(
+                {"messages": [{"role": "user", "content": "Celebrate"}]},
+                session_id="tg_1002",
+            )
+
+        assert result == "ayy let's go!"
+
+        history = handler.memory_store.get_conversation_history(
+            session_id="tg_1002",
+            limit=5,
+        )
+        assistant_rows = [row for row in history if row.get("role") == "assistant"]
+        assert assistant_rows
+        assert assistant_rows[0].get("content") == "ayy let's go!"
+        print("✓ pseudo reaction directives are removed from visible responses")
+    finally:
+        if os.path.exists(tmp.name):
+            os.remove(tmp.name)
+
+
 async def main() -> int:
     await test_auto_memory_cadence_bounds()
     await test_dream_profile_and_consolidation_helpers()
     await test_cross_channel_recall_injects_requested_history()
     await test_cross_channel_recall_prefers_current_session_when_same_channel()
     await test_cross_channel_recall_is_injected_into_handle_context()
+    await test_rolling_context_preserves_same_second_message_order()
     await test_imessage_session_injects_mobile_prompt_defaults()
     await test_imessage_handle_ids_are_injected_and_persisted()
     await test_telegram_reaction_targets_are_injected_and_persisted()
+    await test_handle_injects_session_continuity_brief()
+    await test_session_continuity_excludes_other_session_memories()
+    await test_handle_injects_continuity_fallback_when_lookup_fails()
+    await test_handle_filters_query_memories_to_active_messaging_session()
+    await test_handle_injects_assistant_identity_and_filters_conflicting_user_name_memory()
+    await test_handle_infers_assistant_identity_from_recent_history()
     await test_handle_injects_request_freshness_token()
+    await test_handle_runs_memory_maintenance_before_closing_http_session()
+    await test_persistent_messaging_sessions_without_notes_still_avoid_thread_resets()
     await test_handle_strips_delivery_directives_from_response()
     await test_handle_strips_internal_prompt_residue_from_response()
+    await test_handle_strips_pseudo_reaction_directives_from_response()
     print("\nAll memory-maintenance tests passed")
     return 0
 

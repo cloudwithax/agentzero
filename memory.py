@@ -733,7 +733,7 @@ class MemoryStore:
                 SELECT id, session_id, role, content, metadata, created_at
                 FROM conversations
                 WHERE session_id = ?
-                ORDER BY created_at DESC
+                ORDER BY created_at DESC, id DESC
                 LIMIT ?
             """,
                 (session_id, limit),
@@ -743,7 +743,7 @@ class MemoryStore:
                 """
                 SELECT id, session_id, role, content, metadata, created_at
                 FROM conversations
-                ORDER BY created_at DESC
+                ORDER BY created_at DESC, id DESC
                 LIMIT ?
             """,
                 (limit,),
@@ -823,7 +823,7 @@ class MemoryStore:
                 SELECT id, session_id, role, content, metadata, created_at
                 FROM conversations
                 WHERE session_id = ?
-                ORDER BY created_at DESC
+                ORDER BY created_at DESC, id DESC
                 LIMIT ?
             """,
                 (session_id, limit),
@@ -834,7 +834,7 @@ class MemoryStore:
                 SELECT id, session_id, role, content, metadata, created_at
                 FROM conversations
                 WHERE session_id LIKE ?
-                ORDER BY created_at DESC
+                ORDER BY created_at DESC, id DESC
                 LIMIT ?
             """,
                 (f"{prefix}%", limit),

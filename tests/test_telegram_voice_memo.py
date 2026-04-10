@@ -10,8 +10,28 @@ from unittest.mock import AsyncMock, Mock, patch
 from integrations import (
     _build_telegram_user_content,
     _extract_telegram_attachment_urls,
+    _telegram_file_url,
     _transcribe_audio_bytes_with_whisper,
 )
+
+
+async def test_telegram_file_url_preserves_absolute_file_paths() -> None:
+    """Telegram file URLs should not duplicate the API base when already absolute."""
+    bot = SimpleNamespace(
+        token="test-token",
+        get_file=AsyncMock(
+            return_value=SimpleNamespace(
+                file_path="https://api.telegram.org/file/bottest-token/photos/file_1.jpg"
+            )
+        ),
+    )
+
+    url = await _telegram_file_url(bot, "photo-id")
+
+    assert (
+        url
+        == "https://api.telegram.org/file/bottest-token/photos/file_1.jpg"
+    )
 
 
 async def test_extract_telegram_attachment_urls_includes_voice_audio_and_images() -> None:
@@ -130,6 +150,7 @@ async def test_transcribe_audio_bytes_uses_telegram_voice_memo_overrides() -> No
 
 
 async def main() -> int:
+    await test_telegram_file_url_preserves_absolute_file_paths()
     await test_extract_telegram_attachment_urls_includes_voice_audio_and_images()
     await test_build_telegram_user_content_transcribes_voice_notes_and_keeps_images()
     await test_transcribe_audio_bytes_uses_telegram_voice_memo_overrides()

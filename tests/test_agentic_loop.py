@@ -903,6 +903,105 @@ async def test_run_agentic_loop_retries_invalid_pseudo_tool_syntax() -> None:
     print("  ✓ Passed")
 
 
+async def test_run_agentic_loop_retries_markdown_reaction_pseudo_tool() -> None:
+    """Markdown-style reaction directives should be retried into real tool calls."""
+    print("Test 9b: Retry when model emits markdown pseudo reaction syntax")
+
+    initial_response = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": (
+                        "ayy let's go!\n\n"
+                        "*send_telegram_reaction: chat_id=880978583, "
+                        "message_id=112, reaction=love*"
+                    ),
+                }
+            }
+        ]
+    }
+
+    tool_call_response = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_tg_reaction",
+                            "type": "function",
+                            "function": {
+                                "name": "send_telegram_reaction",
+                                "arguments": json.dumps(
+                                    {
+                                        "chat_id": 880978583,
+                                        "message_id": 112,
+                                        "reaction": "love",
+                                    }
+                                ),
+                            },
+                        }
+                    ],
+                }
+            }
+        ]
+    }
+
+    final_response = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "ayy let's go!",
+                }
+            }
+        ]
+    }
+
+    execute_tool_calls = AsyncMock(
+        return_value=[
+            {
+                "tool_call_id": "call_tg_reaction",
+                "role": "tool",
+                "content": json.dumps({"success": True}),
+            }
+        ]
+    )
+    api_call_with_retry = AsyncMock(side_effect=[tool_call_response, final_response])
+
+    messages = [
+        {"role": "user", "content": "Nice, celebrate with me."},
+    ]
+
+    with (
+        patch("agentic_loop.api_call_with_retry", new=api_call_with_retry),
+        patch("agentic_loop.execute_tool_calls", execute_tool_calls),
+    ):
+        content = await run_agentic_loop(
+            messages=messages,
+            session=AsyncMock(),
+            base_url=BASE_URL,
+            api_key=API_KEY,
+            base_payload=BASE_PAYLOAD.copy(),
+            initial_response_data=initial_response,
+        )
+
+    assert content == "ayy let's go!"
+    assert execute_tool_calls.await_count == 1
+    pseudo_tool_nudges = [
+        m["content"]
+        for m in messages
+        if m.get("role") == "user"
+        and "invalid pseudo-tool markup" in m.get("content", "")
+    ]
+    assert (
+        len(pseudo_tool_nudges) == 1
+    ), f"Expected one pseudo-tool nudge, got {len(pseudo_tool_nudges)}"
+    print("  ✓ Passed")
+
+
 async def test_run_agentic_loop_retries_unverified_publish_success_claim() -> None:
     """Failed publish tool output should block blanket success claims."""
     print("Test 10: Retry when model claims publish success after failed tool output")
@@ -1044,6 +1143,7 @@ async def main() -> None:
     await test_run_agentic_loop_retries_bare_reaction_word()
     await test_run_agentic_loop_nudges_consult_advisor_for_hard_decision()
     await test_run_agentic_loop_retries_invalid_pseudo_tool_syntax()
+    await test_run_agentic_loop_retries_markdown_reaction_pseudo_tool()
     await test_run_agentic_loop_retries_unverified_publish_success_claim()
 
     print()
