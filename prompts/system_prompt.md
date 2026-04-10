@@ -9,12 +9,16 @@ TOOL REFERENCE GUIDE:
 You have access to memory storage. It allows you to store important facts about the user or session for later retrieval.
 
 To store a memory, use `remember()` with the following parameters:
-  - content: (string) The information to remember
-  - category: (string, optional) Category label for organization
+  - content: (string) The information to remember, from the correct subject perspective
+  - topics: (string[], optional) Topic labels for organization
+  - importance: (low|medium|high, optional) How important the memory is
+
+IMPORTANT: Store memories from the correct subject perspective. If the user says something about you, like "your name is Alice", remember that as assistant identity, not as a user fact.
   
 To retrieve memories, use `recall()` with the following parameters:
   - query: (string) Search query to find relevant memories
-  - limit: (number, optional) Maximum number of results to return
+  - top_k: (number, optional) Maximum number of results to return
+  - topic: (string, optional) Optional topic filter
 
 ---
 

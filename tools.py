@@ -82,6 +82,48 @@ _runtime_messages: contextvars.ContextVar[Optional[list[dict[str, Any]]]] = (
     )
 )
 
+_ASSISTANT_NAME_USER_TEXT_PATTERNS = (
+    re.compile(
+        r"""(?ix)
+        \b(?:your|ur)\s+name\s+(?:is|=|should\s+be)\s+
+        ['"]?(?P<name>[A-Za-z][A-Za-z0-9'_-]{0,39})['"]?
+        """
+    ),
+    re.compile(
+        r"""(?ix)
+        \b(?:i(?:'m| am)\s+calling\s+you|call\s+yourself|you(?:'re| are)\s+(?:called|named))\s+
+        ['"]?(?P<name>[A-Za-z][A-Za-z0-9'_-]{0,39})['"]?
+        """
+    ),
+)
+_ASSISTANT_NAME_MEMORY_PATTERNS = (
+    re.compile(
+        r"""(?ix)
+        \b(?:the\s+)?assistant(?:'s)?\s+name\s+(?:is|=)\s+
+        ['"]?(?P<name>[A-Za-z][A-Za-z0-9'_-]{0,39})['"]?
+        """
+    ),
+    re.compile(
+        r"""(?ix)
+        \b(?:your|bot)\s+name\s+(?:is|=)\s+
+        ['"]?(?P<name>[A-Za-z][A-Za-z0-9'_-]{0,39})['"]?
+        """
+    ),
+)
+_USER_NAME_MEMORY_PATTERNS = (
+    re.compile(
+        r"""(?ix)
+        \b(?:the\s+)?user(?:'s)?\s+name\s+(?:is|=)\s+
+        ['"]?(?P<name>[A-Za-z][A-Za-z0-9'_-]{0,39})['"]?
+        """
+    ),
+    re.compile(
+        r"""(?ix)
+        \buser\s+goes\s+by\s+['"]?(?P<name>[A-Za-z][A-Za-z0-9'_-]{0,39})['"]?
+        """
+    ),
+)
+
 
 def set_agent_workspace(path: str) -> None:
     """Override the workspace path at runtime (called from main/handler)."""
@@ -155,6 +197,127 @@ def set_tool_runtime_messages(messages: Optional[list[dict[str, Any]]]):
 def reset_tool_runtime_messages(token: contextvars.Token):
     """Restore previous shared-message runtime context."""
     _runtime_messages.reset(token)
+
+
+def _message_content_to_text(content: Any) -> str:
+    """Extract plain text from content that may include multimodal blocks."""
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text" and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+            elif isinstance(item.get("content"), str):
+                parts.append(item["content"])
+        return "\n".join(part for part in parts if part).strip()
+
+    return "" if content is None else str(content)
+
+
+def _normalize_name_key(value: str) -> str:
+    """Normalize a short name-like token for equality checks."""
+    lowered = str(value or "").strip().lower()
+    return re.sub(r"[^a-z0-9]+", "", lowered)
+
+
+def _format_name_display(value: str) -> str:
+    """Preserve mixed-case names, but title-case all-lower/all-upper tokens."""
+    normalized = str(value or "").strip()
+    if not normalized:
+        return ""
+    if normalized.islower() or normalized.isupper():
+        return normalized[:1].upper() + normalized[1:].lower()
+    return normalized
+
+
+def _latest_real_user_text(messages: Optional[list[dict[str, Any]]]) -> str:
+    """Return the latest non-system user text from shared runtime messages."""
+    if not messages:
+        return ""
+
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        candidate = _message_content_to_text(message.get("content", ""))
+        if candidate.strip().startswith("[System:"):
+            continue
+        return candidate
+
+    return ""
+
+
+def _extract_name_with_patterns(text: str, patterns: tuple[re.Pattern[str], ...]) -> str:
+    """Extract the first matching name token from text."""
+    normalized = str(text or "").strip()
+    if not normalized:
+        return ""
+
+    for pattern in patterns:
+        match = pattern.search(normalized)
+        if not match:
+            continue
+        name = str(match.group("name") or "").strip(" \t\r\n'\".,!?")
+        if name:
+            return name
+
+    return ""
+
+
+def extract_assistant_name_from_user_text(text: str) -> str:
+    """Extract an assistant-name assignment from the latest user turn."""
+    return _extract_name_with_patterns(text, _ASSISTANT_NAME_USER_TEXT_PATTERNS)
+
+
+def extract_assistant_name_from_memory_content(content: str) -> str:
+    """Extract an assistant-name memory from stored memory text."""
+    return _extract_name_with_patterns(content, _ASSISTANT_NAME_MEMORY_PATTERNS)
+
+
+def extract_user_name_from_memory_content(content: str) -> str:
+    """Extract a user-name memory from stored memory text."""
+    return _extract_name_with_patterns(content, _USER_NAME_MEMORY_PATTERNS)
+
+
+def normalize_memory_candidate_from_user_text(
+    content: str,
+    user_text: str,
+    topics: Optional[list[str]] = None,
+) -> tuple[str, list[str], dict[str, Any]]:
+    """Correct obvious subject/perspective mistakes using the live user turn."""
+    normalized_content = str(content or "").strip()
+    normalized_topics = [str(topic).strip() for topic in (topics or []) if str(topic).strip()]
+    metadata_updates: dict[str, Any] = {}
+
+    assistant_name = extract_assistant_name_from_user_text(user_text)
+    if not assistant_name:
+        return normalized_content, normalized_topics, metadata_updates
+
+    assistant_name_key = _normalize_name_key(assistant_name)
+    remembered_user_name = extract_user_name_from_memory_content(normalized_content)
+    remembered_assistant_name = extract_assistant_name_from_memory_content(
+        normalized_content
+    )
+
+    if assistant_name_key and (
+        _normalize_name_key(remembered_user_name) == assistant_name_key
+        or _normalize_name_key(remembered_assistant_name) == assistant_name_key
+    ):
+        assistant_name = _format_name_display(assistant_name)
+        normalized_content = f"The assistant's name is {assistant_name}."
+        metadata_updates = {
+            "subject": "assistant_identity",
+            "slot": "assistant_name",
+            "assistant_name": assistant_name,
+        }
+        for topic in ("assistant_identity", "assistant_name"):
+            if topic not in normalized_topics:
+                normalized_topics.append(topic)
+
+    return normalized_content, normalized_topics, metadata_updates
 
 
 # File tools
@@ -470,11 +633,22 @@ async def remember_tool(
         if memory_store is None:
             return {"success": False, "error": "Memory store not initialized"}
 
+        normalized_content, normalized_topics, inferred_metadata = (
+            normalize_memory_candidate_from_user_text(
+                content=content,
+                user_text=_latest_real_user_text(_runtime_messages.get()),
+                topics=topics,
+            )
+        )
         metadata = {"importance": importance, "type": "explicit_memory"}
+        metadata.update(inferred_metadata)
+        session_id = _runtime_session_id.get()
+        if session_id:
+            metadata["session_id"] = session_id
         memory_id = await memory_store.add_memory(
-            content=content,
+            content=normalized_content,
             metadata=metadata,
-            topics=topics or [],
+            topics=normalized_topics,
             generate_embedding=True,
         )
         return {

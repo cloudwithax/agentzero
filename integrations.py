@@ -2222,7 +2222,10 @@ async def _telegram_file_url(bot: Any, file_id: str) -> str | None:
         tg_file = await bot.get_file(file_id)
         if not tg_file or not tg_file.file_path:
             return None
-        return f"https://api.telegram.org/file/bot{bot.token}/{tg_file.file_path}"
+        file_path = str(tg_file.file_path).strip()
+        if file_path.startswith(("http://", "https://")):
+            return file_path
+        return f"https://api.telegram.org/file/bot{bot.token}/{file_path.lstrip('/')}"
     except Exception as e:
         logger.warning("Failed to resolve Telegram file URL: %s", e)
         return None

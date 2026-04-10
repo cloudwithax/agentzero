@@ -3,8 +3,18 @@
 
 import asyncio
 import json
+import os
+import tempfile
 from tools import TOOLS
+from tools import (
+    reset_tool_runtime_session,
+    reset_tool_runtime_messages,
+    set_memory_store,
+    set_tool_runtime_messages,
+    set_tool_runtime_session,
+)
 from handler import BASE_PAYLOAD
+from memory import EnhancedMemoryStore
 
 
 async def test_tools_work():
@@ -160,9 +170,83 @@ async def test_tool_result_format():
     )
 
 
+async def test_remember_tool_persists_runtime_session_id():
+    """Explicit remember() calls should stay tied to the active runtime session."""
+    print("Testing remember runtime session binding...")
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+    tmp.close()
+
+    try:
+        store = EnhancedMemoryStore(db_path=tmp.name, api_key="")
+        set_memory_store(store)
+
+        session_token = set_tool_runtime_session("tg_memory_test")
+        try:
+            result = await TOOLS["remember"](
+                content="User goes by Alice.",
+                importance="high",
+            )
+        finally:
+            reset_tool_runtime_session(session_token)
+
+        assert result["success"], f"Remember failed: {result}"
+        recent = store.get_recent_memories(limit=1)
+        assert recent, "Expected explicit memory to be stored"
+        assert recent[0].metadata.get("session_id") == "tg_memory_test", recent[0]
+        print("✓ remember stores active session_id for continuity\n")
+    finally:
+        if os.path.exists(tmp.name):
+            os.remove(tmp.name)
+
+
+async def test_remember_tool_rewrites_assistant_name_from_user_turn():
+    """Explicit remember() should correct assistant-name perspective mistakes."""
+    print("Testing remember assistant-name perspective correction...")
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+    tmp.close()
+
+    try:
+        store = EnhancedMemoryStore(db_path=tmp.name, api_key="")
+        set_memory_store(store)
+
+        session_token = set_tool_runtime_session("tg_identity_test")
+        messages_token = set_tool_runtime_messages(
+            [
+                {
+                    "role": "user",
+                    "content": "your name is alice, remember that",
+                }
+            ]
+        )
+        try:
+            result = await TOOLS["remember"](
+                content="User's name is Alice.",
+                importance="high",
+            )
+        finally:
+            reset_tool_runtime_messages(messages_token)
+            reset_tool_runtime_session(session_token)
+
+        assert result["success"], f"Remember failed: {result}"
+        recent = store.get_recent_memories(limit=1)
+        assert recent, "Expected explicit memory to be stored"
+        assert recent[0].content == "The assistant's name is Alice.", recent[0]
+        assert recent[0].metadata.get("subject") == "assistant_identity", recent[0]
+        assert recent[0].metadata.get("slot") == "assistant_name", recent[0]
+        assert recent[0].metadata.get("assistant_name") == "Alice", recent[0]
+        print("✓ remember corrects assistant-name identity memories\n")
+    finally:
+        if os.path.exists(tmp.name):
+            os.remove(tmp.name)
+
+
 if __name__ == "__main__":
     asyncio.run(test_tools_work())
     asyncio.run(test_payload_isolation())
     asyncio.run(test_tool_call_parsing())
     asyncio.run(test_tool_result_format())
+    asyncio.run(test_remember_tool_persists_runtime_session_id())
+    asyncio.run(test_remember_tool_rewrites_assistant_name_from_user_turn())
     print("All tests passed!")

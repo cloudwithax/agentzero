@@ -76,6 +76,14 @@ _PSEUDO_TOOL_XML_PATTERN = re.compile(
     r")\b[^>]*>"
 )
 _PSEUDO_FUNCTION_XML_PATTERN = re.compile(r"(?is)<function_[A-Za-z_][\w-]*\b")
+_PSEUDO_TOOL_MARKDOWN_PATTERN = re.compile(
+    r"(?im)(?:^|[\r\n])\s*[*_`~][*_`~ ]*"
+    r"(?:read|write|edit|glob|grep|bash|web_search|webfetch|codesearch|"
+    r"activate_skill|add_skill|consult_advisor|consult_reviewer|"
+    r"send_tapback|send_telegram_reaction|send_reaction|"
+    r"consortium_[a-z_]+|reminder_[a-z_]+)"
+    r"\s*(?:[:(])"
+)
 TAPBACK_ACK_PATTERN = re.compile(
     r"(?is)^\s*"
     r"(?:done|ok(?:ay)?|sent)[.!]?\s*$"
@@ -393,6 +401,7 @@ def contains_pseudo_tool_syntax(text: str) -> bool:
         _PSEUDO_TOOL_TAG_PATTERN.search(text)
         or _PSEUDO_TOOL_XML_PATTERN.search(text)
         or _PSEUDO_FUNCTION_XML_PATTERN.search(text)
+        or _PSEUDO_TOOL_MARKDOWN_PATTERN.search(text)
     )
 
 
