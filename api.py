@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 import uuid
 from typing import Any, Awaitable, Callable, Optional
 
@@ -15,6 +16,27 @@ import strip_markdown
 from tools import TOOLS, validate_tool_args
 
 logger = logging.getLogger(__name__)
+
+
+# ── Global rate limiter (token bucket) ────────────────────────────────────────
+# NVIDIA free-tier: 40 RPM → 1 request every 1.5s
+_RPM_LIMIT = 40
+_MIN_INTERVAL = 60.0 / _RPM_LIMIT  # 1.5s
+_rate_lock = asyncio.Lock()
+_last_request_time: float = 0.0
+
+
+async def _rate_limit_wait() -> None:
+    """Block until we're allowed to make the next API request."""
+    global _last_request_time
+    async with _rate_lock:
+        now = time.monotonic()
+        elapsed = now - _last_request_time
+        if elapsed < _MIN_INTERVAL:
+            wait = _MIN_INTERVAL - elapsed
+            logger.debug("Rate limiter: waiting %.2fs", wait)
+            await asyncio.sleep(wait)
+        _last_request_time = time.monotonic()
 
 
 def _apply_cache_busting_headers(headers: dict[str, str]) -> dict[str, str]:
@@ -507,6 +529,7 @@ async def api_call_with_retry(
     request_payload["stream"] = stream
 
     for attempt in range(max_retries):
+        await _rate_limit_wait()
         try:
             async with session.post(
                 url, json=request_payload, headers=request_headers

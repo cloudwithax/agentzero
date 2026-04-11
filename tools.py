@@ -1232,7 +1232,7 @@ async def send_telegram_reaction_tool(
     Args:
         chat_id: Telegram chat ID where the message was sent
         message_id: Telegram message ID to react to
-        reaction: Semantic reaction type: like, love, dislike, laugh, emphasize, question
+        reaction: Reaction name. Core: like (👍), love (❤), dislike (👎), laugh (🤣), emphasize (🔥), question (🤔). Extended: party (🎉), clap (👏), cry (😢), sob (😭), scream (😱), mindblown (🤯), pray (🙏), cool (😎), 100 (💯), hearts (🥰), starry (🤩), angry (😡), devil (😈), ghost (👻), clown (🤡), shrug (🤷), eyes (👀), kiss (😘), hug (🤗), salute (🫡), nerd (🤓), trophy (🏆), and more
     """
     try:
         try:

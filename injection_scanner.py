@@ -159,8 +159,8 @@ _RE_INDIRECT_INJECTION = re.compile(
     r"|(?:make\s+this\s+your\s+default)"
 )
 
-_SUSPICION_THRESHOLD = 0.30
-_CRITICAL_THRESHOLD = 0.60
+_SUSPICION_THRESHOLD = 0.45
+_CRITICAL_THRESHOLD = 0.70
 
 
 def _normalize_text(text: str) -> str:

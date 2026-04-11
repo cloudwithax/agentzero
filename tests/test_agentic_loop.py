@@ -199,7 +199,7 @@ async def test_run_agentic_loop_retries_multiple_narrated_publish_attempts() -> 
         m["content"]
         for m in messages
         if m.get("role") == "user"
-        and "did not make any tool calls" in m.get("content", "")
+        and "zero tool calls" in m.get("content", "")
     ]
     assert (
         len(user_nudges) == 2
@@ -323,7 +323,7 @@ async def test_run_agentic_loop_retries_when_user_explicitly_requires_tools() ->
         m["content"]
         for m in messages
         if m.get("role") == "user"
-        and "did not make any tool calls" in m.get("content", "")
+        and "zero tool calls" in m.get("content", "")
     ]
     assert (
         len(user_nudges) == 1
@@ -436,7 +436,7 @@ async def test_run_agentic_loop_retries_to_add_skill_for_skill_url() -> None:
         m["content"]
         for m in messages
         if m.get("role") == "user"
-        and "The user provided a skill URL" in m.get("content", "")
+        and "zero tool calls" in m.get("content", "")
     ]
     assert (
         len(user_nudges) == 1
@@ -686,14 +686,14 @@ async def test_run_agentic_loop_retries_bare_reaction_word() -> None:
     assert content == "hey! yeah I'm here, what's up?"
     assert api_call_with_retry.await_count == 1
 
-    bare_reaction_nudges = [
+    reaction_nudges = [
         m["content"]
         for m in messages
-        if m.get("role") == "user" and "bare reaction word" in m.get("content", "")
+        if m.get("role") == "user" and "zero tool calls" in m.get("content", "")
     ]
     assert (
-        len(bare_reaction_nudges) == 1
-    ), f"Expected one bare-reaction nudge, got {len(bare_reaction_nudges)}"
+        len(reaction_nudges) == 1
+    ), f"Expected one reaction nudge, got {len(reaction_nudges)}"
     print("  ✓ Passed")
 
 
@@ -790,7 +790,7 @@ async def test_run_agentic_loop_nudges_consult_advisor_for_hard_decision() -> No
     advisor_nudges = [
         m["content"]
         for m in messages
-        if m.get("role") == "user" and "Call consult_advisor" in m.get("content", "")
+        if m.get("role") == "user" and "zero tool calls" in m.get("content", "")
     ]
     assert (
         len(advisor_nudges) == 1
@@ -895,7 +895,7 @@ async def test_run_agentic_loop_retries_invalid_pseudo_tool_syntax() -> None:
         m["content"]
         for m in messages
         if m.get("role") == "user"
-        and "invalid pseudo-tool markup" in m.get("content", "")
+        and "zero tool calls" in m.get("content", "")
     ]
     assert (
         len(pseudo_tool_nudges) == 1
@@ -994,11 +994,113 @@ async def test_run_agentic_loop_retries_markdown_reaction_pseudo_tool() -> None:
         m["content"]
         for m in messages
         if m.get("role") == "user"
-        and "invalid pseudo-tool markup" in m.get("content", "")
+        and "zero tool calls" in m.get("content", "")
     ]
     assert (
         len(pseudo_tool_nudges) == 1
     ), f"Expected one pseudo-tool nudge, got {len(pseudo_tool_nudges)}"
+    print("  ✓ Passed")
+
+
+async def test_run_agentic_loop_retries_short_reaction_ack_without_tool() -> None:
+    """Short `sent! ❤️` acknowledgements should not pass as real Telegram reactions."""
+    print("Test 9c: Retry when model claims short reaction ack without a tool call")
+
+    initial_response = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "sent! ❤️",
+                }
+            }
+        ]
+    }
+
+    tool_call_response = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_tg_reaction",
+                            "type": "function",
+                            "function": {
+                                "name": "send_telegram_reaction",
+                                "arguments": json.dumps(
+                                    {
+                                        "chat_id": 880978583,
+                                        "message_id": 118,
+                                        "reaction": "love",
+                                    }
+                                ),
+                            },
+                        }
+                    ],
+                }
+            }
+        ]
+    }
+
+    final_response = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "try it now.",
+                }
+            }
+        ]
+    }
+
+    execute_tool_calls = AsyncMock(
+        return_value=[
+            {
+                "tool_call_id": "call_tg_reaction",
+                "role": "tool",
+                "content": json.dumps({"success": True}),
+            }
+        ]
+    )
+    api_call_with_retry = AsyncMock(side_effect=[tool_call_response, final_response])
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "[Available Telegram reaction targets from current and recent messages]:\n"
+                "Use these exact chat_id/message_id values when calling "
+                "send_telegram_reaction.\n"
+                '1. current inbound message: chat_id=880978583; message_id=118; message="try sending it again"\n'
+            ),
+        },
+        {"role": "user", "content": "try sending it again"},
+    ]
+
+    with (
+        patch("agentic_loop.api_call_with_retry", new=api_call_with_retry),
+        patch("agentic_loop.execute_tool_calls", execute_tool_calls),
+    ):
+        content = await run_agentic_loop(
+            messages=messages,
+            session=AsyncMock(),
+            base_url=BASE_URL,
+            api_key=API_KEY,
+            base_payload=BASE_PAYLOAD.copy(),
+            initial_response_data=initial_response,
+        )
+
+    assert content == "try it now."
+    assert execute_tool_calls.await_count == 1
+    ack_nudges = [
+        m["content"]
+        for m in messages
+        if m.get("role") == "user"
+        and "zero tool calls" in m.get("content", "")
+    ]
+    assert len(ack_nudges) == 1, f"Expected one reaction nudge, got {len(ack_nudges)}"
     print("  ✓ Passed")
 
 
@@ -1118,7 +1220,7 @@ async def test_run_agentic_loop_retries_unverified_publish_success_claim() -> No
         m["content"]
         for m in messages
         if m.get("role") == "user"
-        and "Failed tool results are ground truth" in m.get("content", "")
+        and "these tools failed" in m.get("content", "")
     ]
     assert len(correction_nudges) >= 1, correction_nudges
     print("  ✓ Passed")
@@ -1144,6 +1246,7 @@ async def main() -> None:
     await test_run_agentic_loop_nudges_consult_advisor_for_hard_decision()
     await test_run_agentic_loop_retries_invalid_pseudo_tool_syntax()
     await test_run_agentic_loop_retries_markdown_reaction_pseudo_tool()
+    await test_run_agentic_loop_retries_short_reaction_ack_without_tool()
     await test_run_agentic_loop_retries_unverified_publish_success_claim()
 
     print()

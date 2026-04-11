@@ -13,6 +13,7 @@ inline inside ``process_response`` and adds:
 * Consistent tool-leak detection on the final text response.
 """
 
+import asyncio
 import logging
 import json
 import re
@@ -99,6 +100,10 @@ _BARE_REACTION_PATTERN = re.compile(
     r"^(?:like|love|dislike|laugh|emphasize|question)[.!]?\s*$",
     re.IGNORECASE,
 )
+_SHORT_REACTION_ACK_PREFIX_PATTERN = re.compile(
+    r"^(?:sent|sending|reacted|done)\b",
+    re.IGNORECASE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +112,19 @@ DEFAULT_MAX_ITERATIONS = 20
 DEFAULT_MAX_ACTION_INTENT_RETRIES = 3
 DEFAULT_MAX_TAPBACK_REPLY_RETRIES = 1
 REACTION_TOOL_NAMES = {"send_tapback", "send_telegram_reaction", "send_reaction"}
+REACTION_WORD_NAMES = {
+    "love", "like", "dislike", "laugh", "emphasize", "question",
+    "party", "clap", "cry", "sob", "scream", "mindblown", "pray",
+    "cool", "100", "hearts", "starry", "angry", "devil", "ghost",
+    "clown", "shrug", "eyes", "kiss", "hug", "salute", "nerd",
+    "trophy", "heartbreak", "heartonfire", "vomit", "poo", "ok",
+    "whale", "dove", "unicorn", "moai", "banana", "strawberry",
+    "champagne", "hotdog", "yawn", "woozy", "sleep", "scared",
+    "handshake", "halo", "grin", "alien", "lightning", "moon",
+    "cursing", "zany", "lipstick", "nailpolish", "middlefinger",
+    "coder", "pill", "pumpkin", "cupid", "hearteyes", "writing",
+    "santa", "christmas", "snowman", "seenoevil",
+}
 _PUBLISH_REQUEST_PATTERNS = re.compile(
     r"(?i)\b(?:publish|deploy|push|upload|post\s+it|put\s+it\s+online|here\.now|site)\b"
 )
@@ -319,30 +337,6 @@ def response_claims_failed_targets_succeeded(
     return False
 
 
-def build_safe_publish_summary(
-    verified_urls: list[str],
-    failure_summaries: list[str],
-) -> str:
-    """Build a deterministic publish summary from verified successes and failures."""
-    verified_here_now = [url for url in verified_urls if "here.now" in url]
-    other_verified = [url for url in verified_urls if url not in verified_here_now]
-
-    parts: list[str] = []
-    if verified_here_now:
-        parts.append(f"verified live deployment: {verified_here_now[0]}")
-    elif other_verified:
-        parts.append(f"verified destination: {other_verified[0]}")
-    else:
-        parts.append("no publish target was fully verified")
-
-    if failure_summaries:
-        parts.append(
-            "could not verify at least one requested publish target because tool steps failed: "
-            + "; ".join(failure_summaries[:2])
-        )
-
-    return ". ".join(parts) + "."
-
 
 def user_explicitly_requires_tool_execution(
     messages: list[dict[str, Any]], allowed_tool_names: set[str]
@@ -405,6 +399,52 @@ def contains_pseudo_tool_syntax(text: str) -> bool:
     )
 
 
+def text_contains_reaction_emoji(text: str) -> bool:
+    """Return True when text contains any Telegram reaction emoji."""
+    if not text:
+        return False
+    try:
+        from integrations import TELEGRAM_REACTION_EMOJI_MAP
+        return any(emoji in text for emoji in TELEGRAM_REACTION_EMOJI_MAP.values())
+    except ImportError:
+        return False
+
+
+def conversation_exposes_reaction_targets(messages: list[dict[str, Any]]) -> bool:
+    """Return True when the prompt context includes concrete reaction targets."""
+    for message in messages:
+        content = _message_content_to_text(message.get("content", ""))
+        if (
+            "[Available Telegram reaction targets" in content
+            or "[Available iMessage tapback handles" in content
+        ):
+            return True
+    return False
+
+
+def looks_like_short_reaction_ack(text: str) -> bool:
+    """Return True for terse `sent! ❤️`-style acknowledgements."""
+    normalized = (text or "").strip()
+    if not normalized or len(normalized) > 32:
+        return False
+    if not _SHORT_REACTION_ACK_PREFIX_PATTERN.match(normalized):
+        return False
+
+    remainder = _SHORT_REACTION_ACK_PREFIX_PATTERN.sub("", normalized, count=1).strip()
+    if not remainder:
+        return False
+
+    compact = re.sub(r"[\s.!?]+", "", remainder)
+    if not compact:
+        return False
+
+    if re.fullmatch(r"[^\w]+", compact):
+        return True
+
+    lowered = compact.lower()
+    return lowered in REACTION_WORD_NAMES
+
+
 def needs_tapback_followup_reply(text: str, executed_tool_names: list[str]) -> bool:
     """Return True when a reaction-only turn still needs a normal text reply."""
     if not text or not executed_tool_names:
@@ -416,7 +456,7 @@ def needs_tapback_followup_reply(text: str, executed_tool_names: list[str]) -> b
     ):
         return False
 
-    return bool(TAPBACK_ACK_PATTERN.match(text.strip()))
+    return bool(TAPBACK_ACK_PATTERN.match(text.strip())) or looks_like_short_reaction_ack(text)
 
 
 async def run_agentic_loop(
@@ -560,6 +600,12 @@ async def run_agentic_loop(
                 "consult_advisor" in allowed_tool_names_set
                 and contains_hard_decision_language(content_text)
             )
+            reaction_ack_without_tool = (
+                not forced_finish
+                and executed_tool_rounds == 0
+                and conversation_exposes_reaction_targets(messages)
+                and text_contains_reaction_emoji(content_text)
+            )
 
             if (
                 not forced_finish
@@ -579,13 +625,10 @@ async def run_agentic_loop(
                     {
                         "role": "user",
                         "content": (
-                            "[System: Your last reply used invalid pseudo-tool markup like "
-                            '<read(filepath="foo")>. That text is never executed. Do not '
-                            "emit angle-bracket tags, XML-style calls, or any plain-text "
-                            "representation of a tool call. Use actual structured tool_calls only. "
-                            "If this is a planning-heavy repo task, your next response must either "
-                            "make real inspection tool calls (read/glob/grep/bash) or call "
-                            "consult_advisor for the strategic question.]"
+                            "[System: You wrote pseudo-tool syntax but produced zero "
+                            "tool calls. Text like <read(...)> is never executed. "
+                            "Make real structured tool_calls. Do not reply with "
+                            "text — make the tool call.]"
                         ),
                     },
                 )
@@ -609,10 +652,10 @@ async def run_agentic_loop(
                     {
                         "role": "user",
                         "content": (
-                            "[System: You surfaced a hard strategic decision. Do not stop "
-                            "here. Call consult_advisor with the exact decision you need "
-                            "resolved plus any options, constraints, or failed attempts. "
-                            "After the tool returns, continue executing.]"
+                            "[System: You described a decision but produced zero "
+                            "tool calls. Call consult_advisor with the decision "
+                            "and options. Do not reply with text — make the "
+                            "tool call.]"
                         ),
                     },
                 )
@@ -638,13 +681,10 @@ async def run_agentic_loop(
                     {
                         "role": "user",
                         "content": (
-                            "[System: The user provided a skill URL. Do not pre-screen, reject, "
-                            "or manually fetch that URL yourself. Call add_skill with the exact "
-                            "URL now so the actual skill installer can fetch it, run the real "
-                            "prompt-injection scan, validate the SKILL.md format, install it, "
-                            "and auto-activate it if appropriate. Only after the add_skill tool "
-                            "returns should you describe success or failure. URL: "
-                            f"{requested_skill_url}]"
+                            "[System: You were given a skill URL but produced zero "
+                            "tool calls. Call add_skill with the URL: "
+                            f"{requested_skill_url} — do not reply with text, "
+                            "make the tool call.]"
                         ),
                     }
                 )
@@ -659,77 +699,39 @@ async def run_agentic_loop(
                 and (
                     contains_action_intent_narration(content_text)
                     or is_bare_reaction_word(content_text)
+                    or reaction_ack_without_tool
                     or explicit_tool_required
                 )
                 and action_intent_retries_used < max_action_intent_retries
             ):
                 action_intent_retries_used += 1
-                if is_bare_reaction_word(content_text):
-                    logger.warning(
-                        "Agentic loop: model returned bare reaction word "
-                        "'%s' instead of calling a reaction tool; nudging model "
-                        "to execute properly (attempt %d/%d).",
-                        content_text.strip(),
-                        action_intent_retries_used,
-                        max_action_intent_retries,
-                    )
-                    messages.append(message)
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                "[System: You just replied with a single "
-                                "reaction word. That is not a valid reply — "
-                                "reactions must be sent via the correct "
-                                "tool for the current channel. For iMessage, "
-                                "call send_tapback with message_handle. For "
-                                "Telegram, call send_telegram_reaction with "
-                                "chat_id and message_id. Otherwise reply to "
-                                "the user's message in normal conversational "
-                                "text. Do not output bare reaction words as text.]"
-                            ),
-                        },
-                    )
-                elif explicit_tool_required:
-                    logger.warning(
-                        "Agentic loop: user explicitly required tool execution "
-                        "but model returned text-only output; nudging model to execute "
-                        "(attempt %d/%d).",
-                        action_intent_retries_used,
-                        max_action_intent_retries,
+                if is_bare_reaction_word(content_text) or reaction_ack_without_tool:
+                    reason = "send a reaction"
+                    tool_hint = (
+                        "Call send_telegram_reaction with chat_id, message_id, "
+                        "and reaction from the available targets above"
                     )
                 else:
-                    logger.warning(
-                        "Agentic loop: detected action-intent narration without "
-                        "tool calls, nudging model to execute (attempt %d/%d).",
-                        action_intent_retries_used,
-                        max_action_intent_retries,
+                    reason = "take action"
+                    tool_hint = (
+                        "Make the tool_calls you described"
                     )
+                logger.warning(
+                    "Agentic loop: model tried to %s but produced zero "
+                    "tool calls (attempt %d/%d): %s",
+                    reason,
+                    action_intent_retries_used,
+                    max_action_intent_retries,
+                    content_text.strip()[:80],
+                )
                 messages.append(message)
                 messages.append(
                     {
                         "role": "user",
                         "content": (
-                            "[System: You just described actions you intend to take "
-                            "but did not make any tool calls. Do NOT narrate what "
-                            "you will do — actually do it. Make the tool_calls now. "
-                            "For planning-heavy repo work, planning text alone is not progress: "
-                            "inspect with read/glob/grep/bash, or call a consultation tool if the "
-                            "blocker is strategic or review-related. "
-                            "If you said you're activating a skill, call "
-                            "activate_skill. If you said you're running a command, "
-                            "call bash. If you said you're sending a tapback or "
-                            "If the blocker is a hard strategic decision, call "
-                            "consult_advisor first, then continue executing. If you need a "
-                            "correctness/risk pass on the current approach, call "
-                            "consult_reviewer first, then continue executing. "
-                            "reaction, call the correct reaction tool for the "
-                            "current channel: send_tapback with message_handle "
-                            "for iMessage, or send_telegram_reaction with "
-                            "chat_id/message_id for Telegram. If you said "
-                            "you're publishing, pushing, "
-                            "posting, uploading, or deploying, make the relevant "
-                            "skill and shell tool calls now. Act, don't narrate.]"
+                            f"[System: You tried to {reason} but produced zero "
+                            f"tool calls. {tool_hint}. Do not reply with "
+                            "text — make the tool call.]"
                         ),
                     },
                 )
@@ -752,12 +754,9 @@ async def run_agentic_loop(
                     {
                         "role": "user",
                         "content": (
-                            "[System: You already handled the reaction internally. "
-                            "Now reply to the user's message normally in plain text. "
-                            "Do not mention the tapback, Telegram reaction, "
-                            "send_tapback, send_telegram_reaction, tool calls, "
-                            "or any internal action. Continue the conversation "
-                            "naturally and answer the user's actual message.]"
+                            "[System: Reaction sent. Now reply to the user's "
+                            "actual message in plain text. Do not mention "
+                            "reactions, tool calls, or internal actions.]"
                         ),
                     }
                 )
@@ -799,15 +798,10 @@ async def run_agentic_loop(
                     {
                         "role": "user",
                         "content": (
-                            "[System: One or more publish/deploy steps failed in tool output. "
-                            "Failed tool results are ground truth. Do not claim those targets "
-                            "succeeded, and do not invent URLs, remotes, or platform endpoints. "
-                            "Reply with only the destinations that were actually verified by "
-                            "successful tool output, and explicitly name any target that failed "
-                            "or could not be verified. If further recovery is possible, make the "
-                            "needed tool_calls first. Recent failed tools: "
+                            "[System: You claimed success but these tools failed: "
                             + "; ".join(accumulated_failed_tool_summaries[:3])
-                            + "]"
+                            + ". Do not claim failed targets succeeded. Report "
+                            "only verified results, or make tool_calls to retry.]"
                         ),
                     }
                 )
@@ -828,9 +822,9 @@ async def run_agentic_loop(
                         {
                             "role": "user",
                             "content": (
-                                "Your last reply exposed internal tool call content. "
-                                "Do not show tool calls, shell commands, code fences, or "
-                                "JSON internals. Reply naturally in plain text for the end user."
+                                "[System: Your reply exposed internal tool call "
+                                "content. Reply in plain text only — no tool "
+                                "calls, code fences, or JSON.]"
                             ),
                         }
                     )
@@ -866,22 +860,6 @@ async def run_agentic_loop(
                         "Sorry, there was an internal formatting issue. "
                         "Please send that again."
                     )
-
-            if (
-                latest_user_requests_publish(messages)
-                and accumulated_failed_tool_summaries
-                and (
-                    likely_unverified_success_claim(content_text)
-                    or response_claims_failed_targets_succeeded(
-                        content_text, accumulated_failed_tool_summaries
-                    )
-                    or forced_finish
-                )
-            ):
-                return build_safe_publish_summary(
-                    verified_urls=accumulated_verified_urls,
-                    failure_summaries=accumulated_failed_tool_summaries,
-                )
 
             return safe_strip_markdown(content_text) if content_text else ""
 
