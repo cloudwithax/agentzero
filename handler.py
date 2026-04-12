@@ -32,6 +32,7 @@ from tools import (
     set_acp_agent,
 )
 from acp import ACPAgent
+from self_heal import SelfHealManager
 from prompt_templates import get_template
 
 logger = logging.getLogger(__name__)
@@ -115,6 +116,19 @@ def _strip_internal_prompt_residue(content: str) -> str:
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip(" \t\r\n-—")
+
+
+def _extract_iteration_from_error(error_string: str) -> int:
+    match = re.search(r"iteration=(\d+)", error_string or "")
+    return int(match.group(1)) if match else 0
+
+
+def _extract_tools_from_error(error_string: str) -> list[str]:
+    match = re.search(r"tools_executed=\[([^\]]*)\]", error_string or "")
+    if not match:
+        return []
+    raw = match.group(1).strip()
+    return [t.strip().strip("'\"") for t in raw.split(",") if t.strip()]
 
 
 def _build_consortium_agree_tool_schema() -> dict[str, Any]:
@@ -1123,6 +1137,17 @@ BASE_PAYLOAD = {
                 },
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "self_heal_status",
+                "description": "Get current status of the self-healing subsystem including heal history, worktree state, and configuration",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                },
+            },
+        },
     ],
 }
 
@@ -1268,6 +1293,7 @@ class AgentHandler:
         self.adaptive_formatter = adaptive_formatter
         self.skill_registry = skill_registry
         self.acp_agent = acp_agent
+        self._self_heal_manager: Optional[SelfHealManager] = None
         self._consortium_tasks: dict[str, dict[str, Any]] = {}
         self._consortium_tasks_lock = asyncio.Lock()
         self.reminder_scheduler = ReminderScheduler(
@@ -1284,6 +1310,9 @@ class AgentHandler:
     async def start_reminder_scheduler(self) -> None:
         """Start the reminder scheduler background loop."""
         await self.reminder_scheduler.start()
+
+    def set_self_heal_manager(self, manager: SelfHealManager) -> None:
+        self._self_heal_manager = manager
 
     async def create_reminder_task(
         self,
@@ -2353,7 +2382,7 @@ class AgentHandler:
         return (
             "\n\n[Assistant identity note]:\n"
             f"Your configured name in this session is {assistant_name}. "
-            "If the user says \"your name\" or addresses that name, they mean you, "
+            'If the user says "your name" or addresses that name, they mean you, '
             "not the user.\n"
         )
 
@@ -3349,7 +3378,11 @@ class AgentHandler:
         if not user_query:
             return ""
 
-        step_count = len(task_plan.steps) if task_plan and getattr(task_plan, "steps", None) else 0
+        step_count = (
+            len(task_plan.steps)
+            if task_plan and getattr(task_plan, "steps", None)
+            else 0
+        )
         query_length = len(user_query.strip())
         task_type = str(getattr(task, "type", "generic") or "generic").lower()
 
@@ -4127,6 +4160,19 @@ class AgentHandler:
                     payload_template,
                     stream_chunk_callback=response_chunk_callback,
                 )
+                if self._self_heal_manager and content and content.startswith("Error:"):
+                    heal_result = await self._self_heal_manager.try_heal(
+                        error_string=content,
+                        context={
+                            "session_id": session_id,
+                            "user_query": user_query,
+                            "iteration": _extract_iteration_from_error(content),
+                            "tools_executed": _extract_tools_from_error(content),
+                        },
+                    )
+                    if heal_result.success and heal_result.applied:
+                        content = f"{content}\n\n[Self-healed: {heal_result.summary}]"
+                        logger.info("Self-heal applied: %s", heal_result.summary)
             finally:
                 reset_tool_runtime_session(session_token)
 

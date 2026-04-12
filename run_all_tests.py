@@ -23,6 +23,7 @@ tests = [
     "tests/test_consortium_mode.py",
     "tests/test_skills.py",
     "tests/test_injection_scanner.py",
+    "tests/test_self_heal.py",
 ]
 
 

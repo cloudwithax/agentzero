@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import time
+import traceback
 import uuid
 from typing import Any, Awaitable, Callable, Optional
 
@@ -277,9 +278,7 @@ def _parse_xml_tool_call_blob(blob: str) -> list[dict[str, Any]]:
         param_name = param_match.group("name").strip()
         if not param_name:
             continue
-        parameters[param_name] = _coerce_xml_parameter_value(
-            param_match.group("value")
-        )
+        parameters[param_name] = _coerce_xml_parameter_value(param_match.group("value"))
 
     if not parameters and body:
         return []
@@ -693,11 +692,18 @@ async def execute_tool_calls(
                     )
             except Exception as e:
                 logger.error(f"Tool execution error for {func_name}: {e}")
+                tb_text = traceback.format_exc()
+                enriched_error = {
+                    "success": False,
+                    "error": str(e),
+                    "exception_type": type(e).__name__,
+                    "traceback_snippet": tb_text[-2000:] if tb_text else None,
+                }
                 tool_results.append(
                     {
                         "tool_call_id": tool_call["id"],
                         "role": "tool",
-                        "content": json.dumps({"success": False, "error": str(e)}),
+                        "content": json.dumps(enriched_error),
                     }
                 )
 

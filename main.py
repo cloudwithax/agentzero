@@ -18,11 +18,17 @@ from capabilities import Capability, CapabilityProfile, AdaptiveFormatter  # noq
 from examples import ExampleBank, AdaptiveFewShotManager  # noqa: E402
 from planning import TaskPlanner, TaskAnalyzer  # noqa: E402
 from skills import SkillRegistry  # noqa: E402
-from tools import set_memory_store, set_skill_registry, set_acp_agent, set_agent_workspace  # noqa: E402
+from tools import (
+    set_memory_store,
+    set_skill_registry,
+    set_acp_agent,
+    set_agent_workspace,
+)  # noqa: E402
 from handler import AgentHandler, PRIMARY_MODEL_ID  # noqa: E402
 from integrations import run_telegram_bot_async, start_sendblue_bot  # noqa: E402
 from openai_compat_server import start_openai_compatible_server  # noqa: E402
 from acp import ACPAgent  # noqa: E402
+from self_heal import SelfHealManager, GitWorktreeManager  # noqa: E402
 
 # Setup logging
 requested_log_level = os.environ.get("LOG_LEVEL", "INFO").strip().upper()
@@ -84,11 +90,11 @@ def daemonize() -> None:
     sys.stdout.flush()
     sys.stderr.flush()
 
-    with open(os.devnull, "r", encoding="utf-8") as stdin_handle, open(
-        "agentzero.out.log", "a", encoding="utf-8"
-    ) as stdout_handle, open(
-        "agentzero.err.log", "a", encoding="utf-8"
-    ) as stderr_handle:
+    with (
+        open(os.devnull, "r", encoding="utf-8") as stdin_handle,
+        open("agentzero.out.log", "a", encoding="utf-8") as stdout_handle,
+        open("agentzero.err.log", "a", encoding="utf-8") as stderr_handle,
+    ):
         os.dup2(stdin_handle.fileno(), sys.stdin.fileno())
         os.dup2(stdout_handle.fileno(), sys.stdout.fileno())
         os.dup2(stderr_handle.fileno(), sys.stderr.fileno())
@@ -278,6 +284,7 @@ def initialize_agent() -> tuple[AgentHandler, ACPAgent]:
 
     # Sync workspace path from handler config into tools
     from handler import AGENT_WORKSPACE as _handler_workspace  # noqa: PLC0415
+
     set_agent_workspace(_handler_workspace)
 
     # Initialize Agent Skills registry
@@ -333,6 +340,12 @@ def initialize_agent() -> tuple[AgentHandler, ACPAgent]:
         protocol="tcp",
     )
     set_acp_agent(acp_agent)
+
+    # Initialize self-healing subsystem
+    heal_manager = SelfHealManager(acp_agent=acp_agent)
+    handler.set_self_heal_manager(heal_manager)
+    if hasattr(heal_manager, "_wt_manager") and heal_manager._wt_manager is not None:
+        atexit.register(heal_manager.shutdown)
 
     return handler, acp_agent
 
@@ -429,6 +442,10 @@ if __name__ == "__main__":
             return
 
         # Run all bots concurrently
-        await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            if handler._self_heal_manager:
+                handler._self_heal_manager.shutdown()
 
     asyncio.run(run_bots())

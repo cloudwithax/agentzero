@@ -113,17 +113,72 @@ DEFAULT_MAX_ACTION_INTENT_RETRIES = 3
 DEFAULT_MAX_TAPBACK_REPLY_RETRIES = 1
 REACTION_TOOL_NAMES = {"send_tapback", "send_telegram_reaction", "send_reaction"}
 REACTION_WORD_NAMES = {
-    "love", "like", "dislike", "laugh", "emphasize", "question",
-    "party", "clap", "cry", "sob", "scream", "mindblown", "pray",
-    "cool", "100", "hearts", "starry", "angry", "devil", "ghost",
-    "clown", "shrug", "eyes", "kiss", "hug", "salute", "nerd",
-    "trophy", "heartbreak", "heartonfire", "vomit", "poo", "ok",
-    "whale", "dove", "unicorn", "moai", "banana", "strawberry",
-    "champagne", "hotdog", "yawn", "woozy", "sleep", "scared",
-    "handshake", "halo", "grin", "alien", "lightning", "moon",
-    "cursing", "zany", "lipstick", "nailpolish", "middlefinger",
-    "coder", "pill", "pumpkin", "cupid", "hearteyes", "writing",
-    "santa", "christmas", "snowman", "seenoevil",
+    "love",
+    "like",
+    "dislike",
+    "laugh",
+    "emphasize",
+    "question",
+    "party",
+    "clap",
+    "cry",
+    "sob",
+    "scream",
+    "mindblown",
+    "pray",
+    "cool",
+    "100",
+    "hearts",
+    "starry",
+    "angry",
+    "devil",
+    "ghost",
+    "clown",
+    "shrug",
+    "eyes",
+    "kiss",
+    "hug",
+    "salute",
+    "nerd",
+    "trophy",
+    "heartbreak",
+    "heartonfire",
+    "vomit",
+    "poo",
+    "ok",
+    "whale",
+    "dove",
+    "unicorn",
+    "moai",
+    "banana",
+    "strawberry",
+    "champagne",
+    "hotdog",
+    "yawn",
+    "woozy",
+    "sleep",
+    "scared",
+    "handshake",
+    "halo",
+    "grin",
+    "alien",
+    "lightning",
+    "moon",
+    "cursing",
+    "zany",
+    "lipstick",
+    "nailpolish",
+    "middlefinger",
+    "coder",
+    "pill",
+    "pumpkin",
+    "cupid",
+    "hearteyes",
+    "writing",
+    "santa",
+    "christmas",
+    "snowman",
+    "seenoevil",
 }
 _PUBLISH_REQUEST_PATTERNS = re.compile(
     r"(?i)\b(?:publish|deploy|push|upload|post\s+it|put\s+it\s+online|here\.now|site)\b"
@@ -147,6 +202,11 @@ _SKILL_URL_HESITATION_PATTERNS = re.compile(
     r"|(?:can't|cannot|won't|will not|should not).{0,80}(?:install|add|fetch)"
     r"|(?:manual(?:ly)?\s+review)"
 )
+
+# ── Tool context optimization thresholds ──────────────────────────────────────
+_OPTIMIZE_AFTER_ROUNDS = 3  # Skip optimization for first 2 rounds
+_OPTIMIZE_EVERY_N_ROUNDS = 2  # Re-optimize every 2 rounds (3, 5, 7, 9...)
+_OPTIMIZE_MIN_TOOL_TOKENS = 4000  # Skip if tool context is small
 
 
 def contains_action_intent_narration(text: str) -> bool:
@@ -228,7 +288,9 @@ def summarize_recent_tool_failures(
 
         if isinstance(parsed, dict):
             if parsed.get("success") is False:
-                error_text = str(parsed.get("error") or parsed.get("stderr") or "").strip()
+                error_text = str(
+                    parsed.get("error") or parsed.get("stderr") or ""
+                ).strip()
                 summary = tool_name
                 if call_context:
                     summary += f" ({call_context[:180]})"
@@ -238,7 +300,9 @@ def summarize_recent_tool_failures(
 
             returncode = parsed.get("returncode")
             if isinstance(returncode, int) and returncode != 0:
-                stderr_text = str(parsed.get("stderr") or parsed.get("stdout") or "").strip()
+                stderr_text = str(
+                    parsed.get("stderr") or parsed.get("stdout") or ""
+                ).strip()
                 summary = tool_name
                 if call_context:
                     summary += f" ({call_context[:180]})"
@@ -300,7 +364,9 @@ def response_claims_failed_targets_succeeded(
         return False
 
     normalized = text.lower()
-    if re.search(r"(?i)\b(?:both\s+targets|both\s+destinations|functionally\s+complete)\b", text):
+    if re.search(
+        r"(?i)\b(?:both\s+targets|both\s+destinations|functionally\s+complete)\b", text
+    ):
         return True
 
     target_tokens: set[str] = set()
@@ -310,7 +376,14 @@ def response_claims_failed_targets_succeeded(
             target_tokens.add(host)
             target_tokens.add(host.split(".")[0])
         for token in re.findall(r"\b[a-z][a-z0-9-]{4,}\b", lowered):
-            if token not in {"returncode", "reported", "failure", "resolve", "origin", "error"}:
+            if token not in {
+                "returncode",
+                "reported",
+                "failure",
+                "resolve",
+                "origin",
+                "error",
+            }:
                 target_tokens.add(token)
 
     for token in target_tokens:
@@ -335,7 +408,6 @@ def response_claims_failed_targets_succeeded(
                 return True
 
     return False
-
 
 
 def user_explicitly_requires_tool_execution(
@@ -405,6 +477,7 @@ def text_contains_reaction_emoji(text: str) -> bool:
         return False
     try:
         from integrations import TELEGRAM_REACTION_EMOJI_MAP
+
         return any(emoji in text for emoji in TELEGRAM_REACTION_EMOJI_MAP.values())
     except ImportError:
         return False
@@ -456,7 +529,288 @@ def needs_tapback_followup_reply(text: str, executed_tool_names: list[str]) -> b
     ):
         return False
 
-    return bool(TAPBACK_ACK_PATTERN.match(text.strip())) or looks_like_short_reaction_ack(text)
+    return bool(
+        TAPBACK_ACK_PATTERN.match(text.strip())
+    ) or looks_like_short_reaction_ack(text)
+
+
+def _estimate_tool_context_tokens(messages: list[dict[str, Any]]) -> int:
+    """Estimate token count for assistant+tool messages only (len/4 convention)."""
+    total = 0
+    for msg in messages:
+        role = msg.get("role", "")
+        if role not in ("assistant", "tool"):
+            continue
+        content = msg.get("content") or ""
+        if isinstance(content, str):
+            total += len(content) // 4
+        # Count tool_calls arguments
+        for tc in msg.get("tool_calls") or []:
+            args = tc.get("function", {}).get("arguments", "")
+            if args:
+                total += len(args) // 4
+    return total
+
+
+def _extract_tool_rounds(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Walk messages and identify tool call rounds.
+
+    Each round = one assistant message with tool_calls + its consecutive tool
+    role result messages.  Non-tool messages (system, user, text-only assistant)
+    are tagged as "passthrough" and always kept.
+
+    Returns list of dicts:
+      - passthrough: {"type": "passthrough", "messages": [...], "start_pos": int, "end_pos": int}
+      - round:       {"type": "round", "round_index": int, "assistant_msg": dict,
+                       "tool_result_msgs": [...], "start_pos": int, "end_pos": int}
+    """
+    segments: list[dict[str, Any]] = []
+    passthrough_buf: list[dict[str, Any]] = []
+    passthrough_start: int | None = None
+    round_index = 0
+    i = 0
+
+    while i < len(messages):
+        msg = messages[i]
+
+        # Detect assistant message with tool_calls
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            # Flush passthrough buffer
+            if passthrough_buf:
+                segments.append(
+                    {
+                        "type": "passthrough",
+                        "messages": list(passthrough_buf),
+                        "start_pos": passthrough_start,
+                        "end_pos": i - 1,
+                    }
+                )
+                passthrough_buf.clear()
+                passthrough_start = None
+
+            assistant_pos = i
+            tool_results: list[dict[str, Any]] = []
+            j = i + 1
+            while j < len(messages) and messages[j].get("role") == "tool":
+                tool_results.append(messages[j])
+                j += 1
+
+            segments.append(
+                {
+                    "type": "round",
+                    "round_index": round_index,
+                    "assistant_msg": msg,
+                    "tool_result_msgs": tool_results,
+                    "start_pos": assistant_pos,
+                    "end_pos": j - 1,
+                }
+            )
+            round_index += 1
+            i = j
+        else:
+            if passthrough_start is None:
+                passthrough_start = i
+            passthrough_buf.append(msg)
+            i += 1
+
+    # Flush remaining passthrough
+    if passthrough_buf:
+        segments.append(
+            {
+                "type": "passthrough",
+                "messages": list(passthrough_buf),
+                "start_pos": passthrough_start,
+                "end_pos": len(messages) - 1,
+            }
+        )
+
+    return segments
+
+
+async def _optimize_tool_context(
+    *,
+    messages: list[dict[str, Any]],
+    session: aiohttp.ClientSession,
+    base_url: str,
+    api_key: str,
+) -> list[dict[str, Any]]:
+    """Use the advisor model to prune/summarize old tool call rounds."""
+    from prompt_templates import get_template
+
+    # Lazy imports to avoid circular dependency (same pattern as api.py)
+    from handler import ADVISOR_MODEL_ID, BASE_PAYLOAD
+
+    segments = _extract_tool_rounds(messages)
+    rounds = [s for s in segments if s["type"] == "round"]
+
+    if len(rounds) < 2:
+        return messages  # Nothing to optimize
+
+    # Build compact representation for the advisor
+    compact_rounds: list[dict[str, Any]] = []
+    for r in rounds:
+        tool_calls_compact = []
+        for tc in r["assistant_msg"].get("tool_calls") or []:
+            fn = tc.get("function", {})
+            args_preview = (fn.get("arguments") or "")[:200]
+            tool_calls_compact.append(
+                {
+                    "name": fn.get("name", "unknown"),
+                    "arguments_preview": args_preview,
+                }
+            )
+
+        results_compact = []
+        for tr in r["tool_result_msgs"]:
+            content_raw = tr.get("content") or ""
+            # Detect success/failure
+            success = True
+            try:
+                parsed = (
+                    json.loads(content_raw)
+                    if isinstance(content_raw, str)
+                    else content_raw
+                )
+                if isinstance(parsed, dict):
+                    if parsed.get("success") is False:
+                        success = False
+                    rc = parsed.get("returncode")
+                    if isinstance(rc, int) and rc != 0:
+                        success = False
+            except Exception:
+                pass
+            results_compact.append(
+                {
+                    "tool_call_id": tr.get("tool_call_id", ""),
+                    "content_preview": content_raw[:500]
+                    if isinstance(content_raw, str)
+                    else str(content_raw)[:500],
+                    "success": success,
+                }
+            )
+
+        compact_rounds.append(
+            {
+                "round_index": r["round_index"],
+                "tool_calls": tool_calls_compact,
+                "results": results_compact,
+            }
+        )
+
+    # Call the advisor model
+    system_prompt = get_template("tool_context_optimizer")
+    user_content = json.dumps(compact_rounds, indent=2)
+
+    payload = BASE_PAYLOAD.copy()
+    payload["model"] = ADVISOR_MODEL_ID
+    payload["tools"] = []
+    payload["max_tokens"] = 4096
+    payload["temperature"] = 0.1
+    payload["messages"] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+
+    response_data = await api_call_with_retry(
+        session,
+        base_url,
+        payload,
+        {"Authorization": f"Bearer {api_key}"},
+    )
+
+    if "error" in response_data or not response_data.get("choices"):
+        logger.warning(
+            "Tool context optimizer: API error, returning original messages."
+        )
+        return messages
+
+    raw_output = _message_content_to_text(
+        response_data["choices"][0]["message"].get("content", "")
+    )
+
+    # Parse JSON — strip code fences if present
+    cleaned = raw_output.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError:
+        logger.warning(
+            "Tool context optimizer: failed to parse JSON response, keeping original."
+        )
+        return messages
+
+    decisions_list = parsed.get("decisions")
+    if not isinstance(decisions_list, list):
+        logger.warning(
+            "Tool context optimizer: invalid decisions structure, keeping original."
+        )
+        return messages
+
+    # Index decisions by round_index
+    decisions_by_idx: dict[int, dict[str, Any]] = {}
+    for d in decisions_list:
+        idx = d.get("round_index")
+        if isinstance(idx, int):
+            decisions_by_idx[idx] = d
+
+    # Hard override: force KEEP on the most recent round
+    if rounds:
+        last_round_idx = rounds[-1]["round_index"]
+        decisions_by_idx[last_round_idx] = {
+            "round_index": last_round_idx,
+            "action": "KEEP",
+        }
+
+    # Rebuild messages applying decisions
+    rebuilt: list[dict[str, Any]] = []
+    for segment in segments:
+        if segment["type"] == "passthrough":
+            rebuilt.extend(segment["messages"])
+            continue
+
+        ridx = segment["round_index"]
+        decision = decisions_by_idx.get(ridx, {"action": "KEEP"})
+        action = decision.get("action", "KEEP").upper()
+
+        if action == "DROP":
+            logger.debug(
+                "Tool context optimizer: dropping round %d — %s",
+                ridx,
+                decision.get("reason", "no reason"),
+            )
+            continue
+
+        if action == "SUMMARIZE":
+            summary = decision.get("summary", "Previous tool interaction.")
+            # Keep assistant msg verbatim (preserves tool_calls for format validity)
+            rebuilt.append(segment["assistant_msg"])
+            # Replace each tool result content with summary
+            for tr in segment["tool_result_msgs"]:
+                summarized = dict(tr)
+                summarized["content"] = f"[Context summary] {summary}"
+                rebuilt.append(summarized)
+            logger.debug(
+                "Tool context optimizer: summarized round %d.",
+                ridx,
+            )
+            continue
+
+        # KEEP (default)
+        rebuilt.append(segment["assistant_msg"])
+        rebuilt.extend(segment["tool_result_msgs"])
+
+    logger.info(
+        "Tool context optimizer: %d messages -> %d messages (%d rounds evaluated).",
+        len(messages),
+        len(rebuilt),
+        len(rounds),
+    )
+    return rebuilt
 
 
 async def run_agentic_loop(
@@ -554,13 +908,19 @@ async def run_agentic_loop(
             logger.error(
                 "Agentic loop API error (iteration %d): %s", iteration, error_msg
             )
-            return f"Error: {error_msg}"
+            tools_context = (
+                f", tools_executed={executed_tool_names}" if executed_tool_names else ""
+            )
+            return f"Error: {error_msg} [iteration={iteration}{tools_context}]"
 
         if not response_data.get("choices"):
             logger.error(
                 "Agentic loop: no choices in response (iteration %d)", iteration
             )
-            return "Error: No response from API"
+            tools_context = (
+                f", tools_executed={executed_tool_names}" if executed_tool_names else ""
+            )
+            return f"Error: No response from API [iteration={iteration}{tools_context}]"
 
         message = response_data["choices"][0]["message"]
 
@@ -713,9 +1073,7 @@ async def run_agentic_loop(
                     )
                 else:
                     reason = "take action"
-                    tool_hint = (
-                        "Make the tool_calls you described"
-                    )
+                    tool_hint = "Make the tool_calls you described"
                 logger.warning(
                     "Agentic loop: model tried to %s but produced zero "
                     "tool calls (attempt %d/%d): %s",
@@ -897,6 +1255,25 @@ async def run_agentic_loop(
 
         messages.append(message)
         messages.extend(tool_results)
+
+        # ── Context optimization ──────────────────────────────────────────
+        if (
+            executed_tool_rounds >= _OPTIMIZE_AFTER_ROUNDS
+            and executed_tool_rounds % _OPTIMIZE_EVERY_N_ROUNDS == 0
+            and _estimate_tool_context_tokens(messages) >= _OPTIMIZE_MIN_TOOL_TOKENS
+        ):
+            try:
+                messages = await _optimize_tool_context(
+                    messages=messages,
+                    session=session,
+                    base_url=base_url,
+                    api_key=api_key,
+                )
+            except Exception:
+                logger.warning(
+                    "Tool context optimization failed; continuing with full context.",
+                    exc_info=True,
+                )
 
     # Unreachable — the forced_finish branch always returns — but satisfies mypy.
     return "Task completed."

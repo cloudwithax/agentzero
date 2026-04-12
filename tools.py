@@ -250,7 +250,9 @@ def _latest_real_user_text(messages: Optional[list[dict[str, Any]]]) -> str:
     return ""
 
 
-def _extract_name_with_patterns(text: str, patterns: tuple[re.Pattern[str], ...]) -> str:
+def _extract_name_with_patterns(
+    text: str, patterns: tuple[re.Pattern[str], ...]
+) -> str:
     """Extract the first matching name token from text."""
     normalized = str(text or "").strip()
     if not normalized:
@@ -289,7 +291,9 @@ def normalize_memory_candidate_from_user_text(
 ) -> tuple[str, list[str], dict[str, Any]]:
     """Correct obvious subject/perspective mistakes using the live user turn."""
     normalized_content = str(content or "").strip()
-    normalized_topics = [str(topic).strip() for topic in (topics or []) if str(topic).strip()]
+    normalized_topics = [
+        str(topic).strip() for topic in (topics or []) if str(topic).strip()
+    ]
     metadata_updates: dict[str, Any] = {}
 
     assistant_name = extract_assistant_name_from_user_text(user_text)
@@ -1456,6 +1460,49 @@ async def acp_list_peers_tool() -> dict[str, Any]:
         return {"success": False, "error": str(e)}
 
 
+async def self_heal_status_tool() -> dict[str, Any]:
+    """Get current status of the self-healing subsystem."""
+    try:
+        from self_heal import _SELF_HEAL_ENABLED, _SELF_HEAL_CLAUDE_MODEL
+        from self_heal import (
+            _SELF_HEAL_COOLDOWN_SECONDS,
+            _SELF_HEAL_TIMEOUT_SECONDS,
+            _SELF_HEAL_AUTO_MERGE,
+            _SELF_HEAL_MAX_ATTEMPTS_PER_SESSION,
+        )
+    except ImportError:
+        return {"success": False, "error": "self_heal module not available"}
+
+    from handler import AgentHandler
+
+    manager = getattr(AgentHandler, "_self_heal_manager_instance", None)
+    if not manager:
+        for frame_info in inspect.stack():
+            local_vars = (
+                frame_info.frame.f_locals if hasattr(frame_info, "frame") else {}
+            )
+            handler_instance = local_vars.get("self", None)
+            if isinstance(handler_instance, AgentHandler):
+                manager = getattr(handler_instance, "_self_heal_manager", None)
+                break
+
+    status = {
+        "enabled": _SELF_HEAL_ENABLED,
+        "claude_model": _SELF_HEAL_CLAUDE_MODEL or "(default)",
+        "cooldown_seconds": _SELF_HEAL_COOLDOWN_SECONDS,
+        "timeout_seconds": _SELF_HEAL_TIMEOUT_SECONDS,
+        "auto_merge": _SELF_HEAL_AUTO_MERGE,
+        "max_attempts_per_session": _SELF_HEAL_MAX_ATTEMPTS_PER_SESSION,
+        "manager_active": manager is not None,
+    }
+    if manager:
+        status.update(manager.get_status())
+    return {"success": True, **status}
+
+
+import inspect
+
+
 # Tool registry for easy access - defined before handle() to avoid NameError
 # Includes aliases for compatibility with benchmark grading
 TOOLS = {
@@ -1508,6 +1555,8 @@ TOOLS = {
     "get_credential": get_credential_tool,
     "delete_credential": delete_credential_tool,
     "list_credentials": list_credentials_tool,
+    # Self-healing tools
+    "self_heal_status": self_heal_status_tool,
 }
 
 
@@ -1567,6 +1616,7 @@ def validate_tool_args(func_name: str, func_args: dict) -> tuple:
         "get_credential": ["key"],
         "delete_credential": ["key"],
         "list_credentials": [],
+        "self_heal_status": [],
     }
 
     if func_name in required_params:
