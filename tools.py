@@ -1137,6 +1137,7 @@ async def generate_image_tool(
             "success": True,
             "message": f"Image saved to {resolved} ({len(image_bytes)} bytes)",
             "path": resolved,
+            "url": url,
         }
         if warning:
             result["warning"] = warning

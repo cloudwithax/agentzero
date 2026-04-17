@@ -543,12 +543,93 @@ def _split_outbound_message_chunks(message: str) -> list[str]:
     ]
 
 
+def _split_text_for_telegram(text: str, limit: int = 4096) -> list[str]:
+    """Split *text* into chunks that each fit within *limit* characters.
+
+    Tries to break at double-newlines (paragraph boundaries) first, then
+    single newlines, then sentence-ending punctuation, and finally at word
+    boundaries.  As a last resort, hard-splits at the character limit.
+    """
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+
+    while remaining:
+        if len(remaining) <= limit:
+            chunks.append(remaining)
+            break
+
+        # Find the best split point within the limit window.
+        window = remaining[:limit]
+        split_at = -1
+
+        # 1. paragraph break
+        idx = window.rfind("\n\n")
+        if idx > 0:
+            split_at = idx + 2  # keep the double newline on the first chunk
+        # 2. single newline
+        if split_at == -1:
+            idx = window.rfind("\n")
+            if idx > 0:
+                split_at = idx + 1
+        # 3. sentence-ending punctuation followed by a space
+        if split_at == -1:
+            for punct in (". ", "! ", "? "):
+                idx = window.rfind(punct)
+                if idx > 0:
+                    split_at = idx + len(punct)
+                    break
+        # 4. last space (word boundary)
+        if split_at == -1:
+            idx = window.rfind(" ")
+            if idx > 0:
+                split_at = idx + 1
+        # 5. hard split
+        if split_at == -1:
+            split_at = limit
+
+        chunks.append(remaining[:split_at].rstrip())
+        remaining = remaining[split_at:].lstrip()
+
+    return [c for c in chunks if c]
+
+
 def _build_outbound_delivery_plan(message: str) -> list[dict[str, Any]]:
-    """Build outbound delivery steps as one sanitized message (chunking disabled)."""
-    normalized = _sanitize_outbound_delivery_text(message)
-    if not normalized:
+    """Build outbound delivery steps — one per ``<message>`` block.
+
+    When the LLM wraps its output in multiple ``<message>`` tags each block
+    becomes its own delivery step so that the recipient sees several shorter
+    messages rather than one wall of text (the OpenPoke paradigm).  Messages
+    that still exceed the Telegram 4096-char limit are further split at
+    natural boundaries.
+    """
+    normalized = "" if message is None else str(message)
+    if not normalized.strip():
         return []
-    return [{"type": "message", "text": normalized}]
+
+    # If the LLM emitted explicit <message> blocks, honour each one.
+    message_chunks = [
+        match.group("message").strip()
+        for match in OUTBOUND_MESSAGE_BLOCK_PATTERN.finditer(normalized)
+        if isinstance(match.group("message"), str) and match.group("message").strip()
+    ]
+
+    if not message_chunks:
+        # No <message> blocks — fall back to sanitizing the raw text.
+        sanitized = OUTBOUND_TYPING_DIRECTIVE_PATTERN.sub("", normalized)
+        sanitized = OUTBOUND_MESSAGE_TAG_PATTERN.sub("", sanitized).strip()
+        if not sanitized:
+            return []
+        message_chunks = [sanitized]
+
+    # Each chunk becomes one or more delivery steps (split at 4096 chars).
+    steps: list[dict[str, Any]] = []
+    for chunk in message_chunks:
+        for part in _split_text_for_telegram(chunk):
+            steps.append({"type": "message", "text": part})
+    return steps
 
 
 def _normalize_attachment_urls(value: Any) -> list[str]:
@@ -2340,34 +2421,64 @@ async def _build_telegram_user_content(
     return await _build_user_message_content_async(merged_text, filtered_attachments)
 
 
+_TELEGRAM_CAPTION_LIMIT = 1024
+
+
 async def _send_telegram_response(
     bot: Any, chat_id: int, text: str, attachment_urls: list[str]
 ) -> None:
-    """Send one text response plus optional attachments to Telegram."""
+    """Send each delivery-plan step as a separate Telegram message.
+
+    Long responses are automatically split at natural boundaries so every
+    message stays within the Telegram 4096-character limit.  When
+    attachments are present the last text part is used as the photo
+    caption (if it fits within Telegram's 1024-char caption limit) so
+    that text and images arrive together in a single bubble.
+    """
     delivery_plan = _build_outbound_delivery_plan(text)
     attachments = _normalize_attachment_urls(attachment_urls)
-    message_text = ""
-    if delivery_plan:
-        message_text = str(delivery_plan[0].get("text", "")).strip()
 
-    if message_text:
-        await bot.send_message(chat_id=chat_id, text=message_text)
+    text_parts = [
+        str(step.get("text", "")).strip()
+        for step in delivery_plan
+        if str(step.get("text", "")).strip()
+    ]
+
+    if not text_parts and not attachments:
+        await bot.send_message(chat_id=chat_id, text="No response.")
+        return
 
     if not attachments:
-        if not message_text:
-            await bot.send_message(chat_id=chat_id, text="No response.")
+        # No photos — just send every text part as its own message.
+        for part in text_parts:
+            await bot.send_message(chat_id=chat_id, text=part)
         return
 
+    # Decide whether the last text part can serve as a photo caption.
+    caption: str | None = None
+    if text_parts and len(text_parts[-1]) <= _TELEGRAM_CAPTION_LIMIT:
+        caption = text_parts.pop()  # pull it out; it goes on the photo
+
+    # Send all remaining text parts as plain messages first.
+    for part in text_parts:
+        await bot.send_message(chat_id=chat_id, text=part)
+
+    # Send attachments — single photo or media group — with caption.
     if len(attachments) == 1:
-        await bot.send_photo(chat_id=chat_id, photo=attachments[0])
+        kwargs: dict[str, Any] = {"chat_id": chat_id, "photo": attachments[0]}
+        if caption:
+            kwargs["caption"] = caption
+        await bot.send_photo(**kwargs)
         return
 
-    # Import lazily so optional telegram dependency stays type-safe.
     from telegram import InputMediaPhoto as _InputMediaPhoto
 
     for i in range(0, len(attachments), 10):
         chunk = attachments[i : i + 10]
         media_group = [_InputMediaPhoto(media=url) for url in chunk]
+        # Caption goes on the first item of the first media group.
+        if i == 0 and caption:
+            media_group[0] = _InputMediaPhoto(media=chunk[0], caption=caption)
         await bot.send_media_group(chat_id=chat_id, media=media_group)
 
 
@@ -2700,12 +2811,16 @@ async def send_imessage(
         "sb-api-secret-key": api_secret,
     }
     delivery_plan = _build_outbound_delivery_plan(message)
-    if not delivery_plan:
-        delivery_plan = [{"type": "message", "text": ""}]
-    message_text = str(delivery_plan[0].get("text", ""))
+    message_parts = [
+        str(step.get("text", "")).strip()
+        for step in delivery_plan
+        if step.get("type") == "message" and str(step.get("text", "")).strip()
+    ]
+    if not message_parts:
+        message_parts = [""]
 
     normalized_media_urls = _normalize_attachment_urls(media_urls)
-    if not message_text.strip() and not normalized_media_urls:
+    if not any(p.strip() for p in message_parts) and not normalized_media_urls:
         return {"success": True, "skipped": True, "reason": "empty payload"}
 
     close_session = False
@@ -2713,36 +2828,74 @@ async def send_imessage(
         session = aiohttp.ClientSession()
         close_session = True
     try:
-        payload: dict[str, Any] = {
-            "number": phone_number,
-            "from_number": from_number,
-            "content": _format_sendblue_message_content(message_text),
-            "send_style": "regular",
-        }
-        if normalized_media_urls:
-            payload["media_url"] = (
-                normalized_media_urls
-                if len(normalized_media_urls) > 1
-                else normalized_media_urls[0]
-            )
-
-        async with session.post(
-            "https://api.sendblue.co/api/send-message",
-            json=payload,
-            headers=headers,
-        ) as resp:
-            data = await resp.json()
-            success = 200 <= resp.status < 300
-            if isinstance(data, dict):
-                delivery_status = str(data.get("status", "")).strip().upper()
-                if delivery_status in {"QUEUED", "SENT", "DELIVERED"}:
-                    success = True
-
-            return {
-                "success": success,
-                "data": data,
-                "status": resp.status,
+        last_result: dict[str, Any] = {}
+        for idx, part_text in enumerate(message_parts):
+            if not part_text.strip():
+                continue
+            payload: dict[str, Any] = {
+                "number": phone_number,
+                "from_number": from_number,
+                "content": _format_sendblue_message_content(part_text),
+                "send_style": "regular",
             }
+            # Attach media only to the last text part.
+            if idx == len(message_parts) - 1 and normalized_media_urls:
+                payload["media_url"] = (
+                    normalized_media_urls
+                    if len(normalized_media_urls) > 1
+                    else normalized_media_urls[0]
+                )
+
+            async with session.post(
+                "https://api.sendblue.co/api/send-message",
+                json=payload,
+                headers=headers,
+            ) as resp:
+                data = await resp.json()
+                success = 200 <= resp.status < 300
+                if isinstance(data, dict):
+                    delivery_status = str(data.get("status", "")).strip().upper()
+                    if delivery_status in {"QUEUED", "SENT", "DELIVERED"}:
+                        success = True
+                last_result = {
+                    "success": success,
+                    "data": data,
+                    "status": resp.status,
+                }
+                if not success:
+                    return last_result
+
+        # If we only had media and no text, send media alone.
+        if not last_result and normalized_media_urls:
+            payload = {
+                "number": phone_number,
+                "from_number": from_number,
+                "content": "",
+                "send_style": "regular",
+                "media_url": (
+                    normalized_media_urls
+                    if len(normalized_media_urls) > 1
+                    else normalized_media_urls[0]
+                ),
+            }
+            async with session.post(
+                "https://api.sendblue.co/api/send-message",
+                json=payload,
+                headers=headers,
+            ) as resp:
+                data = await resp.json()
+                success = 200 <= resp.status < 300
+                if isinstance(data, dict):
+                    delivery_status = str(data.get("status", "")).strip().upper()
+                    if delivery_status in {"QUEUED", "SENT", "DELIVERED"}:
+                        success = True
+                last_result = {
+                    "success": success,
+                    "data": data,
+                    "status": resp.status,
+                }
+
+        return last_result or {"success": True, "skipped": True, "reason": "empty payload"}
     except Exception as e:
         return {"success": False, "error": str(e)}
     finally:

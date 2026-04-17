@@ -347,6 +347,49 @@ def extract_verified_urls(tool_results: list[dict[str, Any]]) -> list[str]:
     return urls
 
 
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
+
+
+def extract_outbound_attachments(
+    tool_results: list[dict[str, Any]],
+    tool_calls: list[dict[str, Any]],
+) -> list[str]:
+    """Extract attachment URLs produced by image-generating tool calls.
+
+    Looks for successful tool results that contain a ``url`` field pointing
+    to an image resource.  These URLs are suitable for embedding in outbound
+    Telegram / Sendblue messages alongside the assistant's text reply.
+    """
+    # Build a set of tool-call IDs that came from image-producing tools.
+    image_tool_names = {"generate_image"}
+    image_call_ids = {
+        tc.get("id")
+        for tc in tool_calls
+        if tc.get("function", {}).get("name") in image_tool_names
+    }
+
+    urls: list[str] = []
+    for result in tool_results:
+        if not isinstance(result, dict):
+            continue
+        # Only inspect results that correspond to image-producing calls.
+        if result.get("tool_call_id") not in image_call_ids:
+            continue
+        payload = result.get("content", "")
+        try:
+            parsed = json.loads(payload) if isinstance(payload, str) else payload
+        except Exception:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        if parsed.get("success") is False:
+            continue
+        url = str(parsed.get("url") or "").strip()
+        if url and url not in urls:
+            urls.append(url)
+    return urls
+
+
 def likely_unverified_success_claim(text: str) -> bool:
     """Return True when text reads like a blanket success claim without failure acknowledgment."""
     if not text:
@@ -856,6 +899,7 @@ async def run_agentic_loop(
     pending_response_data: Optional[dict[str, Any]] = initial_response_data
     accumulated_failed_tool_summaries: list[str] = []
     accumulated_verified_urls: list[str] = []
+    accumulated_attachments: list[str] = []
 
     for iteration in range(max_iterations + 1):  # +1 so the forced-finish call is free
         forced_finish = iteration == max_iterations
@@ -1219,7 +1263,13 @@ async def run_agentic_loop(
                         "Please send that again."
                     )
 
-            return safe_strip_markdown(content_text) if content_text else ""
+            final_text = safe_strip_markdown(content_text) if content_text else ""
+            if accumulated_attachments:
+                return json.dumps({
+                    "text": final_text,
+                    "attachments": accumulated_attachments,
+                })
+            return final_text
 
         # ── Execute tool calls and feed results back ──────────────────────────
         runtime_messages_token = set_tool_runtime_messages([*messages, message])
@@ -1234,12 +1284,16 @@ async def run_agentic_loop(
             tool_calls=tool_calls,
         )
         recent_verified_urls = extract_verified_urls(tool_results)
+        recent_attachments = extract_outbound_attachments(tool_results, tool_calls)
         for failure in recent_failures:
             if failure not in accumulated_failed_tool_summaries:
                 accumulated_failed_tool_summaries.append(failure)
         for url in recent_verified_urls:
             if url not in accumulated_verified_urls:
                 accumulated_verified_urls.append(url)
+        for url in recent_attachments:
+            if url not in accumulated_attachments:
+                accumulated_attachments.append(url)
         executed_tool_rounds += 1
         executed_tool_names.extend(
             tool_call.get("function", {}).get("name", "")

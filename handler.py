@@ -1586,8 +1586,43 @@ class AgentHandler:
     def _finalize_visible_response(
         self, content: Any, session_id: Optional[str]
     ) -> str:
-        """Return text safe for visible responses with delivery directives removed."""
+        """Return text safe for visible responses with delivery directives removed.
+
+        If *content* is a JSON payload carrying ``attachments`` alongside
+        ``text`` (emitted by the agentic loop when tools produce images),
+        only the text portion is sanitized and the JSON envelope is
+        preserved so downstream callers can extract the attachments.
+        """
         normalized = "" if content is None else str(content)
+
+        # Detect JSON payloads with attachments and sanitize only the text.
+        _parsed_payload: dict | None = None
+        try:
+            _parsed_payload = json.loads(normalized)
+        except Exception:
+            pass
+        if (
+            isinstance(_parsed_payload, dict)
+            and "attachments" in _parsed_payload
+            and isinstance(_parsed_payload.get("text"), str)
+        ):
+            inner_text = _strip_delivery_directives(_parsed_payload["text"])
+            inner_text = _strip_internal_prompt_residue(inner_text)
+            if (
+                session_id
+                and session_id.startswith(("imessage_", "tg_"))
+                and self._BARE_REACTION_RE.match(inner_text.strip())
+            ):
+                logger.warning(
+                    "Suppressing bare reaction word '%s' from outbound mobile "
+                    "delivery — reactions must use send_tapback or "
+                    "send_telegram_reaction.",
+                    inner_text.strip(),
+                )
+                inner_text = ""
+            _parsed_payload["text"] = inner_text
+            return json.dumps(_parsed_payload)
+
         visible_text = _strip_delivery_directives(normalized)
         visible_text = _strip_internal_prompt_residue(visible_text)
         if (
@@ -1603,6 +1638,24 @@ class AgentHandler:
             )
             return ""
         return visible_text
+
+    @staticmethod
+    def _visible_text_from_response(content: str) -> str:
+        """Extract the human-visible text from a response.
+
+        If *content* is a JSON envelope with ``text`` and ``attachments``
+        (produced by the agentic loop when tools generate images), return
+        only the ``text`` portion.  Otherwise return *content* as-is.
+        """
+        if not content:
+            return content
+        try:
+            parsed = json.loads(content)
+        except Exception:
+            return content
+        if isinstance(parsed, dict) and "text" in parsed and "attachments" in parsed:
+            return str(parsed["text"])
+        return content
 
     def _build_request_payload_template(self) -> dict[str, Any]:
         """Build base payload with dynamic tool registration (including skills)."""
@@ -3356,11 +3409,7 @@ class AgentHandler:
             "active_skills_context": active_skills_context,
             "request_freshness_token": request_freshness_token,
             "session_prompt_suffix": session_prompt_suffix,
-            "identity": (
-                custom_prompt
-                if custom_prompt
-                else "You are a helpful AI assistant with persistent memory."
-            ),
+            "identity": (custom_prompt if custom_prompt else ""),
             "plan_context": plan_context,
             "consultation_context": consultation_context,
             "example_context": example_context,
@@ -4178,6 +4227,10 @@ class AgentHandler:
 
             content = self._finalize_visible_response(content, session_id)
 
+            # Extract the visible text for history / memory (strip the
+            # JSON attachment envelope if present so history stays clean).
+            visible_text = self._visible_text_from_response(content)
+
             # Persist the visible turn before post-response maintenance so
             # cadence calculations see the latest exchange.
             if session_id and user_query:
@@ -4187,23 +4240,24 @@ class AgentHandler:
                     session_id=session_id,
                     metadata=normalized_request_metadata or None,
                 )
-            if session_id and content:
+            if session_id and visible_text:
                 self.memory_store.add_conversation_message(
-                    role="assistant", content=content, session_id=session_id
+                    role="assistant", content=visible_text, session_id=session_id
                 )
 
             await self._run_memory_maintenance(
                 session=session,
                 session_id=session_id,
                 user_query=user_query,
-                assistant_response=content,
+                assistant_response=visible_text,
             )
 
         # Provide feedback on examples if task was completed
-        if task and content and not content.startswith("Error:"):
+        visible_text = self._visible_text_from_response(content)
+        if task and visible_text and not visible_text.startswith("Error:"):
             self.example_bank.auto_feedback(task.type, success=True, efficiency=1.0)
 
-        print(content)
+        print(visible_text)
         return content
 
     def _build_rolling_context(

@@ -141,19 +141,19 @@ def test_sendblue_message_formatting_prefers_carriage_returns() -> None:
 
 
 def test_split_outbound_message_chunks_prefers_explicit_blocks() -> None:
-    """Explicit <message> blocks should collapse into one sanitized outbound chunk."""
+    """Explicit <message> blocks should each become a separate outbound chunk."""
     chunks = _split_outbound_message_chunks(
         "<message>first</message>\nrecalling memories...\n<message>second</message>"
     )
-    assert chunks == ["first\n\nsecond"]
+    assert chunks == ["first", "second"]
 
 
 def test_split_outbound_message_chunks_ignores_typing_directives() -> None:
-    """Typing directives should be removed from the single outbound chunk."""
+    """Typing directives should be removed; each <message> block is its own chunk."""
     chunks = _split_outbound_message_chunks(
         '<message>first</message><typing seconds="1.5"/><message>second</message>'
     )
-    assert chunks == ["first\n\nsecond"]
+    assert chunks == ["first", "second"]
 
 
 async def test_send_imessage_normalizes_content_before_send() -> None:
@@ -540,12 +540,15 @@ async def test_send_imessage_sends_explicit_message_blocks_separately() -> None:
             os.environ["SENDBLUE_FORCE_CARRIAGE_RETURNS"] = previous_force_cr
 
     assert result.get("success") is True
-    assert len(fake_session.payloads) == 1
-    outbound_payload = fake_session.payloads[0]
-    assert "<message>" not in str(outbound_payload.get("content", ""))
-    assert "chunk one" in str(outbound_payload.get("content", ""))
-    assert "chunk two" in str(outbound_payload.get("content", ""))
-    assert outbound_payload.get("media_url") == "https://img.example/final.png"
+    # Each <message> block is sent as a separate API call.
+    assert len(fake_session.payloads) == 2
+    first_payload = fake_session.payloads[0]
+    second_payload = fake_session.payloads[1]
+    assert "<message>" not in str(first_payload.get("content", ""))
+    assert "chunk one" in str(first_payload.get("content", ""))
+    assert "media_url" not in first_payload  # media only on last part
+    assert "chunk two" in str(second_payload.get("content", ""))
+    assert second_payload.get("media_url") == "https://img.example/final.png"
 
 
 async def test_send_imessage_typing_directive_is_ignored() -> None:
@@ -614,8 +617,10 @@ async def test_send_imessage_typing_directive_is_ignored() -> None:
             os.environ["SENDBLUE_FORCE_CARRIAGE_RETURNS"] = previous_force_cr
 
     assert result.get("success") is True
-    assert len(fake_session.payloads) == 1
+    # Two <message> blocks → two separate API calls, no typing directives.
+    assert len(fake_session.payloads) == 2
     assert "<typing" not in str(fake_session.payloads[0].get("content", ""))
+    assert "<typing" not in str(fake_session.payloads[1].get("content", ""))
     assert typing_mock.await_count == 0
 
 
