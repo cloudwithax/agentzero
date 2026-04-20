@@ -629,6 +629,59 @@ class MemoryStore:
 
         return memories
 
+    def get_speech_pattern_memories(
+        self, session_id: Optional[str] = None, limit: int = 5
+    ) -> list[Memory]:
+        """Get speech pattern memories for a session or globally."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        if session_id:
+            cursor.execute(
+                """
+                SELECT id, content, embedding, metadata, created_at, updated_at
+                FROM memories
+                WHERE metadata LIKE '%"type": "speech_pattern"%'
+                AND (metadata LIKE ? OR metadata LIKE '%"session_id": null%')
+                ORDER BY created_at DESC
+                LIMIT ?
+            """,
+                (f'%"session_id": "{session_id}"%', limit),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT id, content, embedding, metadata, created_at, updated_at
+                FROM memories
+                WHERE metadata LIKE '%"type": "speech_pattern"%'
+                ORDER BY created_at DESC
+                LIMIT ?
+            """,
+                (limit,),
+            )
+
+        rows = cursor.fetchall()
+        conn.close()
+
+        memories = []
+        for row in rows:
+            memory_id, content, embedding_bytes, metadata, created_at, updated_at = row
+            embedding = (
+                self._bytes_to_embedding(embedding_bytes) if embedding_bytes else None
+            )
+            memories.append(
+                Memory(
+                    id=memory_id,
+                    content=content,
+                    embedding=embedding,
+                    metadata=json.loads(metadata or "{}"),
+                    created_at=created_at,
+                    updated_at=updated_at,
+                )
+            )
+
+        return memories
+
     def add_conversation_message(
         self,
         role: str,

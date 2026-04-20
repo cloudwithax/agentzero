@@ -1210,6 +1210,10 @@ SESSION_CONTINUITY_MAX_HISTORY_LINES = max(
     1,
     int(os.environ.get("SESSION_CONTINUITY_MAX_HISTORY_LINES", "4")),
 )
+MEMORY_RELEVANCE_THRESHOLD = max(
+    0.0,
+    float(os.environ.get("MEMORY_RELEVANCE_THRESHOLD", "0.15")),
+)
 
 DREAM_MODE_ENABLED = os.environ.get("MEMORY_DREAM_ENABLED", "1").strip() != "0"
 DREAM_LOOKBACK_DAYS = max(7, int(os.environ.get("MEMORY_DREAM_LOOKBACK_DAYS", "21")))
@@ -2261,6 +2265,59 @@ class AgentHandler:
             return f"{normalized[: max_chars - 3]}..."
         return normalized
 
+    def _score_memory_relevance_to_query(
+        self,
+        memory: Any,
+        query: str,
+    ) -> float:
+        """Score memory relevance to a user query using keyword and semantic matching."""
+        if not query or not isinstance(query, str):
+            return 1.0
+
+        import re
+
+        memory_content = str(getattr(memory, "content", "") or "").lower()
+        normalized_content = self._normalize_memory_text(memory_content)
+
+        if not normalized_content:
+            return 0.0
+
+        query_lower = query.lower()
+        memory_lower = normalized_content
+
+        keyword_overlap = 0.0
+        query_words = set(re.sub(r"[^\w]", "", qw) for qw in query_lower.split() if len(re.sub(r"[^\w]", "", qw)) > 2)
+        memory_words = set(re.sub(r"[^\w]", "", mw) for mw in memory_lower.split() if len(re.sub(r"[^\w]", "", mw)) > 2)
+
+        if query_words and memory_words:
+            intersection = query_words & memory_words
+            union = query_words | memory_words
+            if union:
+                keyword_overlap = len(intersection) / len(union)
+
+        phrase_overlap = 0.0
+        query_phrases = []
+        current_phrase = []
+        for word in query_lower.split():
+            if len(word) > 3:
+                current_phrase.append(word)
+            else:
+                if len(current_phrase) >= 2:
+                    query_phrases.append(" ".join(current_phrase))
+                current_phrase = []
+        if len(current_phrase) >= 2:
+            query_phrases.append(" ".join(current_phrase))
+
+        for phrase in query_phrases:
+            if phrase in memory_lower:
+                phrase_overlap = 1.0
+                break
+
+        combined_overlap = (keyword_overlap * 0.6) + (phrase_overlap * 0.4)
+        combined_overlap = max(0.0, min(1.0, combined_overlap))
+
+        return combined_overlap
+
     def _score_session_continuity_memory(
         self,
         memory: Any,
@@ -2405,6 +2462,7 @@ class AgentHandler:
     def _build_assistant_identity_context(
         self,
         session_id: Optional[str],
+        user_query: Optional[str] = None,
     ) -> str:
         """Inject a direct assistant-identity note when a session has one."""
         if not session_id:
@@ -2432,6 +2490,15 @@ class AgentHandler:
             return ""
 
         assistant_name = next(iter(assistant_identity_names.values()))
+
+        if user_query:
+            relevance_score = self._score_memory_relevance_to_query(
+                type("Memory", (), {"content": f"Your name is {assistant_name}", "metadata": {}}),
+                user_query
+            )
+            if relevance_score < 0.1:
+                return ""
+
         return (
             "\n\n[Assistant identity note]:\n"
             f"Your configured name in this session is {assistant_name}. "
@@ -2457,6 +2524,7 @@ class AgentHandler:
     def _build_session_continuity_context(
         self,
         session_id: Optional[str],
+        user_query: Optional[str] = None,
     ) -> str:
         """Build a proactive continuity brief from durable memories + recent history."""
         if not SESSION_CONTINUITY_ENABLED or not session_id:
@@ -2504,6 +2572,11 @@ class AgentHandler:
             if not normalized_text or normalized_text in seen_memory_texts:
                 continue
 
+            if user_query:
+                relevance_score = self._score_memory_relevance_to_query(memory, user_query)
+                if relevance_score < 0.05:
+                    continue
+
             seen_memory_texts.add(normalized_text)
             scored_memories.append((score, memory))
 
@@ -2537,17 +2610,23 @@ class AgentHandler:
             if is_persistent_messaging:
                 return (
                     "\n\n[Session continuity status]:\n"
-                    "This messaging channel is one persistent conversation by design. "
-                    "Do not treat this turn like a fresh thread or re-introduce yourself. "
-                    "If continuity notes are missing, acknowledge that plainly and continue "
-                    "without making the user re-establish the relationship from scratch.\n"
+                    "This iMessage/Telegram session is one persistent conversation by design. "
+                    "Do not act like each inbound message starts a new thread."
                 )
             return (
                 "\n\n[Session continuity status]:\n"
                 "No continuity notes were found yet. Do not fake familiarity. "
                 "If continuity matters, acknowledge the gap plainly and warmly, then "
-                "rebuild context without making the user re-teach basic facts more than necessary.\n"
+                "rebuild context without making the user re-teach basic facts more than necessary."
             )
+
+        if not profile_lines:
+            profile_lines = [
+                "[No relevant continuity notes found for this conversation]"
+            ]
+            history_lines = [
+                "[Recent conversation thread not available]"
+            ]
 
         lines = [
             "",
@@ -3048,6 +3127,209 @@ class AgentHandler:
             cadence.get("ratio"),
         )
 
+    SPEECH_PATTERN_UPDATE_INTERVAL = int(
+        os.environ.get("SPEECH_PATTERN_UPDATE_INTERVAL", "15")
+    )
+    SPEECH_PATTERN_MIN_MESSAGES = int(
+        os.environ.get("SPEECH_PATTERN_MIN_MESSAGES", "8")
+    )
+
+    def _should_update_speech_patterns(
+        self, session_id: Optional[str], message_count: int
+    ) -> tuple[bool, dict[str, Any]]:
+        """Decide if speech pattern extraction should run."""
+        if not session_id:
+            return False, {"reason": "missing_session_id"}
+
+        if message_count < self.SPEECH_PATTERN_MIN_MESSAGES:
+            return False, {
+                "reason": "too_few_messages",
+                "message_count": message_count,
+            }
+
+        existing_patterns = self.memory_store.get_speech_pattern_memories(
+            session_id=session_id, limit=1
+        )
+        if existing_patterns:
+            return False, {"reason": "recently_updated"}
+
+        return True, {"reason": "eligible"}
+
+    async def _extract_speech_patterns(
+        self,
+        session: aiohttp.ClientSession,
+        session_id: Optional[str],
+        user_query: str,
+    ) -> Optional[dict[str, Any]]:
+        """Extract speech patterns from recent user messages."""
+        if not session_id:
+            return None
+
+        recent_messages = self.memory_store.get_conversation_history(
+            session_id=session_id, limit=20
+        )
+        user_messages = [
+            msg.content
+            for msg in recent_messages
+            if msg.role == "user" and msg.content.strip()
+        ]
+        if len(user_messages) < self.SPEECH_PATTERN_MIN_MESSAGES:
+            return None
+
+        user_text = "\n\n---\n\n".join(user_messages[-15:])
+
+        payload = BASE_PAYLOAD.copy()
+        payload["model"] = MODEL_ID
+        payload["temperature"] = 0.15
+        payload["max_tokens"] = 500
+        payload["tools"] = []
+        payload["messages"] = [
+            {
+                "role": "system",
+                "content": (
+                    "Analyze the user's recent messages and extract their speech patterns. "
+                    "Identify: vocabulary preferences (words/phrases they use uniquely), "
+                    "style markers (how they structure sentences, casual/formal tone), "
+                    "greeting patterns, common expressions, punctuation habits, "
+                    "and any distinctive writing traits. "
+                    "Focus on patterns that would help you sound more like them. "
+                    "Respond with JSON only using this schema: "
+                    '{"extract": boolean, "patterns": string, "style_notes": string, '
+                    '"vocabulary": string[], "reason": string}. '
+                    '"patterns" should be a 1-2 sentence summary of their speaking style. '
+                    '"style_notes" should capture tone, sentence structure, formality. '
+                    '"vocabulary" should list 3-8 distinctive words or phrases they commonly use.'
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Analyze these user messages for speech patterns:\n\n{user_text}"
+                ),
+            },
+        ]
+
+        try:
+            response_data = await api_call_with_retry(
+                session,
+                BASE_URL,
+                payload,
+                {"Authorization": f"Bearer {API_KEY}"},
+            )
+            raw_output = await process_response(
+                response_data,
+                payload["messages"],
+                session,
+                BASE_URL,
+                API_KEY,
+                payload,
+            )
+
+            parsed = self._coerce_json_dict(raw_output)
+            should_extract = parsed.get("extract", False)
+            if isinstance(should_extract, str):
+                should_extract = should_extract.strip().lower() in {
+                    "true",
+                    "1",
+                    "yes",
+                }
+            else:
+                should_extract = bool(should_extract)
+
+            if not should_extract:
+                return None
+
+            patterns = str(parsed.get("patterns", "")).strip()
+            style_notes = str(parsed.get("style_notes", "")).strip()
+            vocabulary = parsed.get("vocabulary", [])
+            if isinstance(vocabulary, list):
+                vocabulary = [str(v).strip() for v in vocabulary if str(v).strip()]
+
+            if not patterns and not style_notes:
+                return None
+
+            full_content = patterns
+            if style_notes:
+                full_content = f"{patterns}\n\n{style_notes}"
+            if vocabulary:
+                full_content = f"{full_content}\n\nDistictive vocabulary: {', '.join(vocabulary)}"
+
+            return {
+                "content": full_content,
+                "patterns": patterns,
+                "style_notes": style_notes,
+                "vocabulary": vocabulary,
+                "reason": str(parsed.get("reason", "")).strip(),
+            }
+        except Exception as e:
+            logger.warning("Speech pattern extraction failed: %s", e)
+            return None
+
+    async def _auto_update_speech_patterns(
+        self,
+        session: aiohttp.ClientSession,
+        session_id: Optional[str],
+        user_query: str,
+    ):
+        """Automatically update speech patterns for a session."""
+        if not session_id or not user_query:
+            return
+
+        message_count = self.memory_store.get_conversation_message_count(session_id)
+        should_update, status = self._should_update_speech_patterns(
+            session_id=session_id, message_count=message_count
+        )
+        if not should_update:
+            logger.debug(
+                "Speech pattern update skipped for session %s: %s", session_id, status
+            )
+            return
+
+        extracted = await self._extract_speech_patterns(
+            session=session, session_id=session_id, user_query=user_query
+        )
+        if not extracted:
+            logger.info("Speech pattern extraction returned nothing for session %s", session_id)
+            return
+
+        metadata = {
+            "type": "speech_pattern",
+            "session_id": session_id,
+            "patterns": extracted.get("patterns", ""),
+            "style_notes": extracted.get("style_notes", ""),
+            "vocabulary": extracted.get("vocabulary", []),
+        }
+
+        memory_id = await self.memory_store.add_memory(
+            content=extracted.get("content", ""),
+            metadata=metadata,
+            generate_embedding=False,
+        )
+        logger.info("Speech pattern stored: id=%s session=%s", memory_id, session_id)
+
+    def _build_speech_pattern_context(
+        self, session_id: Optional[str]
+    ) -> str:
+        """Build speech pattern context block for system prompt."""
+        if not session_id:
+            return ""
+
+        patterns = self.memory_store.get_speech_pattern_memories(
+            session_id=session_id, limit=3
+        )
+        if not patterns:
+            return ""
+
+        lines = [
+            "\n\n[User speaking style - adapt to match]:\n"
+        ]
+        for i, pattern in enumerate(patterns, 1):
+            content = pattern.content.strip()
+            if content:
+                lines.append(f"{i}. {content}")
+
+        return "\n".join(lines)
+
     def _get_or_refresh_dream_profile(self) -> dict[str, Any]:
         """Compute or refresh the learned off-peak profile used for dream mode."""
         now = datetime.datetime.now()
@@ -3305,6 +3587,13 @@ class AgentHandler:
             )
         except Exception as exc:
             logger.warning("Auto-memory capture failed: %s", exc)
+
+        try:
+            await self._auto_update_speech_patterns(
+                session=session, session_id=session_id, user_query=user_query
+            )
+        except Exception as exc:
+            logger.warning("Speech pattern update failed: %s", exc)
 
         try:
             await self._run_dream_cycle_if_due(session=session)
@@ -3916,16 +4205,24 @@ class AgentHandler:
         memory_context = ""
         if session_id:
             assistant_identity_context = self._build_assistant_identity_context(
-                session_id=session_id
+                session_id=session_id,
+                user_query=user_query,
             )
             if assistant_identity_context:
                 memory_context += assistant_identity_context
 
             continuity_context = self._build_session_continuity_context(
-                session_id=session_id
+                session_id=session_id,
+                user_query=user_query,
             )
             if continuity_context:
                 memory_context += continuity_context
+
+            speech_pattern_context = self._build_speech_pattern_context(
+                session_id=session_id
+            )
+            if speech_pattern_context:
+                memory_context += speech_pattern_context
 
         if user_query:
             try:
