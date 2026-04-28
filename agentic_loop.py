@@ -30,7 +30,13 @@ from api import (
     infer_tool_calls_from_content,
     safe_strip_markdown,
 )
-from tools import reset_tool_runtime_messages, set_tool_runtime_messages
+from tools import (
+    get_send_message_buffer,
+    init_send_message_buffer,
+    reset_send_message_buffer,
+    reset_tool_runtime_messages,
+    set_tool_runtime_messages,
+)
 
 # Patterns that indicate the model is narrating intended actions instead of
 # executing them. When detected in a text-only response (no tool_calls), the
@@ -111,6 +117,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_ITERATIONS = 20
 DEFAULT_MAX_ACTION_INTENT_RETRIES = 3
 DEFAULT_MAX_TAPBACK_REPLY_RETRIES = 1
+DEFAULT_MAX_SEND_MESSAGE_RETRIES = 3
 REACTION_TOOL_NAMES = {"send_tapback", "send_telegram_reaction", "send_reaction"}
 REACTION_WORD_NAMES = {
     "love",
@@ -867,6 +874,7 @@ async def run_agentic_loop(
     max_tool_leak_retries: int = 1,
     max_action_intent_retries: int = DEFAULT_MAX_ACTION_INTENT_RETRIES,
     max_tapback_reply_retries: int = DEFAULT_MAX_TAPBACK_REPLY_RETRIES,
+    max_send_message_retries: int = DEFAULT_MAX_SEND_MESSAGE_RETRIES,
     initial_response_data: Optional[dict[str, Any]] = None,
 ) -> str:
     """Run the agentic loop until the model produces a final text answer.
@@ -891,9 +899,55 @@ async def run_agentic_loop(
     """
     allowed_tool_names = _extract_allowed_tool_names(base_payload)
     allowed_tool_names_set = set(allowed_tool_names)
+    send_message_available = "send_message" in allowed_tool_names_set
+    send_buffer_token = init_send_message_buffer() if send_message_available else None
+
+    try:
+        result = await _run_agentic_loop_inner(
+            messages=messages,
+            session=session,
+            base_url=base_url,
+            api_key=api_key,
+            base_payload=base_payload,
+            stream_chunk_callback=stream_chunk_callback,
+            max_iterations=max_iterations,
+            max_tool_leak_retries=max_tool_leak_retries,
+            max_action_intent_retries=max_action_intent_retries,
+            max_tapback_reply_retries=max_tapback_reply_retries,
+            max_send_message_retries=max_send_message_retries,
+            initial_response_data=initial_response_data,
+            allowed_tool_names=allowed_tool_names,
+            allowed_tool_names_set=allowed_tool_names_set,
+            send_message_available=send_message_available,
+        )
+        return result
+    finally:
+        if send_buffer_token is not None:
+            reset_send_message_buffer(send_buffer_token)
+
+
+async def _run_agentic_loop_inner(
+    messages: list[dict[str, Any]],
+    session: aiohttp.ClientSession,
+    base_url: str,
+    api_key: str,
+    base_payload: dict[str, Any],
+    stream_chunk_callback: Optional[Callable[[str], Awaitable[None]]],
+    max_iterations: int,
+    max_tool_leak_retries: int,
+    max_action_intent_retries: int,
+    max_tapback_reply_retries: int,
+    max_send_message_retries: int,
+    initial_response_data: Optional[dict[str, Any]],
+    allowed_tool_names: list[str],
+    allowed_tool_names_set: set[str],
+    send_message_available: bool,
+) -> str:
     tool_leak_retries_used = 0
     action_intent_retries_used = 0
     tapback_reply_retries_used = 0
+    send_message_retries_used = 0
+    force_send_message_next = False
     executed_tool_rounds = 0
     executed_tool_names: list[str] = []
     pending_response_data: Optional[dict[str, Any]] = initial_response_data
@@ -914,25 +968,79 @@ async def run_agentic_loop(
             current_payload["messages"] = messages
 
             if forced_finish:
-                # Inject a system nudge and strip tools so the model must answer in text.
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "[System: You have used the maximum number of tool-call rounds. "
-                            "Do NOT call any more tools. Summarise what you have accomplished "
-                            "and give the user a direct final answer now.]"
-                        ),
+                # Inject a system nudge so the model gives a final answer.
+                # If send_message is enforced, keep ONLY send_message (so the
+                # model is forced to deliver via the tool); otherwise strip
+                # tools entirely so the model must answer in text.
+                if send_message_available:
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "[System: You have used the maximum number of "
+                                "tool-call rounds. Stop investigating. Deliver "
+                                "your final answer to the user NOW by calling "
+                                "send_message — that is the only allowed tool. "
+                                "Plain-text replies are not delivered.]"
+                            ),
+                        }
+                    )
+                    base_tools = base_payload.get("tools") or []
+                    forced_tools = [
+                        tool
+                        for tool in base_tools
+                        if isinstance(tool, dict)
+                        and tool.get("function", {}).get("name") == "send_message"
+                    ]
+                    current_payload = {
+                        k: v for k, v in base_payload.items() if k != "tools"
                     }
-                )
-                current_payload = {
-                    k: v for k, v in base_payload.items() if k != "tools"
-                }
+                    if forced_tools:
+                        current_payload["tools"] = forced_tools
+                        current_payload["tool_choice"] = {
+                            "type": "function",
+                            "function": {"name": "send_message"},
+                        }
+                else:
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "[System: You have used the maximum number of tool-call rounds. "
+                                "Do NOT call any more tools. Summarise what you have accomplished "
+                                "and give the user a direct final answer now.]"
+                            ),
+                        }
+                    )
+                    current_payload = {
+                        k: v for k, v in base_payload.items() if k != "tools"
+                    }
                 current_payload["messages"] = messages
                 logger.warning(
                     "Agentic loop reached max_iterations=%d — forcing final answer.",
                     max_iterations,
                 )
+            elif force_send_message_next:
+                # Previous round returned plain text instead of send_message;
+                # the API-level tool_choice forces compliance this round.
+                base_tools = base_payload.get("tools") or []
+                forced_tools = [
+                    tool
+                    for tool in base_tools
+                    if isinstance(tool, dict)
+                    and tool.get("function", {}).get("name") == "send_message"
+                ]
+                if forced_tools:
+                    current_payload = {
+                        k: v for k, v in base_payload.items() if k != "tools"
+                    }
+                    current_payload["tools"] = forced_tools
+                    current_payload["tool_choice"] = {
+                        "type": "function",
+                        "function": {"name": "send_message"},
+                    }
+                    current_payload["messages"] = messages
+                force_send_message_next = False
 
             # ── API call ──────────────────────────────────────────────────────
             response_data = await api_call_with_retry(
@@ -1264,6 +1372,85 @@ async def run_agentic_loop(
                     )
 
             final_text = safe_strip_markdown(content_text) if content_text else ""
+
+            # ── Enforce send_message: nudge if model returned plain text ──
+            if send_message_available:
+                send_buffer = get_send_message_buffer()
+                if not send_buffer and final_text.strip():
+                    if (
+                        not forced_finish
+                        and send_message_retries_used < max_send_message_retries
+                    ):
+                        send_message_retries_used += 1
+                        logger.warning(
+                            "Agentic loop: model returned plain text instead of "
+                            "calling send_message; forcing send_message tool "
+                            "choice (attempt %d/%d).",
+                            send_message_retries_used,
+                            max_send_message_retries,
+                        )
+                        messages.append(message)
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "[System: Plain-text replies are not "
+                                    "delivered to the user. You MUST call the "
+                                    "send_message tool to deliver your "
+                                    "response. Make one send_message call per "
+                                    "message bubble — split only when there "
+                                    "are distinct beats (setup/punchline, "
+                                    "answer/aside, question/context). Do not "
+                                    "reply with text — make the tool call(s) "
+                                    "now.]"
+                                ),
+                            }
+                        )
+                        force_send_message_next = True
+                        continue
+
+                    logger.error(
+                        "Agentic loop: model refused to call send_message after "
+                        "%d nudges (forced_finish=%s); returning error to user.",
+                        send_message_retries_used,
+                        forced_finish,
+                    )
+                    return (
+                        "Sorry, I hit an internal delivery error. Please send "
+                        "that again."
+                    )
+
+                if send_buffer:
+                    first_channel = send_buffer[0].get("channel", "buffered")
+                    if first_channel == "buffered":
+                        # Non-messaging channel (CLI, OpenAI-compat): no live
+                        # send happened — assemble the buffered messages into
+                        # the response so the caller actually sees them.
+                        joined = "\n\n".join(
+                            str(record.get("text", ""))
+                            for record in send_buffer
+                            if str(record.get("text", "")).strip()
+                        )
+                        if accumulated_attachments:
+                            return json.dumps(
+                                {
+                                    "text": joined,
+                                    "attachments": accumulated_attachments,
+                                }
+                            )
+                        return joined
+
+                    # Messaging channel: every bubble already shipped via
+                    # the live tool dispatch, so suppress the legacy
+                    # post-loop send path.
+                    return json.dumps(
+                        {
+                            "text": "",
+                            "attachments": [],
+                            "delivered_via_tool": True,
+                        }
+                    )
+
             if accumulated_attachments:
                 return json.dumps({
                     "text": final_text,

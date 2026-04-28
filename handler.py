@@ -611,6 +611,37 @@ BASE_PAYLOAD = {
         {
             "type": "function",
             "function": {
+                "name": "send_message",
+                "description": (
+                    "Deliver one user-facing message bubble to the active "
+                    "conversation. Each call sends exactly one message. "
+                    "Call this multiple times in a single turn ONLY when "
+                    "the reply has clearly distinct beats (setup then "
+                    "punchline, answer then aside, question then context). "
+                    "Do not split sentences arbitrarily. All user-facing "
+                    "replies MUST go through this tool — plain text "
+                    "responses are not delivered."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {
+                            "type": "string",
+                            "description": "Message body for this single bubble.",
+                        },
+                        "attachments": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional list of media URLs to attach to this message.",
+                        },
+                    },
+                    "required": ["text"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "send_tapback",
                 "description": "Send an iMessage tapback reaction to a specific inbound Sendblue message",
                 "parameters": {

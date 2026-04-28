@@ -81,6 +81,12 @@ _runtime_messages: contextvars.ContextVar[Optional[list[dict[str, Any]]]] = (
         default=None,
     )
 )
+_send_message_buffer: contextvars.ContextVar[Optional[list[dict[str, Any]]]] = (
+    contextvars.ContextVar(
+        "send_message_buffer",
+        default=None,
+    )
+)
 
 _ASSISTANT_NAME_USER_TEXT_PATTERNS = (
     re.compile(
@@ -197,6 +203,22 @@ def set_tool_runtime_messages(messages: Optional[list[dict[str, Any]]]):
 def reset_tool_runtime_messages(token: contextvars.Token):
     """Restore previous shared-message runtime context."""
     _runtime_messages.reset(token)
+
+
+def init_send_message_buffer():
+    """Begin tracking send_message tool deliveries for the current turn."""
+    return _send_message_buffer.set([])
+
+
+def reset_send_message_buffer(token: contextvars.Token):
+    """Restore previous send_message buffer context."""
+    _send_message_buffer.reset(token)
+
+
+def get_send_message_buffer() -> list[dict[str, Any]]:
+    """Return a copy of the messages dispatched via send_message this turn."""
+    current = _send_message_buffer.get()
+    return list(current or [])
 
 
 def _message_content_to_text(content: Any) -> str:
@@ -1187,6 +1209,118 @@ async def add_skill_tool(url: str, auto_activate: bool = True):
         return {"success": False, "error": str(e)}
 
 
+async def send_message_tool(
+    text: str,
+    attachments: Optional[list[str]] = None,
+):
+    """Deliver one user-facing message to the active conversation channel.
+
+    Each call sends exactly one message to the user. Call this multiple
+    times in the same turn to send several short messages back-to-back —
+    use that pattern for natural pacing (e.g. setup then punchline,
+    answer then aside, question then context). Do not split for the
+    sake of splitting; only when the message has clearly distinct beats.
+
+    All user-facing replies must go through this tool. Plain text
+    responses are not delivered.
+
+    Args:
+        text: The message body for this single bubble.
+        attachments: Optional list of media URLs to attach to this message.
+    """
+    body = "" if text is None else str(text)
+    body_stripped = body.strip()
+    normalized_attachments: list[str] = []
+    if isinstance(attachments, list):
+        normalized_attachments = [
+            str(item).strip() for item in attachments if str(item or "").strip()
+        ]
+
+    if not body_stripped and not normalized_attachments:
+        return {"success": False, "error": "text or attachments required"}
+
+    session_id = (_runtime_session_id.get() or "").strip()
+    record: dict[str, Any] = {
+        "text": body_stripped,
+        "attachments": list(normalized_attachments),
+        "channel": "buffered",
+    }
+
+    try:
+        if session_id.startswith("imessage_"):
+            phone_number = session_id[len("imessage_"):]
+            try:
+                from integrations import send_imessage
+            except Exception as import_error:
+                return {
+                    "success": False,
+                    "error": f"iMessage integration unavailable: {import_error}",
+                }
+            delivery = await send_imessage(
+                phone_number=phone_number,
+                message=body_stripped,
+                media_urls=normalized_attachments or None,
+            )
+            success = bool(delivery.get("success", False))
+            record["channel"] = "imessage"
+            record["delivery"] = delivery
+            buffer = _send_message_buffer.get()
+            if buffer is not None:
+                buffer.append(record)
+            return {
+                "success": success,
+                "channel": "imessage",
+                "delivery": delivery,
+            }
+
+        if session_id.startswith("tg_"):
+            try:
+                from integrations import (
+                    _send_telegram_response,
+                    session_delivery_targets,
+                )
+            except Exception as import_error:
+                return {
+                    "success": False,
+                    "error": f"Telegram integration unavailable: {import_error}",
+                }
+            target = session_delivery_targets.get(session_id) or {}
+            chat_id = target.get("chat_id")
+            bot = target.get("bot")
+            if chat_id is None or bot is None:
+                return {
+                    "success": False,
+                    "error": "Telegram delivery target not registered for this session",
+                }
+            try:
+                await _send_telegram_response(
+                    bot,
+                    int(chat_id),
+                    body_stripped,
+                    list(normalized_attachments),
+                )
+            except Exception as send_error:
+                return {
+                    "success": False,
+                    "error": f"Telegram send failed: {send_error}",
+                }
+            record["channel"] = "telegram"
+            buffer = _send_message_buffer.get()
+            if buffer is not None:
+                buffer.append(record)
+            return {"success": True, "channel": "telegram"}
+
+        # Non-messaging channel (CLI, OpenAI-compat, scheduled run, etc.).
+        # Buffer the message; the loop assembles the final response from
+        # the buffer when no live channel is bound.
+        buffer = _send_message_buffer.get()
+        if buffer is not None:
+            buffer.append(record)
+        return {"success": True, "channel": "buffered", "queued": True}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 async def send_tapback_tool(
     message_handle: str,
     reaction: str,
@@ -1531,6 +1665,7 @@ TOOLS = {
     "create_image": generate_image_tool,  # Alias
     "activate_skill": activate_skill_tool,
     "add_skill": add_skill_tool,
+    "send_message": send_message_tool,
     "send_tapback": send_tapback_tool,
     "send_reaction": send_tapback_tool,
     "send_telegram_reaction": send_telegram_reaction_tool,
@@ -1589,6 +1724,7 @@ def validate_tool_args(func_name: str, func_args: dict) -> tuple:
         "create_image": ["prompt", "filename"],
         "activate_skill": ["name"],
         "add_skill": ["url"],
+        "send_message": ["text"],
         "send_tapback": ["message_handle", "reaction"],
         "send_reaction": ["message_handle", "reaction"],
         "send_telegram_reaction": ["chat_id", "message_id", "reaction"],

@@ -2244,6 +2244,25 @@ async def _build_imessage_user_content(
     return await _build_user_message_content_async(merged_text, filtered_attachments)
 
 
+def _response_already_delivered(response: str) -> bool:
+    """Return True when the agentic loop already delivered all output via send_message.
+
+    The loop returns a JSON envelope with ``delivered_via_tool: true`` whenever
+    the model used the ``send_message`` tool to dispatch every user-facing
+    bubble.  Callers should skip the legacy post-loop send in that case to
+    avoid duplicate or empty messages.
+    """
+    if not response:
+        return False
+    try:
+        parsed = json.loads(response)
+    except Exception:
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    return bool(parsed.get("delivered_via_tool"))
+
+
 def _extract_agent_response_payload(response: str) -> tuple[str, list[str]]:
     """Parse optional structured attachment payload from assistant text output."""
     if not response:
@@ -2709,6 +2728,8 @@ async def _process_telegram_message(
         except (asyncio.TimeoutError, asyncio.CancelledError):
             pass
 
+    if _response_already_delivered(response):
+        return
     response_text, response_attachments = _extract_agent_response_payload(response)
     await _send_telegram_response(bot, chat_id, response_text, response_attachments)
 
@@ -3643,6 +3664,15 @@ async def process_imessage_and_reply(
             )
         finally:
             await _stop_typing_loop("response_ready")
+
+        if _response_already_delivered(resp):
+            if not typing_task.done():
+                logger.warning(
+                    "Detected active typing indicator loop after reply send for %s; forcing stop",
+                    phone_number,
+                )
+                await _stop_typing_loop("post_send_guard")
+            return
 
         reply_text, reply_attachments = _extract_agent_response_payload(resp)
         send_res = await send_imessage(

@@ -16,6 +16,24 @@ from agentic_loop import (
 from handler import API_KEY, BASE_PAYLOAD, BASE_URL
 
 
+def _payload_without_send_message() -> dict:
+    """Return a BASE_PAYLOAD copy with send_message stripped from tools.
+
+    These tests exercise other nudge behaviors and predate the send_message
+    enforcement, so they bypass it by removing the tool from the allowed set.
+    """
+    payload = BASE_PAYLOAD.copy()
+    payload["tools"] = [
+        tool
+        for tool in BASE_PAYLOAD.get("tools", [])
+        if not (
+            isinstance(tool, dict)
+            and tool.get("function", {}).get("name") == "send_message"
+        )
+    ]
+    return payload
+
+
 def test_contains_action_intent_narration_matches_here_now_publish_language() -> None:
     """here.now-style narrated publish text should trigger an execution retry."""
     print("Test 1: Detect narrated here.now publish text")
@@ -185,7 +203,7 @@ async def test_run_agentic_loop_retries_multiple_narrated_publish_attempts() -> 
             session=AsyncMock(),
             base_url=BASE_URL,
             api_key=API_KEY,
-            base_payload=BASE_PAYLOAD.copy(),
+            base_payload=_payload_without_send_message(),
             initial_response_data=initial_response,
             max_tool_leak_retries=1,
             max_action_intent_retries=3,
@@ -310,7 +328,7 @@ async def test_run_agentic_loop_retries_when_user_explicitly_requires_tools() ->
             session=AsyncMock(),
             base_url=BASE_URL,
             api_key=API_KEY,
-            base_payload=BASE_PAYLOAD.copy(),
+            base_payload=_payload_without_send_message(),
             initial_response_data=initial_response,
             max_tool_leak_retries=1,
             max_action_intent_retries=3,
@@ -424,7 +442,7 @@ async def test_run_agentic_loop_retries_to_add_skill_for_skill_url() -> None:
             session=AsyncMock(),
             base_url=BASE_URL,
             api_key=API_KEY,
-            base_payload=BASE_PAYLOAD.copy(),
+            base_payload=_payload_without_send_message(),
             initial_response_data=initial_response,
             max_tool_leak_retries=1,
             max_action_intent_retries=3,
@@ -519,7 +537,7 @@ async def test_run_agentic_loop_retries_for_normal_reply_after_tapback_ack() -> 
             session=AsyncMock(),
             base_url=BASE_URL,
             api_key=API_KEY,
-            base_payload=BASE_PAYLOAD.copy(),
+            base_payload=_payload_without_send_message(),
             initial_response_data=initial_response,
         )
 
@@ -607,7 +625,7 @@ async def test_run_agentic_loop_retries_for_normal_reply_after_telegram_reaction
             session=AsyncMock(),
             base_url=BASE_URL,
             api_key=API_KEY,
-            base_payload=BASE_PAYLOAD.copy(),
+            base_payload=_payload_without_send_message(),
             initial_response_data=initial_response,
         )
 
@@ -679,7 +697,7 @@ async def test_run_agentic_loop_retries_bare_reaction_word() -> None:
             session=AsyncMock(),
             base_url=BASE_URL,
             api_key=API_KEY,
-            base_payload=BASE_PAYLOAD.copy(),
+            base_payload=_payload_without_send_message(),
             initial_response_data=initial_response,
         )
 
@@ -769,8 +787,8 @@ async def test_run_agentic_loop_nudges_consult_advisor_for_hard_decision() -> No
     api_call_with_retry = AsyncMock(side_effect=[tool_call_response, final_response])
 
     messages = [{"role": "user", "content": "Make the advisor strategy default."}]
-    base_payload = BASE_PAYLOAD.copy()
-    base_payload["tools"] = list(BASE_PAYLOAD.get("tools", []))
+    base_payload = _payload_without_send_message()
+    base_payload["tools"] = list(base_payload.get("tools", []))
 
     with (
         patch("agentic_loop.api_call_with_retry", new=api_call_with_retry),
@@ -885,7 +903,7 @@ async def test_run_agentic_loop_retries_invalid_pseudo_tool_syntax() -> None:
             session=AsyncMock(),
             base_url=BASE_URL,
             api_key=API_KEY,
-            base_payload=BASE_PAYLOAD.copy(),
+            base_payload=_payload_without_send_message(),
             initial_response_data=initial_response,
         )
 
@@ -984,7 +1002,7 @@ async def test_run_agentic_loop_retries_markdown_reaction_pseudo_tool() -> None:
             session=AsyncMock(),
             base_url=BASE_URL,
             api_key=API_KEY,
-            base_payload=BASE_PAYLOAD.copy(),
+            base_payload=_payload_without_send_message(),
             initial_response_data=initial_response,
         )
 
@@ -1088,7 +1106,7 @@ async def test_run_agentic_loop_retries_short_reaction_ack_without_tool() -> Non
             session=AsyncMock(),
             base_url=BASE_URL,
             api_key=API_KEY,
-            base_payload=BASE_PAYLOAD.copy(),
+            base_payload=_payload_without_send_message(),
             initial_response_data=initial_response,
         )
 
@@ -1211,7 +1229,7 @@ async def test_run_agentic_loop_retries_unverified_publish_success_claim() -> No
             session=AsyncMock(),
             base_url=BASE_URL,
             api_key=API_KEY,
-            base_payload=BASE_PAYLOAD.copy(),
+            base_payload=_payload_without_send_message(),
             initial_response_data=initial_response,
         )
 
