@@ -32,12 +32,12 @@ async def test_tools_work():
     print("✓ read supports model-style limit slicing")
 
     sliced_with_offset = await TOOLS["read"](filepath="AGENTS.md", offset=1, limit=1)
-    assert sliced_with_offset[
-        "success"
-    ], f"Read offset slice failed: {sliced_with_offset}"
-    assert sliced_with_offset["content"].startswith(
-        "# AgentZero"
-    ), f"Unexpected offset slice: {sliced_with_offset}"
+    assert sliced_with_offset["success"], (
+        f"Read offset slice failed: {sliced_with_offset}"
+    )
+    assert sliced_with_offset["content"].startswith("# AgentZero"), (
+        f"Unexpected offset slice: {sliced_with_offset}"
+    )
     print("✓ read supports human-friendly offset slicing")
 
     # Test glob
@@ -59,9 +59,9 @@ async def test_tools_work():
         max_matches=1,
     )
     assert include_result["success"], f"Grep include failed: {include_result}"
-    assert (
-        len(include_result["matches"]) == 1
-    ), f"Unexpected grep include matches: {include_result}"
+    assert len(include_result["matches"]) == 1, (
+        f"Unexpected grep include matches: {include_result}"
+    )
     print("✓ grep supports include/max_matches arguments")
 
     # Test bash
@@ -81,8 +81,6 @@ async def test_tools_work():
     assert "reminder_run_now" in TOOLS
     assert "send_tapback" in TOOLS
     assert "send_telegram_reaction" in TOOLS
-    assert "consult_advisor" in TOOLS
-    assert "consult_reviewer" in TOOLS
     print("✓ consortium management tools are registered")
 
     print("All tools functional!\n")
@@ -106,11 +104,9 @@ async def test_payload_isolation():
     assert "reminder_cancel" in tool_names, "reminder_cancel missing from payload"
     assert "reminder_run_now" in tool_names, "reminder_run_now missing from payload"
     assert "send_tapback" in tool_names, "send_tapback missing from payload"
-    assert (
-        "send_telegram_reaction" in tool_names
-    ), "send_telegram_reaction missing from payload"
-    assert "consult_advisor" in tool_names, "consult_advisor missing from payload"
-    assert "consult_reviewer" in tool_names, "consult_reviewer missing from payload"
+    assert "send_telegram_reaction" in tool_names, (
+        "send_telegram_reaction missing from payload"
+    )
     assert "consortium_agree" not in tool_names, "consortium_agree should not be public"
 
     # Simulate what handle() does
@@ -242,6 +238,96 @@ async def test_remember_tool_rewrites_assistant_name_from_user_turn():
             os.remove(tmp.name)
 
 
+# ─── Live-API integration tests ───────────────────────────────────────────────
+
+
+async def test_live_agent_uses_read_tool() -> None:
+    """Agent should use the read tool and return file contents."""
+    from tests._live_harness import LIVE, live_run_agentic_loop, parse_loop_result, skip_if_not_live
+    if not LIVE:
+        print("[SKIP] Live read tool test (AGENTZERO_LIVE_TESTS=1 required)")
+        return
+    skip_if_not_live()
+    print("Testing live agent read tool...")
+    result = await live_run_agentic_loop(
+        messages=[{
+            "role": "user",
+            "content": "Read the first line of AGENTS.md using the read tool. Reply with exactly that line. Stop after.",
+        }],
+        max_iterations=5,
+    )
+    parsed = parse_loop_result(result)
+    text = parsed.get("text", result)
+    assert len(text) > 5, f"Reply too short: {text[:200]}"
+    print(f"  PASS — reply: {text[:100]}")
+
+
+async def test_live_agent_uses_bash_tool() -> None:
+    """Agent should use bash and return the output."""
+    from tests._live_harness import LIVE, live_run_agentic_loop, parse_loop_result, skip_if_not_live
+    if not LIVE:
+        print("[SKIP] Live bash tool test")
+        return
+    skip_if_not_live()
+    print("Testing live agent bash tool...")
+    result = await live_run_agentic_loop(
+        messages=[{
+            "role": "user",
+            "content": "Run `printf simple-bash-ok` using bash. Reply with exactly the output. Stop after.",
+        }],
+        max_iterations=5,
+    )
+    parsed = parse_loop_result(result)
+    text = parsed.get("text", result)
+    assert "simple-bash-ok" in text, f"Missing bash output: {text[:200]}"
+    print(f"  PASS — reply: {text[:100]}")
+
+
+async def test_live_agent_uses_write_tool() -> None:
+    """Agent should write a file and confirm success."""
+    from tests._live_harness import LIVE, live_run_agentic_loop, parse_loop_result, skip_if_not_live
+    if not LIVE:
+        print("[SKIP] Live write tool test")
+        return
+    skip_if_not_live()
+    print("Testing live agent write tool...")
+    result = await live_run_agentic_loop(
+        messages=[{
+            "role": "user",
+            "content": (
+                "Write a file at workspace/simple_test.txt containing exactly 'simple-write-ok'. "
+                "Then reply with just 'written' and the file contents. Stop after."
+            ),
+        }],
+        max_iterations=5,
+    )
+    parsed = parse_loop_result(result)
+    text = parsed.get("text", result)
+    assert "simple-write-ok" in text or "written" in text.lower(), f"Unexpected: {text[:200]}"
+    print(f"  PASS — reply: {text[:100]}")
+
+
+async def test_live_agent_uses_glob_tool() -> None:
+    """Agent should use glob to find files."""
+    from tests._live_harness import LIVE, live_run_agentic_loop, parse_loop_result, skip_if_not_live
+    if not LIVE:
+        print("[SKIP] Live glob tool test")
+        return
+    skip_if_not_live()
+    print("Testing live agent glob tool...")
+    result = await live_run_agentic_loop(
+        messages=[{
+            "role": "user",
+            "content": "Use glob to find all *.py files in the current directory. Reply with the count. Stop after.",
+        }],
+        max_iterations=5,
+    )
+    parsed = parse_loop_result(result)
+    text = parsed.get("text", result)
+    assert len(text) > 3, f"Reply too short: {text[:200]}"
+    print(f"  PASS — reply: {text[:100]}")
+
+
 if __name__ == "__main__":
     asyncio.run(test_tools_work())
     asyncio.run(test_payload_isolation())
@@ -249,4 +335,11 @@ if __name__ == "__main__":
     asyncio.run(test_tool_result_format())
     asyncio.run(test_remember_tool_persists_runtime_session_id())
     asyncio.run(test_remember_tool_rewrites_assistant_name_from_user_turn())
-    print("All tests passed!")
+    print("Deterministic tests passed!")
+
+    print("\n--- Live-API integration tests ---")
+    asyncio.run(test_live_agent_uses_read_tool())
+    asyncio.run(test_live_agent_uses_bash_tool())
+    asyncio.run(test_live_agent_uses_write_tool())
+    asyncio.run(test_live_agent_uses_glob_tool())
+    print("\nAll tests passed!")

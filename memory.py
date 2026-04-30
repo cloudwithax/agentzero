@@ -4,6 +4,7 @@ import base64
 import json
 import math
 import os
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -434,7 +435,7 @@ class MemoryStore:
         self,
         content: str,
         metadata: Optional[dict[str, Any]] = None,
-        generate_embedding: bool = True,
+        generate_embedding: bool = False,
         topics: Optional[list[str]] = None,
     ) -> Optional[int]:
         """Add a new memory to the store."""
@@ -498,59 +499,75 @@ class MemoryStore:
         threshold: float = 0.15,
         topic: Optional[str] = None,
     ) -> list[tuple[Memory, float]]:
-        """Search memories by semantic similarity."""
-        try:
-            query_embedding = await self.generate_embedding(query, input_type="query")
-        except Exception as e:
-            print(f"Warning: Failed to generate query embedding: {e}")
+        """Search memories by keyword matching (fast, no API calls)."""
+        if not query or not query.strip():
             return []
+
+        # Extract meaningful keywords from the query (skip short/common words)
+        stopwords = {
+            "the", "a", "an", "is", "are", "was", "were", "be", "been",
+            "in", "on", "at", "to", "for", "of", "with", "from", "by",
+            "and", "or", "but", "not", "so", "if", "it", "its", "i", "you",
+            "he", "she", "we", "they", "my", "your", "his", "her", "our",
+            "me", "us", "them", "do", "does", "did", "can", "will", "would",
+            "what", "where", "when", "why", "how", "who", "which", "that",
+            "this", "these", "those", "there", "here", "just", "now", "then",
+            "very", "really", "about", "also", "please", "tell", "know",
+            "remember", "remind", "name", "live", "like", "want", "need",
+        }
+        keywords = [
+            w.lower() for w in re.findall(r"[a-zA-Z]{3,}", query)
+            if w.lower() not in stopwords
+        ]
 
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
-        if topic:
-            cursor.execute(
-                """
-                SELECT m.id, m.content, m.embedding, m.metadata, m.created_at, m.updated_at
-                FROM memories m
-                JOIN memory_topics mt ON m.id = mt.memory_id
-                JOIN topics t ON mt.topic_id = t.id
-                WHERE t.name = ? AND m.embedding IS NOT NULL
-            """,
-                (topic,),
-            )
-        else:
-            cursor.execute(
-                """
-                SELECT id, content, embedding, metadata, created_at, updated_at
-                FROM memories
-                WHERE embedding IS NOT NULL
-            """
-            )
+        # Build scored results from text matching
+        scored: dict[int, tuple[Memory, float]] = {}
 
-        rows = cursor.fetchall()
-        conn.close()
+        for kw in keywords[:8]:  # max 8 keywords
+            like_pattern = f"%{kw}%"
+            if topic:
+                cursor.execute(
+                    """
+                    SELECT m.id, m.content, m.embedding, m.metadata, m.created_at, m.updated_at
+                    FROM memories m
+                    JOIN memory_topics mt ON m.id = mt.memory_id
+                    JOIN topics t ON mt.topic_id = t.id
+                    WHERE t.name = ? AND LOWER(m.content) LIKE ?
+                """,
+                    (topic, like_pattern),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT id, content, embedding, metadata, created_at, updated_at
+                    FROM memories
+                    WHERE LOWER(content) LIKE ?
+                """,
+                    (like_pattern,),
+                )
 
-        results = []
-        for row in rows:
-            memory_id, content, embedding_bytes, metadata, created_at, updated_at = row
-            if embedding_bytes:
-                memory_embedding = self._bytes_to_embedding(embedding_bytes)
-                similarity = self._cosine_similarity(query_embedding, memory_embedding)
-
-                if similarity >= threshold:
+            for row in cursor.fetchall():
+                memory_id, content, embedding_bytes, metadata_str, created_at, updated_at = row
+                if memory_id in scored:
+                    scored[memory_id] = (scored[memory_id][0], scored[memory_id][1] + 1.0)
+                else:
                     memory = Memory(
                         id=memory_id,
                         content=content,
-                        embedding=memory_embedding,
-                        metadata=json.loads(metadata or "{}"),
+                        embedding=None,
+                        metadata=json.loads(metadata_str or "{}"),
                         created_at=created_at,
                         updated_at=updated_at,
                     )
-                    results.append((memory, similarity))
+                    scored[memory_id] = (memory, 1.0)
 
-        results.sort(key=lambda x: x[1], reverse=True)
-        return results[:top_k]
+        conn.close()
+
+        results = sorted(scored.values(), key=lambda x: x[1], reverse=True)
+        return [(m, min(s / len(keywords or [1]), 1.0)) for m, s in results[:top_k]]
 
     def get_memories_by_topic(self, topic: str, limit: int = 10) -> list[Memory]:
         """Get all memories associated with a topic."""

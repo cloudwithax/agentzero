@@ -224,961 +224,294 @@ BASE_PAYLOAD = {
     "top_p": 0.9,
     "frequency_penalty": 0,
     "presence_penalty": 0,
-    "max_tokens": 32768,
-    "stream": False,
-    "tools": [
+    "max_tokens": 4096,
+    "stream": True,
+        "tools": [
         {
-            "type": "function",
-            "function": {
-                "name": "read",
-                "description": "Read the contents of a file",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "filepath": {
-                            "type": "string",
-                            "description": "Path to the file to read",
+                            "type": "function",
+                            "function": {
+                                "name": "read",
+                                "description": "Read the contents of a file",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "filepath": {
+                                            "type": "string",
+                                            "description": "Path to the file to read",
+                                        }
+                                    },
+                                    "required": ["filepath"],
+                                },
+                            },
+                        },
+        {
+                            "type": "function",
+                            "function": {
+                                "name": "write",
+                                "description": "Write content to a file (overwrites existing)",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "filepath": {
+                                            "type": "string",
+                                            "description": "Path to the file to write",
+                                        },
+                                        "content": {
+                                            "type": "string",
+                                            "description": "Content to write",
+                                        },
+                                    },
+                                    "required": ["filepath", "content"],
+                                },
+                            },
+                        },
+        {
+                            "type": "function",
+                            "function": {
+                                "name": "edit",
+                                "description": "Replace old_str with new_str in file. Requires exact match.",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "filepath": {
+                                            "type": "string",
+                                            "description": "Path to the file to edit",
+                                        },
+                                        "old_str": {
+                                            "type": "string",
+                                            "description": "Exact string to replace",
+                                        },
+                                        "new_str": {
+                                            "type": "string",
+                                            "description": "New string to insert",
+                                        },
+                                    },
+                                    "required": ["filepath", "old_str", "new_str"],
+                                },
+                            },
+                        },
+        {
+                            "type": "function",
+                            "function": {
+                                "name": "glob",
+                                "description": "Find files matching a glob pattern",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "pattern": {
+                                            "type": "string",
+                                            "description": "Glob pattern (e.g., '**/*.py')",
+                                        }
+                                    },
+                                    "required": ["pattern"],
+                                },
+                            },
+                        },
+        {
+                            "type": "function",
+                            "function": {
+                                "name": "grep",
+                                "description": "Search for pattern in files. Returns matching lines with filenames.",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "pattern": {
+                                            "type": "string",
+                                            "description": "Regex pattern to search for",
+                                        },
+                                        "path": {
+                                            "type": "string",
+                                            "description": "Directory to search in (default: current directory)",
+                                        },
+                                    },
+                                    "required": ["pattern"],
+                                },
+                            },
+                        },
+        {
+                            "type": "function",
+                            "function": {
+                                "name": "bash",
+                                "description": "Execute a shell command and return output",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "command": {
+                                            "type": "string",
+                                            "description": "Shell command to execute",
+                                        }
+                                    },
+                                    "required": ["command"],
+                                },
+                            },
+                        },
+        {
+                            "type": "function",
+                            "function": {
+                                "name": "remember",
+                                "description": "Store important information in persistent memory for future reference. Keep the subject correct: if the user names or renames the assistant, remember that as assistant identity, not as a user fact.",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "content": {
+                                            "type": "string",
+                                            "description": "The information to remember, written from the correct subject perspective",
+                                        },
+                                        "topics": {
+                                            "type": "array",
+                                            "items": {"type": "string"},
+                                            "description": "Optional topics/tags for categorization",
+                                        },
+                                        "importance": {
+                                            "type": "string",
+                                            "enum": ["low", "medium", "high"],
+                                            "description": "Importance level of this memory",
+                                        },
+                                    },
+                                    "required": ["content"],
+                                },
+                            },
+                        },
+        {
+                            "type": "function",
+                            "function": {
+                                "name": "recall",
+                                "description": "Search and retrieve information from persistent memory",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "query": {
+                                            "type": "string",
+                                            "description": "What to search for in memory",
+                                        },
+                                        "top_k": {
+                                            "type": "integer",
+                                            "description": "Number of memories to retrieve (default: 5)",
+                                        },
+                                        "topic": {
+                                            "type": "string",
+                                            "description": "Optional topic filter",
+                                        },
+                                    },
+                                    "required": ["query"],
+                                },
+                            },
+                        },
+        {
+                            "type": "function",
+                            "function": {
+                                "name": "web_search",
+                                "description": "Search the web for any topic and get clean, ready-to-use content from top results",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "query": {
+                                            "type": "string",
+                                            "description": "The search query string",
+                                        },
+                                        "numResults": {
+                                            "type": "integer",
+                                            "description": "Number of results to return (1-100, default: 10)",
+                                        },
+                                        "category": {
+                                            "type": "string",
+                                            "enum": ["company", "research paper", "news", "people"],
+                                            "description": "Optional category filter for search results",
+                                        },
+                                        "type": {
+                                            "type": "string",
+                                            "enum": [
+                                                "neural",
+                                                "fast",
+                                                "auto",
+                                                "deep",
+                                                "deep-reasoning",
+                                                "instant",
+                                            ],
+                                            "description": "Search type: auto (default), neural, fast, deep, deep-reasoning, instant",
+                                        },
+                                    },
+                                    "required": ["query"],
+                                },
+                            },
+                        },
+        {
+                            "type": "function",
+                            "function": {
+                                "name": "add_skill",
+                                "description": (
+                                    "Fetch a skill from a URL, scan it for prompt-injection attacks, "
+                                    "and install it for the current and future sessions. Use when the user "
+                                    "mentions a URL to a SKILL.md or asks you to add/install a skill from a link."
+                                ),
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "url": {
+                                            "type": "string",
+                                            "description": "HTTPS or HTTP URL pointing to a SKILL.md file",
+                                        },
+                                        "auto_activate": {
+                                            "type": "boolean",
+                                            "description": "Automatically activate the skill for this session after install (default: true)",
+                                        },
+                                    },
+                                    "required": ["url"],
+                                },
+                            },
+                        },
+        {
+                            "type": "function",
+                            "function": {
+                                "name": "consult_advisor",
+                                "description": (
+                                    "Consult the advisor model for a concise strategy when you hit a hard "
+                                    "decision, branching choice, architecture tradeoff, or repeated failure "
+                                    "mid-run. The advisor reads the same shared context and returns a plan; "
+                                    "after the tool result, continue executing yourself."
+                                ),
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "question": {
+                                            "type": "string",
+                                            "description": "The exact decision or blocker you need the advisor to resolve",
+                                        },
+                                        "context": {
+                                            "type": "string",
+                                            "description": "Optional extra context, options under consideration, or recent failed attempts",
+                                        },
+                                    },
+                                    "required": ["question"],
+                                },
+                            },
+                        },
+        {
+                            "type": "function",
+                            "function": {
+                                "name": "consult_reviewer",
+                                "description": (
+                                    "Consult the reviewer model for a concise implementation review focused "
+                                    "on bugs, regressions, missing validation, and residual risks. Use this "
+                                    "after inspection or implementation work when you want a fast risk pass "
+                                    "before finalizing."
+                                ),
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "question": {
+                                            "type": "string",
+                                            "description": "The exact thing you want the reviewer to evaluate",
+                                        },
+                                        "context": {
+                                            "type": "string",
+                                            "description": "Optional extra context, change summary, known risks, or open questions",
+                                        },
+                                    },
+                                    "required": ["question"],
+                                },
+                            },
                         }
-                    },
-                    "required": ["filepath"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "write",
-                "description": "Write content to a file (overwrites existing)",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "filepath": {
-                            "type": "string",
-                            "description": "Path to the file to write",
-                        },
-                        "content": {
-                            "type": "string",
-                            "description": "Content to write",
-                        },
-                    },
-                    "required": ["filepath", "content"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "edit",
-                "description": "Replace old_str with new_str in file. Requires exact match.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "filepath": {
-                            "type": "string",
-                            "description": "Path to the file to edit",
-                        },
-                        "old_str": {
-                            "type": "string",
-                            "description": "Exact string to replace",
-                        },
-                        "new_str": {
-                            "type": "string",
-                            "description": "New string to insert",
-                        },
-                    },
-                    "required": ["filepath", "old_str", "new_str"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "glob",
-                "description": "Find files matching a glob pattern",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "pattern": {
-                            "type": "string",
-                            "description": "Glob pattern (e.g., '**/*.py')",
-                        }
-                    },
-                    "required": ["pattern"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "grep",
-                "description": "Search for pattern in files. Returns matching lines with filenames.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "pattern": {
-                            "type": "string",
-                            "description": "Regex pattern to search for",
-                        },
-                        "path": {
-                            "type": "string",
-                            "description": "Directory to search in (default: current directory)",
-                        },
-                    },
-                    "required": ["pattern"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "description": "Execute a shell command and return output",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "command": {
-                            "type": "string",
-                            "description": "Shell command to execute",
-                        }
-                    },
-                    "required": ["command"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "get_current_date",
-                "description": "Get the current date and time information",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "get_next_weekday",
-                "description": "Calculate the date of the next occurrence of a specific weekday (e.g., 'next Tuesday')",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "weekday_name": {
-                            "type": "string",
-                            "description": "Name of the weekday (e.g., 'Tuesday', 'next Tuesday', 'Monday')",
-                        }
-                    },
-                    "required": ["weekday_name"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "format_date",
-                "description": "Format a date string from one format to another",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "date_str": {
-                            "type": "string",
-                            "description": "The date string to format",
-                        },
-                        "input_format": {
-                            "type": "string",
-                            "description": "Format of input date (default: %Y-%m-%d)",
-                        },
-                        "output_format": {
-                            "type": "string",
-                            "description": "Desired output format (default: %B %d, %Y)",
-                        },
-                    },
-                    "required": ["date_str"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "read_pdf",
-                "description": "Extract and read text content from a PDF file",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "filepath": {
-                            "type": "string",
-                            "description": "Path to the PDF file to read",
-                        }
-                    },
-                    "required": ["filepath"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "remember",
-                "description": "Store important information in persistent memory for future reference. Keep the subject correct: if the user names or renames the assistant, remember that as assistant identity, not as a user fact.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "content": {
-                            "type": "string",
-                            "description": "The information to remember, written from the correct subject perspective",
-                        },
-                        "topics": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Optional topics/tags for categorization",
-                        },
-                        "importance": {
-                            "type": "string",
-                            "enum": ["low", "medium", "high"],
-                            "description": "Importance level of this memory",
-                        },
-                    },
-                    "required": ["content"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "recall",
-                "description": "Search and retrieve information from persistent memory",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "What to search for in memory",
-                        },
-                        "top_k": {
-                            "type": "integer",
-                            "description": "Number of memories to retrieve (default: 5)",
-                        },
-                        "topic": {
-                            "type": "string",
-                            "description": "Optional topic filter",
-                        },
-                    },
-                    "required": ["query"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "get_recent_memories",
-                "description": "Get the most recent memories added to the system",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "limit": {
-                            "type": "integer",
-                            "description": "Number of recent memories to retrieve (default: 10)",
-                        }
-                    },
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "forget",
-                "description": "Delete a specific memory by ID",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "memory_id": {
-                            "type": "integer",
-                            "description": "The ID of the memory to delete",
-                        }
-                    },
-                    "required": ["memory_id"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "memory_stats",
-                "description": "Get statistics about the memory system",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "web_search",
-                "description": "Search the web for any topic and get clean, ready-to-use content from top results",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "The search query string",
-                        },
-                        "numResults": {
-                            "type": "integer",
-                            "description": "Number of results to return (1-100, default: 10)",
-                        },
-                        "category": {
-                            "type": "string",
-                            "enum": ["company", "research paper", "news", "people"],
-                            "description": "Optional category filter for search results",
-                        },
-                        "type": {
-                            "type": "string",
-                            "enum": [
-                                "neural",
-                                "fast",
-                                "auto",
-                                "deep",
-                                "deep-reasoning",
-                                "instant",
-                            ],
-                            "description": "Search type: auto (default), neural, fast, deep, deep-reasoning, instant",
-                        },
-                    },
-                    "required": ["query"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "generate_image",
-                "description": "Generate an image from a text prompt and save it as a PNG/JPG file in the workspace. Use this for any image creation, illustration, or visual generation task.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "prompt": {
-                            "type": "string",
-                            "description": "Detailed text description of the image to generate",
-                        },
-                        "filename": {
-                            "type": "string",
-                            "description": "Output filename (e.g. robot_cafe.png). Saved to workspace.",
-                        },
-                        "width": {
-                            "type": "integer",
-                            "description": "Image width in pixels (default 1024)",
-                        },
-                        "height": {
-                            "type": "integer",
-                            "description": "Image height in pixels (default 1024)",
-                        },
-                        "model": {
-                            "type": "string",
-                            "enum": ["flux", "turbo"],
-                            "description": "Model: flux (high quality, default) or turbo (faster)",
-                        },
-                    },
-                    "required": ["prompt", "filename"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "add_skill",
-                "description": (
-                    "Fetch a skill from a URL, scan it for prompt-injection attacks, "
-                    "and install it for the current and future sessions. Use when the user "
-                    "mentions a URL to a SKILL.md or asks you to add/install a skill from a link."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "url": {
-                            "type": "string",
-                            "description": "HTTPS or HTTP URL pointing to a SKILL.md file",
-                        },
-                        "auto_activate": {
-                            "type": "boolean",
-                            "description": "Automatically activate the skill for this session after install (default: true)",
-                        },
-                    },
-                    "required": ["url"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "send_message",
-                "description": (
-                    "Deliver one user-facing message bubble to the active "
-                    "conversation. Each call sends exactly one message. "
-                    "Call this multiple times in a single turn ONLY when "
-                    "the reply has clearly distinct beats (setup then "
-                    "punchline, answer then aside, question then context). "
-                    "Do not split sentences arbitrarily. All user-facing "
-                    "replies MUST go through this tool — plain text "
-                    "responses are not delivered."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "text": {
-                            "type": "string",
-                            "description": "Message body for this single bubble.",
-                        },
-                        "attachments": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Optional list of media URLs to attach to this message.",
-                        },
-                    },
-                    "required": ["text"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "send_tapback",
-                "description": "Send an iMessage tapback reaction to a specific inbound Sendblue message",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "message_handle": {
-                            "type": "string",
-                            "description": "Sendblue message handle/GUID from inbound webhook payload",
-                        },
-                        "reaction": {
-                            "type": "string",
-                            "enum": [
-                                "love",
-                                "like",
-                                "dislike",
-                                "laugh",
-                                "emphasize",
-                                "question",
-                            ],
-                            "description": "Tapback reaction type",
-                        },
-                        "part_index": {
-                            "type": "integer",
-                            "description": "Optional non-negative part index for multi-part messages",
-                        },
-                    },
-                    "required": ["message_handle", "reaction"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "send_telegram_reaction",
-                "description": "Send a Telegram emoji reaction to a specific inbound Telegram message",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "chat_id": {
-                            "type": "integer",
-                            "description": "Telegram chat ID where the inbound message was received",
-                        },
-                        "message_id": {
-                            "type": "integer",
-                            "description": "Telegram message ID to react to",
-                        },
-                        "reaction": {
-                            "type": "string",
-                            "enum": [
-                                "like",
-                                "love",
-                                "dislike",
-                                "laugh",
-                                "emphasize",
-                                "question",
-                                "party",
-                                "clap",
-                                "cry",
-                                "sob",
-                                "scream",
-                                "mindblown",
-                                "pray",
-                                "cool",
-                                "100",
-                                "hearts",
-                                "starry",
-                                "angry",
-                                "devil",
-                                "ghost",
-                                "clown",
-                                "shrug",
-                                "eyes",
-                                "kiss",
-                                "hug",
-                                "salute",
-                                "nerd",
-                                "trophy",
-                                "heartbreak",
-                                "heartonfire",
-                                "vomit",
-                                "poo",
-                                "ok",
-                                "whale",
-                                "dove",
-                                "unicorn",
-                                "moai",
-                                "banana",
-                                "strawberry",
-                                "champagne",
-                                "hotdog",
-                                "yawn",
-                                "woozy",
-                                "sleep",
-                                "scared",
-                                "handshake",
-                                "halo",
-                                "grin",
-                                "alien",
-                                "lightning",
-                                "moon",
-                                "cursing",
-                                "zany",
-                                "lipstick",
-                                "nailpolish",
-                                "middlefinger",
-                                "coder",
-                                "pill",
-                                "pumpkin",
-                                "cupid",
-                                "hearteyes",
-                                "writing",
-                                "santa",
-                                "christmas",
-                                "snowman",
-                                "seenoevil",
-                            ],
-                            "description": "Reaction name: like (👍), love (❤), dislike (👎), laugh (🤣), emphasize (🔥), question (🤔), party (🎉), clap (👏), cool (😎), 100 (💯), pray (🙏), eyes (👀), etc.",
-                        },
-                    },
-                    "required": ["chat_id", "message_id", "reaction"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "consult_advisor",
-                "description": (
-                    "Consult the advisor model for a concise strategy when you hit a hard "
-                    "decision, branching choice, architecture tradeoff, or repeated failure "
-                    "mid-run. The advisor reads the same shared context and returns a plan; "
-                    "after the tool result, continue executing yourself."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "question": {
-                            "type": "string",
-                            "description": "The exact decision or blocker you need the advisor to resolve",
-                        },
-                        "context": {
-                            "type": "string",
-                            "description": "Optional extra context, options under consideration, or recent failed attempts",
-                        },
-                    },
-                    "required": ["question"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "consult_reviewer",
-                "description": (
-                    "Consult the reviewer model for a concise implementation review focused "
-                    "on bugs, regressions, missing validation, and residual risks. Use this "
-                    "after inspection or implementation work when you want a fast risk pass "
-                    "before finalizing."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "question": {
-                            "type": "string",
-                            "description": "The exact thing you want the reviewer to evaluate",
-                        },
-                        "context": {
-                            "type": "string",
-                            "description": "Optional extra context, change summary, known risks, or open questions",
-                        },
-                    },
-                    "required": ["question"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "consortium_start",
-                "description": "Start a consortium-mode task in the background",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "task": {
-                            "type": "string",
-                            "description": "The user request or task prompt to send to consortium mode",
-                        },
-                        "task_id": {
-                            "type": "string",
-                            "description": "Optional task identifier. If omitted, one is generated",
-                        },
-                    },
-                    "required": ["task"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "reminder_create",
-                "description": "Create a cron-based reminder task (one-off or recurring), with optional direct AI output generation",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "cron": {
-                            "type": "string",
-                            "description": "Cron schedule with 5 fields: minute hour day month weekday",
-                        },
-                        "message": {
-                            "type": "string",
-                            "description": "Reminder text to deliver when run_ai is false",
-                        },
-                        "session_id": {
-                            "type": "string",
-                            "description": "Optional session ID to write scheduled outputs into conversation history",
-                        },
-                        "one_off": {
-                            "type": "boolean",
-                            "description": "If true, task executes once at the next cron match",
-                        },
-                        "run_ai": {
-                            "type": "boolean",
-                            "description": "If true, run direct AI inference using ai_prompt",
-                        },
-                        "ai_prompt": {
-                            "type": "string",
-                            "description": "Prompt used for direct AI inference when run_ai is true",
-                        },
-                        "task_id": {
-                            "type": "string",
-                            "description": "Optional custom task ID",
-                        },
-                        "name": {
-                            "type": "string",
-                            "description": "Optional human-friendly task name",
-                        },
-                    },
-                    "required": ["cron"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "reminder_list",
-                "description": "List scheduled reminder tasks",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "include_disabled": {
-                            "type": "boolean",
-                            "description": "Include completed/cancelled tasks",
-                        }
-                    },
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "reminder_status",
-                "description": "Get status for one reminder task",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "task_id": {
-                            "type": "string",
-                            "description": "Reminder task identifier",
-                        }
-                    },
-                    "required": ["task_id"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "reminder_cancel",
-                "description": "Cancel a reminder task",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "task_id": {
-                            "type": "string",
-                            "description": "Reminder task identifier",
-                        },
-                        "reason": {
-                            "type": "string",
-                            "description": "Optional cancellation reason",
-                        },
-                    },
-                    "required": ["task_id"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "reminder_run_now",
-                "description": "Run a reminder task immediately",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "task_id": {
-                            "type": "string",
-                            "description": "Reminder task identifier",
-                        }
-                    },
-                    "required": ["task_id"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "consortium_stop",
-                "description": "Stop a running consortium-mode task",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "task_id": {
-                            "type": "string",
-                            "description": "The consortium task identifier",
-                        },
-                        "reason": {
-                            "type": "string",
-                            "description": "Optional reason for stopping the task",
-                        },
-                    },
-                    "required": ["task_id"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "consortium_status",
-                "description": "Check status for one consortium task or all consortium tasks",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "task_id": {
-                            "type": "string",
-                            "description": "Optional task identifier. If omitted, returns all tasks",
-                        }
-                    },
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "acp_register_service",
-                "description": "Register capabilities with the ACP network for service discovery",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "service_name": {
-                            "type": "string",
-                            "description": "Name of the service to register",
-                        },
-                        "capabilities": {
-                            "type": "string",
-                            "description": "Comma-separated list of capabilities (e.g., 'memory_access,web_search,tool_execution')",
-                        },
-                        "description": {
-                            "type": "string",
-                            "description": "Description of the service",
-                        },
-                        "endpoint": {
-                            "type": "string",
-                            "description": "Service endpoint address",
-                        },
-                    },
-                    "required": [
-                        "service_name",
-                        "capabilities",
-                        "description",
-                        "endpoint",
-                    ],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "acp_discover_peers",
-                "description": "Discover peers in the ACP network by capability or name",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query_type": {
-                            "type": "string",
-                            "enum": ["all", "capability", "name"],
-                            "description": "Type of query: 'all', 'capability', or 'name'",
-                        },
-                        "query_value": {
-                            "type": "string",
-                            "description": "Optional capability or name pattern to search for",
-                        },
-                    },
-                    "required": [],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "acp_send_message",
-                "description": "Send a message to another agent via ACP",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "recipient_id": {
-                            "type": "string",
-                            "description": "Target agent ID",
-                        },
-                        "message": {
-                            "type": "string",
-                            "description": "Message content",
-                        },
-                        "payload": {
-                            "type": "string",
-                            "description": "Optional structured payload data",
-                        },
-                        "secure": {
-                            "type": "boolean",
-                            "description": "Whether to encrypt and sign the message (default: true)",
-                        },
-                    },
-                    "required": ["recipient_id", "message"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "acp_get_registry",
-                "description": "Get the current ACP registry status and all registered services",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "acp_list_peers",
-                "description": "List all known peers in the ACP network",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "store_credential",
-                "description": "Store a credential (API key, token, password, etc.) in the encrypted vault. Values are encrypted at rest.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "key": {
-                            "type": "string",
-                            "description": "A unique name for this credential (e.g. 'github_token', 'aws_secret_key')",
-                        },
-                        "value": {
-                            "type": "string",
-                            "description": "The secret value to store",
-                        },
-                        "description": {
-                            "type": "string",
-                            "description": "Optional description of what this credential is for",
-                        },
-                    },
-                    "required": ["key", "value"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "get_credential",
-                "description": "Retrieve a stored credential from the encrypted vault by its key name",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "key": {
-                            "type": "string",
-                            "description": "The name of the credential to retrieve",
-                        }
-                    },
-                    "required": ["key"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "delete_credential",
-                "description": "Delete a stored credential from the encrypted vault",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "key": {
-                            "type": "string",
-                            "description": "The name of the credential to delete",
-                        }
-                    },
-                    "required": ["key"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "list_credentials",
-                "description": "List all stored credential keys (values are never exposed in listings)",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "self_heal_status",
-                "description": "Get current status of the self-healing subsystem including heal history, worktree state, and configuration",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                },
-            },
-        },
     ],
 }
 
@@ -1341,6 +674,7 @@ class AgentHandler:
         set_consortium_controller(self)
         set_reminder_controller(self)
         set_acp_agent(acp_agent)
+        self._preflight_cache: dict[str, list[str]] = {}
 
     async def start_reminder_scheduler(self) -> None:
         """Start the reminder scheduler background loop."""
@@ -4498,7 +3832,6 @@ class AgentHandler:
             if task and content and not content.startswith("Error:"):
                 self.example_bank.auto_feedback(task.type, success=True, efficiency=1.0)
 
-            print(content)
             return content
 
         system_message = {

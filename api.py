@@ -256,7 +256,7 @@ def _coerce_xml_parameter_value(raw_value: str) -> Any:
 
 
 def _parse_xml_tool_call_blob(blob: str) -> list[dict[str, Any]]:
-    """Parse XML-style function markup emitted by some executor models."""
+    """Parse XML-style function markup emitted by some models."""
     stripped = blob.strip()
     match = re.fullmatch(
         r"(?is)<function_(?P<name>[a-zA-Z_][\w-]*)>\s*(?P<body>.*?)\s*</function_(?P=name)>",
@@ -305,6 +305,12 @@ def infer_tool_calls_from_content(content: str) -> list[dict[str, Any]]:
         return []
 
     stripped = content.strip()
+
+    # Check for bare tool_name{json} pseudo-tool syntax
+    bare_json_calls = _parse_bare_json_tool_calls(stripped)
+    if bare_json_calls:
+        return bare_json_calls
+
     match = re.fullmatch(r"```(?:bash|sh|shell)\s*\n([\s\S]*?)\n```", stripped)
     if match:
         command = match.group(1).strip()
@@ -325,6 +331,54 @@ def infer_tool_calls_from_content(content: str) -> list[dict[str, Any]]:
         return xml_calls
 
     return _parse_json_tool_calls_blob(content)
+
+
+def _parse_bare_json_tool_calls(content: str) -> list[dict[str, Any]]:
+    """Parse bare tool_name{json} pseudo-tool syntax from model text.
+
+    Handles formats like:
+        declare_message_count{"count": 1}
+        send_message{"text": "Hello"}
+        recall{"query": "Alex name and location"}
+    """
+    _BARE_TOOL_RE = re.compile(
+        r"(?:^|[\r\n])\s*"
+        r"([a-z][a-z0-9_]*)"
+        r"\s*(\{(?:[^{}]|(?:\{[^{}]*\}))*\})",
+        re.MULTILINE | re.DOTALL,
+    )
+    matches = _BARE_TOOL_RE.findall(content)
+    if not matches:
+        return []
+
+    calls: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    for idx, (name, args_str) in enumerate(matches):
+        name = name.strip()
+        if name in seen_names:
+            continue
+        # Skip if it looks like a variable assignment or other JS/Python code
+        if re.search(r'^[a-z]+\s*=\s*', content):
+            continue
+        try:
+            parsed_args = json.loads(args_str.strip())
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(parsed_args, dict):
+            continue
+        calls.append(
+            {
+                "id": f"inferred_bare_json_{idx + 1}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(parsed_args),
+                },
+            }
+        )
+        seen_names.add(name)
+
+    return calls if len(calls) <= 3 else []  # safety: don't recover too many
 
 
 def _extract_allowed_tool_names(payload: dict[str, Any]) -> set[str]:
@@ -615,7 +669,27 @@ async def execute_tool_calls(
     # Handle standard OpenAI-style tool_calls
     for tool_call in message.get("tool_calls", []):
         func_name = tool_call["function"]["name"]
-        func_args = json.loads(tool_call["function"]["arguments"])
+        try:
+            func_args = json.loads(tool_call["function"]["arguments"])
+        except (json.JSONDecodeError, TypeError) as e:
+            logger.warning(
+                "Failed to parse tool-call arguments for %s: %s",
+                func_name,
+                e,
+            )
+            tool_results.append(
+                {
+                    "tool_call_id": tool_call["id"],
+                    "role": "tool",
+                    "content": json.dumps(
+                        {
+                            "success": False,
+                            "error": f"Invalid JSON arguments: {e}",
+                        }
+                    ),
+                }
+            )
+            continue
 
         if allowed_tool_names is not None and func_name not in allowed_tool_names:
             tool_results.append(

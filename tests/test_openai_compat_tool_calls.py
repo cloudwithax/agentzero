@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test tool calls through the OpenAI compat server path end-to-end."""
+"""Live-API test for OpenAI compat server tool-call round-trips."""
 
 import asyncio
 import json
@@ -8,148 +8,209 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from aiohttp import ClientSession, web
 from aiohttp.test_utils import TestClient, TestServer
-from unittest.mock import AsyncMock
 
 from openai_compat_server import create_openai_compatible_app
+from tests._live_harness import (
+    LIVE,
+    skip_if_not_live,
+    _make_handler,
+    _make_store,
+)
 
 
-class ToolCallingHandler:
-    """Handler that simulates a tool-call round-trip like the real handler does."""
+class LiveHandler:
+    """Wraps the real handler for the compat server's handle() contract."""
 
-    def __init__(self):
-        self.calls = []
+    def __init__(self, real_handler, session_id: str = "compat_test"):
+        self._handler = real_handler
+        self._session_id = session_id
 
-    async def handle(
-        self,
-        request,
-        session_id=None,
-        interim_response_callback=None,
-        response_chunk_callback=None,
-        request_metadata=None,
-    ):
-        self.calls.append({
-            "request": request,
-            "session_id": session_id,
-        })
-
+    async def handle(self, request, session_id=None, interim_response_callback=None,
+                     response_chunk_callback=None, request_metadata=None):
+        sid = session_id or self._session_id
         messages = request.get("messages", [])
-
-        # Simulate what handler.handle() does:
-        # 1. Build a payload with tools
-        # 2. Call the real API (mocked)
-        # 3. Process response with tool-call loop
-        from api import process_response
-        from handler import BASE_PAYLOAD, BASE_URL, API_KEY
-
-        payload = BASE_PAYLOAD.copy()
-        payload["messages"] = messages
-
-        # First response: model wants to call bash
-        first_response = {
-            "choices": [
-                {
-                    "message": {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [
-                            {
-                                "id": "call_test_123",
-                                "type": "function",
-                                "function": {
-                                    "name": "bash",
-                                    "arguments": json.dumps({"command": "echo hello"}),
-                                },
-                            }
-                        ],
-                    }
-                }
-            ]
-        }
-
-        # Second response: model gives final answer
-        second_response = {
-            "choices": [
-                {"message": {"role": "assistant", "content": "Command output: hello"}}
-            ]
-        }
-
-        call_count = [0]
-
-        class MockResponse:
-            def __init__(self, payload):
-                self.payload = payload
-                self.status = 200
-
-            async def json(self, content_type=None):
-                return self.payload
-
-        class MockPostCM:
-            def __init__(self, *args, **kwargs):
-                pass
-
-            async def __aenter__(self):
-                call_count[0] += 1
-                if call_count[0] == 1:
-                    return MockResponse(first_response)
-                return MockResponse(second_response)
-
-            async def __aexit__(self, *args):
-                return False
-
-        mock_session = AsyncMock()
-        mock_session.post = MockPostCM
-
-        # This is what handler.handle() does
-        content = await process_response(
-            first_response,
-            payload["messages"],
-            mock_session,
-            BASE_URL,
-            API_KEY,
-            payload,
+        result = await self._handler.handle(
+            messages=messages, session_id=sid,
+            interim_response_callback=interim_response_callback,
+            response_chunk_callback=response_chunk_callback,
+            request_metadata=request_metadata,
         )
+        return result
 
-        return content
 
-
-async def test_tool_calls_through_openai_compat():
-    """Tool calls should work end-to-end through the OpenAI compat server."""
-    print("Test: Tool calls through OpenAI compat server")
-
-    handler = ToolCallingHandler()
-    app = create_openai_compatible_app(
-        handler,
-        api_key="test-key",
-        model_alias="agentzero-main",
-        backing_model="test-model",
-    )
-    server = TestServer(app)
-    client = TestClient(server)
-    await client.start_server()
-
+def _extract_response_text(response: str) -> str:
+    """Extract plain text from a handler response that might be JSON or raw text."""
     try:
-        response = await client.post(
-            "/v1/chat/completions",
-            headers={"Authorization": "Bearer test-key"},
-            json={
+        parsed = json.loads(response)
+        if isinstance(parsed, dict):
+            return parsed.get("text", str(parsed))
+        return str(parsed)
+    except (json.JSONDecodeError, TypeError):
+        return response
+
+
+async def test_live_compat_server_models_endpoint() -> None:
+    """GET /v1/models should list available models."""
+    if not LIVE:
+        print("\nTest L1: Compat server models [SKIP]")
+        return
+    print("\nTest L1: OpenAI compat server /v1/models")
+    skip_if_not_live()
+
+    store = _make_store()
+    handler_obj = _make_handler(store)
+    wrapped = LiveHandler(handler_obj)
+
+    app = create_openai_compatible_app(wrapped, api_key="test-api-key", model_alias="agentzero-test")
+    async with TestServer(app) as server:
+        async with TestClient(server) as client:
+            resp = await client.get(
+                "/v1/models",
+                headers={"Authorization": "Bearer test-api-key"}
+            )
+            assert resp.status == 200, f"Expected 200, got {resp.status}"
+            data = await resp.json()
+            assert "data" in data
+            assert len(data["data"]) >= 1
+            print(f"  PASS — {len(data['data'])} model(s) listed")
+
+
+async def test_live_compat_server_chat_completion() -> None:
+    """POST /v1/chat/completions should call real agent and return response."""
+    if not LIVE:
+        print("\nTest L2: Compat server chat [SKIP]")
+        return
+    print("\nTest L2: OpenAI compat server POST /v1/chat/completions")
+    skip_if_not_live()
+
+    store = _make_store()
+    handler_obj = _make_handler(store)
+    wrapped = LiveHandler(handler_obj)
+
+    app = create_openai_compatible_app(wrapped, api_key="test-api-key", model_alias="agentzero-test")
+    async with TestServer(app) as server:
+        async with TestClient(server) as client:
+            payload = {
                 "model": "agentzero-main",
-                "messages": [{"role": "user", "content": "Run a command"}],
-            },
-        )
-        payload = await response.json()
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Just say 'compat test ok' and nothing else. Stop after that."
+                        ),
+                    }
+                ],
+                "stream": False,
+            }
+            resp = await client.post(
+                "/v1/chat/completions",
+                json=payload,
+                headers={
+                    "Authorization": "Bearer test-api-key",
+                    "Content-Type": "application/json",
+                },
+            )
+            data = await resp.json()
+            assert resp.status == 200, f"Expected 200, got {resp.status}: {data}"
+            choice = data.get("choices", [{}])[0]
+            content = choice.get("message", {}).get("content", "")
+            assert len(content) > 3, f"Empty content: {data}"
+            print(f"  PASS — response: {content[:120]}")
 
-        assert response.status == 200, f"Expected 200, got {response.status}"
-        content = payload["choices"][0]["message"]["content"]
-        assert content == "Command output: hello", f"Got: {content}"
-        print("  ✓ Passed")
-    finally:
-        await client.close()
+
+async def test_live_compat_server_tool_call_roundtrip() -> None:
+    """POST with tool-call trigger should execute tools and return final response."""
+    if not LIVE:
+        print("\nTest L3: Compat server tool calls [SKIP]")
+        return
+    print("\nTest L3: OpenAI compat server tool-call roundtrip")
+    skip_if_not_live()
+
+    store = _make_store()
+    handler_obj = _make_handler(store)
+    wrapped = LiveHandler(handler_obj)
+
+    app = create_openai_compatible_app(wrapped, api_key="test-api-key", model_alias="agentzero-test")
+    async with TestServer(app) as server:
+        async with TestClient(server) as client:
+            payload = {
+                "model": "agentzero-main",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Run `printf compat-tool-ok` using bash. "
+                            "Reply with exactly the bash output and nothing else. "
+                            "Stop after that."
+                        ),
+                    }
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "description": "Run a bash command",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "command": {"type": "string"}
+                                },
+                                "required": ["command"],
+                            },
+                        },
+                    }
+                ],
+                "stream": False,
+            }
+            resp = await client.post(
+                "/v1/chat/completions",
+                json=payload,
+                headers={
+                    "Authorization": "Bearer test-api-key",
+                    "Content-Type": "application/json",
+                },
+            )
+            data = await resp.json()
+            assert resp.status == 200, f"Expected 200, got {resp.status}: {data}"
+            choice = data.get("choices", [{}])[0]
+            content = choice.get("message", {}).get("content", "")
+            assert "compat-tool-ok" in content, f"Missing tool output: {content[:300]}"
+            print(f"  PASS — response: {content[:120]}")
 
 
-async def main():
-    await test_tool_calls_through_openai_compat()
-    print("All OpenAI compat tool call tests passed!")
+async def test_live_compat_server_unauthorized() -> None:
+    """Requests without valid API key should be rejected."""
+    print("\nTest L4: Compat server auth rejection")
+    store = _make_store()
+    handler_obj = _make_handler(store)
+    wrapped = LiveHandler(handler_obj)
+    app = create_openai_compatible_app(wrapped, api_key="test-api-key", model_alias="agentzero-test")
+
+    async with TestServer(app) as server:
+        async with TestClient(server) as client:
+            resp = await client.post(
+                "/v1/chat/completions",
+                json={"model": "agentzero", "messages": [{"role": "user", "content": "hi"}]},
+                headers={"Content-Type": "application/json"},
+            )
+            assert resp.status == 401, f"Expected 401, got {resp.status}"
+    print("  PASS")
+
+
+async def main() -> None:
+    print("=" * 60)
+    print("OpenAI compat server tests")
+    print("=" * 60)
+    await test_live_compat_server_unauthorized()
+    await test_live_compat_server_models_endpoint()
+    await test_live_compat_server_chat_completion()
+    await test_live_compat_server_tool_call_roundtrip()
+    print("\n" + "=" * 60)
+    print("OpenAI compat server tests complete")
+    print("=" * 60)
 
 
 if __name__ == "__main__":

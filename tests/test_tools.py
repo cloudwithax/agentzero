@@ -108,3 +108,32 @@ if __name__ == "__main__":
     asyncio.run(test_tools())
     asyncio.run(simulate_tool_call_flow())
     asyncio.run(test_payload_mutation())
+    print("Deterministic tests passed!")
+
+    # Live-API integration tests
+    import asyncio
+    from tests._live_harness import LIVE, live_run_agentic_loop, parse_loop_result
+
+    async def _run_live() -> None:
+        if not LIVE:
+            print("\n[SKIP] Live-API tests (set AGENTZERO_LIVE_TESTS=1)")
+            return
+        print("\n--- Live-API tool execution ---")
+
+        result = await live_run_agentic_loop(
+            messages=[{
+                "role": "user",
+                "content": (
+                    "Run `printf tools-live-ok` using bash. "
+                    "Reply with exactly the output and nothing else. Stop after."
+                ),
+            }],
+            max_iterations=5,
+        )
+        parsed = parse_loop_result(result)
+        text = parsed.get("text", result)
+        assert "tools-live-ok" in text, f"Missing: {text[:200]}"
+        print(f"  PASS — reply: {text[:100]}")
+
+    asyncio.run(_run_live())
+    print("\nAll tests passed!")

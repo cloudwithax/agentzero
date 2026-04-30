@@ -8,10 +8,14 @@ import json
 import os
 import re
 import subprocess
+import time
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
 import aiohttp
+
+# Web search cache to avoid redundant API calls per query
+_web_search_cache: dict[str, tuple[dict[str, Any], float]] = {}
 
 from memory import EnhancedMemoryStore
 
@@ -67,8 +71,7 @@ def _resolve_write_path(filepath: str) -> tuple[str, str | None]:
 memory_store: Optional[EnhancedMemoryStore] = None
 consortium_controller: Any = None
 reminder_controller: Any = None
-advisor_controller: Any = None
-reviewer_controller: Any = None
+
 skill_registry: Any = None
 acp_agent: Any = None
 _runtime_session_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
@@ -86,6 +89,10 @@ _send_message_buffer: contextvars.ContextVar[Optional[list[dict[str, Any]]]] = (
         "send_message_buffer",
         default=None,
     )
+)
+_declared_message_count: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
+    "declared_message_count",
+    default=None,
 )
 
 _ASSISTANT_NAME_USER_TEXT_PATTERNS = (
@@ -149,22 +156,20 @@ def set_consortium_controller(controller: Any):
     consortium_controller = controller
 
 
+def set_advisor_controller(controller: Any):
+    """Set the advisor controller (no-op placeholder)."""
+    pass
+
+
+def set_reviewer_controller(controller: Any):
+    """Set the reviewer controller (no-op placeholder)."""
+    pass
+
+
 def set_reminder_controller(controller: Any):
     """Set the reminder task controller used by reminder tools."""
     global reminder_controller
     reminder_controller = controller
-
-
-def set_advisor_controller(controller: Any):
-    """Set the advisor controller used by consult_advisor tool calls."""
-    global advisor_controller
-    advisor_controller = controller
-
-
-def set_reviewer_controller(controller: Any):
-    """Set the reviewer controller used by consult_reviewer tool calls."""
-    global reviewer_controller
-    reviewer_controller = controller
 
 
 def set_skill_registry(registry: Any):
@@ -213,6 +218,26 @@ def init_send_message_buffer():
 def reset_send_message_buffer(token: contextvars.Token):
     """Restore previous send_message buffer context."""
     _send_message_buffer.reset(token)
+
+
+def init_declared_message_count():
+    """Begin tracking declared message count for the current turn."""
+    return _declared_message_count.set(None)
+
+
+def reset_declared_message_count(token: contextvars.Token):
+    """Restore previous declared message count context."""
+    _declared_message_count.reset(token)
+
+
+def get_declared_message_count() -> Optional[int]:
+    """Return the declared message count for the current turn, or None."""
+    return _declared_message_count.get()
+
+
+def set_declared_message_count(count: int):
+    """Set the declared message count for the current turn."""
+    return _declared_message_count.set(int(count))
 
 
 def get_send_message_buffer() -> list[dict[str, Any]]:
@@ -822,38 +847,6 @@ async def consortium_status_tool(task_id: Optional[str] = None):
         return {"success": False, "error": str(e)}
 
 
-async def consult_advisor_tool(question: str, context: str = ""):
-    """Consult the advisor model for a concise plan on a hard decision."""
-    try:
-        if advisor_controller is None:
-            return {"success": False, "error": "Advisor controller not initialized"}
-
-        return await advisor_controller.consult_advisor(
-            question=question,
-            context=context,
-            session_id=_runtime_session_id.get(),
-            shared_messages=_runtime_messages.get(),
-        )
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-async def consult_reviewer_tool(question: str, context: str = ""):
-    """Consult the reviewer model for a concise risk review."""
-    try:
-        if reviewer_controller is None:
-            return {"success": False, "error": "Reviewer controller not initialized"}
-
-        return await reviewer_controller.consult_reviewer(
-            question=question,
-            context=context,
-            session_id=_runtime_session_id.get(),
-            shared_messages=_runtime_messages.get(),
-        )
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
 async def reminder_create_tool(
     cron: str,
     message: str = "",
@@ -1030,23 +1023,28 @@ def parse_search_results(text: str) -> list:
 
 # Web search tool using MCP protocol (stateless - no API key required)
 async def web_search_tool(
-    query: str, numResults: int = 10, category: Optional[str] = None, type: str = "auto"
+    query: str, numResults: int = 5, category: Optional[str] = None, type: str = "auto"
 ):
     """Search the web using Exa MCP server (no API key required, has rate limits).
 
     Args:
         query: The search query string
-        numResults: Number of results to return (1-100, default: 10)
+        numResults: Number of results to return (1-100, default: 5)
         category: Optional category filter (company, research paper, news, people)
         type: Search type (auto, neural, fast, deep, deep-reasoning, instant)
     """
     try:
-        # Build tool arguments
+        # Quick cache check — avoid redundant API calls
+        cache_key = f"{query.lower().strip()}:{numResults}:{category or ''}"
+        if cache_key in _web_search_cache:
+            cached_result, cached_at = _web_search_cache[cache_key]
+            if time.time() - cached_at < 300:  # 5 min cache
+                return cached_result
+
         arguments = {"query": query, "numResults": min(max(numResults, 1), 100)}
         if category:
             arguments["category"] = category
 
-        # Call the tool via MCP
         tool_payload = {
             "jsonrpc": "2.0",
             "id": 1,
@@ -1062,7 +1060,7 @@ async def web_search_tool(
                     "Accept": "application/json, text/event-stream",
                 },
                 json=tool_payload,
-                timeout=aiohttp.ClientTimeout(total=60),
+                timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()
@@ -1094,14 +1092,15 @@ async def web_search_tool(
                 # Parse structured results
                 search_results = parse_search_results(full_text)
 
-                # Also include the raw formatted text
-                return {
+                result_data = {
                     "success": True,
                     "query": query,
                     "resultCount": len(search_results),
                     "results": search_results[:numResults],
                     "formatted_text": full_text[:5000] if full_text else "",
                 }
+                _web_search_cache[cache_key] = (result_data, time.time())
+                return result_data
 
     except aiohttp.ClientError as e:
         return {"success": False, "error": f"Network error: {str(e)}"}
@@ -1209,6 +1208,22 @@ async def add_skill_tool(url: str, auto_activate: bool = True):
         return {"success": False, "error": str(e)}
 
 
+async def declare_message_count_tool(count: int):
+    """Declare how many send_message calls will be made this turn.
+
+    Call this BEFORE any send_message calls. After sending all declared
+    messages, output <DONE> on its own line to signal completion.
+    """
+    try:
+        value = int(count)
+        if value < 0:
+            return {"success": False, "error": "count must be non-negative"}
+        set_declared_message_count(value)
+        return {"success": True, "declared_count": value}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 async def send_message_tool(
     text: str,
     attachments: Optional[list[str]] = None,
@@ -1248,7 +1263,7 @@ async def send_message_tool(
 
     try:
         if session_id.startswith("imessage_"):
-            phone_number = session_id[len("imessage_"):]
+            phone_number = session_id[len("imessage_") :]
             try:
                 from integrations import send_imessage
             except Exception as import_error:
@@ -1669,8 +1684,6 @@ TOOLS = {
     "send_tapback": send_tapback_tool,
     "send_reaction": send_tapback_tool,
     "send_telegram_reaction": send_telegram_reaction_tool,
-    "consult_advisor": consult_advisor_tool,
-    "consult_reviewer": consult_reviewer_tool,
     "consortium_start": consortium_start_tool,
     "consortium_stop": consortium_stop_tool,
     "consortium_status": consortium_status_tool,
@@ -1728,8 +1741,6 @@ def validate_tool_args(func_name: str, func_args: dict) -> tuple:
         "send_tapback": ["message_handle", "reaction"],
         "send_reaction": ["message_handle", "reaction"],
         "send_telegram_reaction": ["chat_id", "message_id", "reaction"],
-        "consult_advisor": ["question"],
-        "consult_reviewer": ["question"],
         "consortium_start": ["task"],
         "consortium_stop": ["task_id"],
         "consortium_status": [],

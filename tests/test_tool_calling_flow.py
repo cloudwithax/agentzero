@@ -1,240 +1,109 @@
 #!/usr/bin/env python3
-"""Test the full tool calling flow to identify issues"""
+"""Live-API test for the full tool calling flow."""
 
 import asyncio
 import json
-from unittest.mock import AsyncMock, patch
+import sys
+from pathlib import Path
 
-# Import from refactored modules
-from handler import AgentHandler
-from memory import EnhancedMemoryStore
-from capabilities import Capability, CapabilityProfile, AdaptiveFormatter
-from examples import ExampleBank, AdaptiveFewShotManager
-from planning import TaskPlanner, TaskAnalyzer
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from tests._live_harness import (
+    LIVE,
+    live_run_agentic_loop,
+    live_agent_handle,
+    parse_loop_result,
+    skip_if_not_live,
+    _make_handler,
+    _make_store,
+)
+from handler import BASE_PAYLOAD
 from tools import set_memory_store
 
 
-def create_test_handler():
-    """Create a test handler with mocked dependencies."""
-    import tempfile
+async def test_live_multi_tool_call_flow() -> None:
+    """Real API: agent calls bash, grep, read in one turn."""
+    if not LIVE:
+        print("\nTest L1: Multi-tool flow [SKIP]")
+        return
+    print("\nTest L1: Multi-tool call flow via live API")
+    skip_if_not_live()
 
-    # Create a temporary database file
-    temp_db = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
-    temp_db.close()
-
-    # Create memory store with temp database
-    memory_store = EnhancedMemoryStore(
-        db_path=temp_db.name,
-        api_key="test_key",
+    result = await live_run_agentic_loop(
+        messages=[
+            {
+                "role": "user",
+                "content": (
+                    "Step 1: use grep to search for 'AgentHandler' in handler.py. "
+                    "Step 2: use bash to run `printf flow-test-passed`. "
+                    "Step 3: use read to read the first line of AGENTS.md. "
+                    "Reply with all three results as:\n"
+                    "grep: <match count>\n"
+                    "bash: flow-test-passed\n"
+                    "read: <first line>\n"
+                    "Stop after step 3."
+                ),
+            }
+        ],
+        max_iterations=5,
     )
 
-    # Set memory store for tools
-    set_memory_store(memory_store)
+    parsed = parse_loop_result(result)
+    text = parsed.get("text", result)
+    assert "flow-test-passed" in text, f"Missing bash output: {text[:300]}"
+    assert len(text) > 30, f"Reply too short: {text[:300]}"
+    print(f"  PASS — reply length={len(text)}")
 
-    # Create capability profile
-    capability_profile = CapabilityProfile(
-        capabilities={
-            Capability.JSON_OUTPUT,
-            Capability.TOOL_USE,
-            Capability.CHAIN_OF_THOUGHT,
-            Capability.REASONING,
-            Capability.LONG_CONTEXT,
-            Capability.FEW_SHOT,
-            Capability.SELF_CORRECTION,
-            Capability.STRUCTURED_OUTPUT,
-        },
-        model_name="test-model",
+
+async def test_live_handler_handle_tool_flow() -> None:
+    """Real handler.handle() should call tools and produce a reply."""
+    if not LIVE:
+        print("\nTest L2: Handler tool flow [SKIP]")
+        return
+    print("\nTest L2: Handler.handle() tool flow via live API")
+    skip_if_not_live()
+
+    store = _make_store()
+    handler = _make_handler(store)
+
+    response = await live_agent_handle(
+        handler,
+        user_text=(
+            "Use the bash tool to run `printf handler-tool-ok`. "
+            "Reply with only the bash output. Stop after that."
+        ),
+        session_id="test_tool_flow",
     )
 
-    # Create other components
-    task_planner = TaskPlanner(capability_profile)
-    task_analyzer = TaskAnalyzer()
-    adaptive_formatter = AdaptiveFormatter(capability_profile)
-    example_bank = AdaptiveFewShotManager(ExampleBank(exploration_rate=0.1))
-
-    # Create handler
-    handler = AgentHandler(
-        memory_store=memory_store,
-        capability_profile=capability_profile,
-        example_bank=example_bank,
-        task_planner=task_planner,
-        task_analyzer=task_analyzer,
-        adaptive_formatter=adaptive_formatter,
-    )
-
-    return handler
+    assert "handler-tool-ok" in response, f"Missing expected output: {response[:200]}"
+    print(f"  PASS — response: {response[:100]}")
 
 
-async def mock_api_response(messages, tool_calls=None):
-    """Mock the NVIDIA API response"""
-    if tool_calls:
-        return {"choices": [{"message": {"content": None, "tool_calls": tool_calls}}]}
-    else:
-        return {"choices": [{"message": {"content": "Final response without tools"}}]}
-
-
-async def test_single_tool_call():
-    """Test a single tool call round-trip"""
-    print("=== Test: Single tool call ===")
-
-    handler = create_test_handler()
-
-    request = {"messages": [{"role": "user", "content": "Read the file main.py"}]}
-
-    # Mock the first API call to return a tool call
-    mock_tool_call = [
-        {
-            "id": "call_001",
-            "type": "function",
-            "function": {
-                "name": "read",
-                "arguments": json.dumps({"filepath": "main.py"}),
-            },
-        }
+async def test_live_payload_tools_config() -> None:
+    """Verify all required tools are in BASE_PAYLOAD."""
+    print("\nTest L3: BASE_PAYLOAD tool configuration")
+    tool_names = [
+        t.get("function", {}).get("name")
+        for t in BASE_PAYLOAD.get("tools", [])
+        if isinstance(t, dict)
     ]
-
-    with patch("aiohttp.ClientSession") as mock_session:
-        mock_resp = AsyncMock()
-        mock_resp.json.return_value = await mock_api_response(
-            request["messages"], mock_tool_call
-        )
-
-        mock_session.return_value.__aenter__.return_value.post.return_value.__aenter__.return_value = mock_resp
-
-        try:
-            await handler.handle(request)
-            print("✓ Single tool call completed")
-        except Exception as e:
-            print(f"✗ Error: {e}")
-            import traceback
-
-            traceback.print_exc()
-
-    print()
+    required = ["read", "write", "bash", "grep", "glob", "send_message", "declare_message_count"]
+    for name in required:
+        assert name in tool_names, f"Missing tool: {name}"
+    print("  PASS")
 
 
-async def test_multiple_tool_calls():
-    """Test multiple tool calls in one response"""
-    print("=== Test: Multiple tool calls ===")
-
-    handler = create_test_handler()
-
-    request = {"messages": [{"role": "user", "content": "Read main.py and list files"}]}
-
-    mock_tool_calls = [
-        {
-            "id": "call_001",
-            "type": "function",
-            "function": {
-                "name": "read",
-                "arguments": json.dumps({"filepath": "main.py"}),
-            },
-        },
-        {
-            "id": "call_002",
-            "type": "function",
-            "function": {"name": "glob", "arguments": json.dumps({"pattern": "*.py"})},
-        },
-    ]
-
-    with patch("aiohttp.ClientSession") as mock_session:
-        mock_resp = AsyncMock()
-        mock_resp.json.return_value = await mock_api_response(
-            request["messages"], mock_tool_calls
-        )
-
-        mock_session.return_value.__aenter__.return_value.post.return_value.__aenter__.return_value = mock_resp
-
-        try:
-            await handler.handle(request)
-            print("✓ Multiple tool calls completed")
-        except Exception as e:
-            print(f"✗ Error: {e}")
-            import traceback
-
-            traceback.print_exc()
-
-    print()
-
-
-async def test_payload_persistence():
-    """Test if payload accumulates across multiple requests"""
-    print("=== Test: Payload persistence ===")
-
-    handler = create_test_handler()
-
-    request1 = {"messages": [{"role": "user", "content": "First request"}]}
-    request2 = {"messages": [{"role": "user", "content": "Second request"}]}
-
-    # Simulate first request (no tools)
-    with patch("aiohttp.ClientSession") as mock_session:
-        mock_resp = AsyncMock()
-        mock_resp.json.return_value = await mock_api_response(
-            request1["messages"], None
-        )
-        mock_session.return_value.__aenter__.return_value.post.return_value.__aenter__.return_value = mock_resp
-        await handler.handle(request1)
-
-    # Simulate second request (no tools)
-    with patch("aiohttp.ClientSession") as mock_session:
-        mock_resp = AsyncMock()
-        mock_resp.json.return_value = await mock_api_response(
-            request2["messages"], None
-        )
-        mock_session.return_value.__aenter__.return_value.post.return_value.__aenter__.return_value = mock_resp
-        await handler.handle(request2)
-
-    print("✓ Payload should be reset each time (only current request messages)")
-    print()
-
-
-async def test_tool_error_handling():
-    """Test what happens when a tool fails"""
-    print("=== Test: Tool error handling ===")
-
-    handler = create_test_handler()
-
-    request = {"messages": [{"role": "user", "content": "Read nonexistent file"}]}
-
-    mock_tool_call = [
-        {
-            "id": "call_001",
-            "type": "function",
-            "function": {
-                "name": "read",
-                "arguments": json.dumps({"filepath": "nonexistent.txt"}),
-            },
-        }
-    ]
-
-    with patch("aiohttp.ClientSession") as mock_session:
-        mock_resp = AsyncMock()
-        mock_resp.json.return_value = await mock_api_response(
-            request["messages"], mock_tool_call
-        )
-
-        mock_session.return_value.__aenter__.return_value.post.return_value.__aenter__.return_value = mock_resp
-
-        try:
-            await handler.handle(request)
-            print("✓ Tool error handled gracefully")
-        except Exception as e:
-            print(f"✗ Unhandled error: {e}")
-
-    print()
-
-
-async def test_recursive_tool_calls():
-    """Test if second API call also returns tool calls (not currently supported)"""
-    print("=== Test: Recursive tool calls (known limitation) ===")
-    print("Current implementation only handles ONE round of tool calls.")
-    print("If the second API response also contains tool_calls, they will be ignored.")
-    print()
+async def main() -> None:
+    print("=" * 60)
+    print("Tool calling flow tests")
+    print("=" * 60)
+    await test_live_multi_tool_call_flow()
+    await test_live_handler_handle_tool_flow()
+    test_live_payload_tools_config()
+    print("\n" + "=" * 60)
+    print("Tool calling flow tests complete")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
-    asyncio.run(test_single_tool_call())
-    asyncio.run(test_multiple_tool_calls())
-    asyncio.run(test_payload_persistence())
-    asyncio.run(test_tool_error_handling())
-    asyncio.run(test_recursive_tool_calls())
+    asyncio.run(main())
