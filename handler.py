@@ -438,6 +438,104 @@ BASE_PAYLOAD = {
         {
                             "type": "function",
                             "function": {
+                                "name": "send_message",
+                                "description": "Send a plain-text message to the user via the active chat channel (iMessage or Telegram). Use this when you need to deliver a direct message.",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "text": {
+                                            "type": "string",
+                                            "description": "The message text to send",
+                                        },
+                                    },
+                                    "required": ["text"],
+                                },
+                            },
+                        },
+        {
+                            "type": "function",
+                            "function": {
+                                "name": "declare_message_count",
+                                "description": "Declare how many send_message calls will be made this turn. Call this BEFORE any send_message calls. After sending all declared messages, output <DONE> to signal completion.",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "count": {
+                                            "type": "integer",
+                                            "description": "The number of send_message calls that will be made this turn",
+                                        },
+                                    },
+                                    "required": ["count"],
+                                },
+                            },
+                        },
+        {
+                            "type": "function",
+                            "function": {
+                                "name": "send_tapback",
+                                "description": "Send an iMessage tapback reaction (like, dislike, love, laugh, emphasize, question) to a message by its handle",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "message_handle": {
+                                            "type": "string",
+                                            "description": "The iMessage message handle (available in [Available iMessage tapback handles])",
+                                        },
+                                        "reaction": {
+                                            "type": "string",
+                                            "enum": ["like", "dislike", "love", "laugh", "emphasize", "question"],
+                                            "description": "The tapback reaction to send",
+                                        },
+                                    },
+                                    "required": ["message_handle", "reaction"],
+                                },
+                            },
+                        },
+        {
+                            "type": "function",
+                            "function": {
+                                "name": "send_telegram_reaction",
+                                "description": "Send a Telegram emoji reaction to a message",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "chat_id": {
+                                            "type": "string",
+                                            "description": "The Telegram chat ID (available in [Available Telegram reaction targets])",
+                                        },
+                                        "message_id": {
+                                            "type": "string",
+                                            "description": "The Telegram message ID to react to",
+                                        },
+                                        "reaction": {
+                                            "type": "string",
+                                            "description": "The emoji reaction to send (e.g. 👍, ❤️, 😂)",
+                                        },
+                                    },
+                                    "required": ["chat_id", "message_id", "reaction"],
+                                },
+                            },
+                        },
+        {
+                            "type": "function",
+                            "function": {
+                                "name": "activate_skill",
+                                "description": "Activate an installed skill for the current session so its instructions are loaded into the system prompt",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {
+                                            "type": "string",
+                                            "description": "The name of the skill to activate",
+                                        },
+                                    },
+                                    "required": ["name"],
+                                },
+                            },
+                        },
+        {
+                            "type": "function",
+                            "function": {
                                 "name": "add_skill",
                                 "description": (
                                     "Fetch a skill from a URL, scan it for prompt-injection attacks, "
@@ -509,6 +607,205 @@ BASE_PAYLOAD = {
                                         },
                                     },
                                     "required": ["question"],
+                                },
+                            },
+                        },
+        {
+                            "type": "function",
+                            "function": {
+                                "name": "consortium_start",
+                                "description": (
+                                    "Start a consortium task where multiple internal models deliberate "
+                                    "and converge on a shared verdict. Use for complex reasoning, "
+                                    "critical decisions, fact-checking, or multi-perspective analysis."
+                                ),
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "task": {
+                                            "type": "string",
+                                            "description": "The question, decision, or task for the consortium to resolve",
+                                        },
+                                        "context": {
+                                            "type": "string",
+                                            "description": "Optional context or constraints for the consortium",
+                                        },
+                                        "members": {
+                                            "type": "array",
+                                            "items": {"type": "string"},
+                                            "description": "Optional list of consortium member names to include",
+                                        },
+                                        "max_rounds": {
+                                            "type": "integer",
+                                            "description": "Maximum deliberation rounds (default: 4)",
+                                        },
+                                    },
+                                    "required": ["task"],
+                                },
+                            },
+                        },
+        {
+                            "type": "function",
+                            "function": {
+                                "name": "consortium_stop",
+                                "description": "Stop a running consortium task by its task ID",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "task_id": {
+                                            "type": "string",
+                                            "description": "The consortium task ID to stop",
+                                        },
+                                    },
+                                    "required": ["task_id"],
+                                },
+                            },
+                        },
+        {
+                            "type": "function",
+                            "function": {
+                                "name": "consortium_status",
+                                "description": "Get status for all consortium tasks or a specific one",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "task_id": {
+                                            "type": "string",
+                                            "description": "Optional task ID to check. Omit to list all tasks.",
+                                        },
+                                    },
+                                },
+                            },
+                        },
+        {
+                            "type": "function",
+                            "function": {
+                                "name": "reminder_create",
+                                "description": (
+                                    "Create a scheduled reminder task. Use 'run_at' (Unix timestamp in seconds) "
+                                    "for short-duration one-off tasks (e.g. remind me in 20 seconds). "
+                                    "Use 'cron' (5-field cron expression) for recurring tasks. "
+                                    "Set 'run_ai'=true with an 'ai_prompt' to have the model generate text at "
+                                    "execution time. Set 'run_ai_with_tools'=true to give the AI full tool access "
+                                    "during scheduled execution. Always set 'session_id' so the output can be "
+                                    "delivered back to the correct chat channel."
+                                ),
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "cron": {
+                                            "type": "string",
+                                            "description": "5-field cron expression (minute hour day month weekday). Required unless run_at is provided. Use for recurring tasks.",
+                                        },
+                                        "run_at": {
+                                            "type": "integer",
+                                            "description": "Unix timestamp (seconds since epoch) for the first/only execution. Preferred for short-duration one-off tasks. If combined with cron, sets the first execution time.",
+                                        },
+                                        "message": {
+                                            "type": "string",
+                                            "description": "Static message to deliver when the task fires (used when run_ai is false)",
+                                        },
+                                        "session_id": {
+                                            "type": "string",
+                                            "description": "The chat session to deliver output to (e.g. 'tg_12345' or 'imessage_...'). Defaults to the current session.",
+                                        },
+                                        "one_off": {
+                                            "type": "boolean",
+                                            "description": "If true, the task runs once then auto-completes. Implied when only run_at is provided.",
+                                        },
+                                        "run_ai": {
+                                            "type": "boolean",
+                                            "description": "If true, the AI model generates the output at execution time using ai_prompt",
+                                        },
+                                        "ai_prompt": {
+                                            "type": "string",
+                                            "description": "The prompt for the AI to generate output at execution time. Required when run_ai is true.",
+                                        },
+                                        "run_ai_with_tools": {
+                                            "type": "boolean",
+                                            "description": "If true, the AI has full tool access during scheduled execution (bash, read, write, web_search, etc.)",
+                                        },
+                                        "task_id": {
+                                            "type": "string",
+                                            "description": "Optional custom task ID (letters, numbers, hyphens, underscores)",
+                                        },
+                                        "name": {
+                                            "type": "string",
+                                            "description": "Optional human-readable name for this task",
+                                        },
+                                    },
+                                    "required": [],
+                                },
+                            },
+                        },
+        {
+                            "type": "function",
+                            "function": {
+                                "name": "reminder_list",
+                                "description": "List all scheduled reminder tasks with their status and next run times",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "include_disabled": {
+                                            "type": "boolean",
+                                            "description": "Include disabled/cancelled tasks (default: true)",
+                                        },
+                                    },
+                                },
+                            },
+                        },
+        {
+                            "type": "function",
+                            "function": {
+                                "name": "reminder_status",
+                                "description": "Get detailed status for a single reminder task",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "task_id": {
+                                            "type": "string",
+                                            "description": "The task ID to check",
+                                        },
+                                    },
+                                    "required": ["task_id"],
+                                },
+                            },
+                        },
+        {
+                            "type": "function",
+                            "function": {
+                                "name": "reminder_cancel",
+                                "description": "Cancel a scheduled reminder task",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "task_id": {
+                                            "type": "string",
+                                            "description": "The task ID to cancel",
+                                        },
+                                        "reason": {
+                                            "type": "string",
+                                            "description": "Optional reason for cancellation",
+                                        },
+                                    },
+                                    "required": ["task_id"],
+                                },
+                            },
+                        },
+        {
+                            "type": "function",
+                            "function": {
+                                "name": "reminder_run_now",
+                                "description": "Run a scheduled reminder task immediately instead of waiting for its next scheduled time",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "task_id": {
+                                            "type": "string",
+                                            "description": "The task ID to execute immediately",
+                                        },
+                                    },
+                                    "required": ["task_id"],
                                 },
                             },
                         }
@@ -685,7 +982,7 @@ class AgentHandler:
 
     async def create_reminder_task(
         self,
-        cron: str,
+        cron: str = "",
         message: str = "",
         session_id: Optional[str] = None,
         one_off: bool = False,
@@ -693,6 +990,8 @@ class AgentHandler:
         ai_prompt: str = "",
         task_id: Optional[str] = None,
         name: str = "",
+        run_at: Optional[int] = None,
+        run_ai_with_tools: bool = False,
     ) -> dict[str, Any]:
         """Create one reminder task."""
         return await self.reminder_scheduler.create_task(
@@ -704,6 +1003,8 @@ class AgentHandler:
             ai_prompt=ai_prompt,
             task_id=task_id,
             name=name,
+            run_at=run_at,
+            run_ai_with_tools=run_ai_with_tools,
         )
 
     async def list_reminder_tasks(
@@ -731,17 +1032,26 @@ class AgentHandler:
         """Run one reminder task immediately."""
         return await self.reminder_scheduler.run_task_now(task_id=task_id)
 
-    async def _run_direct_ai_inference(self, prompt: str, task_id: str) -> str:
-        """Run direct AI inference for reminder tasks with tools disabled."""
+    async def _run_direct_ai_inference(
+        self, prompt: str, task_id: str, run_ai_with_tools: bool = False
+    ) -> str:
+        """Run AI inference for scheduled tasks.
+
+        When *run_ai_with_tools* is False (default), the model runs without
+        tool access (``tools=[]``).  When True the full payload tool schema
+        is available so the scheduled agent can read files, execute bash,
+        search the web, and call any other registered tool.
+        """
         prompt_text = str(prompt or "").strip()
         if not prompt_text:
             return ""
 
         system_content = get_template("direct_inference", {})
 
-        payload = BASE_PAYLOAD.copy()
+        payload = self._build_request_payload_template()
         payload["model"] = MODEL_ID
-        payload["tools"] = []
+        if not run_ai_with_tools:
+            payload["tools"] = []
         payload["messages"] = [
             {"role": "system", "content": system_content},
             {

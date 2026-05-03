@@ -4,6 +4,7 @@
 import asyncio
 import datetime
 import tempfile
+import time
 
 import reminder_tasks as reminder_module
 from memory import EnhancedMemoryStore
@@ -67,7 +68,7 @@ async def test_recurring_ai_task_runs() -> None:
 
     deliveries: list[tuple[str, str]] = []
 
-    async def fake_ai_runner(prompt: str, task_id: str) -> str:
+    async def fake_ai_runner(prompt: str, task_id: str, _run_ai_with_tools: bool = False) -> str:
         return f"AI output for {task_id}: {prompt}"
 
     async def fake_delivery_callback(session_id: str, output: str) -> dict:
@@ -211,6 +212,96 @@ async def test_reminders_persist_to_db_and_reload_on_startup() -> None:
     assert task["enabled"] is True, task
 
 
+async def test_unix_timestamp_run_at_creates_one_off() -> None:
+    """A task created with run_at (Unix timestamp) should be one-off and fire at the right time."""
+    scheduler = _build_scheduler()
+    future_ts = int(time.time()) + 3600  # 1 hour from now
+    created = await scheduler.create_task(
+        run_at=future_ts,
+        message="timestamp-based reminder",
+        task_id="ts_reminder",
+    )
+    assert created["success"], created
+    task = created["task"]
+    assert task["one_off"] is True, task
+    assert task["enabled"] is True, task
+    # next_run_at should be roughly 1 hour from now
+    next_run = datetime.datetime.fromisoformat(task["next_run_at"])
+    expected = datetime.datetime.fromtimestamp(future_ts, tz=datetime.timezone.utc)
+    diff = abs((next_run - expected).total_seconds())
+    assert diff < 2, f"next_run_at off by {diff}s: {task['next_run_at']} vs {expected.isoformat()}"
+
+
+async def test_run_at_rejects_past_timestamp() -> None:
+    """A task with a past run_at timestamp should be rejected."""
+    scheduler = _build_scheduler()
+    past_ts = int(time.time()) - 60  # 1 minute ago
+    created = await scheduler.create_task(
+        run_at=past_ts,
+        message="should fail",
+        task_id="past_ts_task",
+    )
+    assert created["success"] is False, created
+    assert "run_at must be in the future" in created["error"], created
+
+
+async def test_run_ai_with_tools_flag_passthrough() -> None:
+    """The run_ai_with_tools flag should be captured in task metadata and passed to the AI runner."""
+
+    runner_calls: list[tuple] = []
+
+    async def tool_aware_runner(prompt: str, task_id: str, run_ai_with_tools: bool) -> str:
+        runner_calls.append((prompt, task_id, run_ai_with_tools))
+        return f"tools={run_ai_with_tools}"
+
+    scheduler = _build_scheduler(ai_runner=tool_aware_runner)
+    created = await scheduler.create_task(
+        cron="* * * * *",
+        run_ai=True,
+        ai_prompt="Test prompt",
+        run_ai_with_tools=True,
+        task_id="tool_task",
+        one_off=True,
+    )
+    assert created["success"], created
+    assert created["task"]["run_ai_with_tools"] is True, created["task"]
+
+    await scheduler.run_task_now("tool_task")
+    assert len(runner_calls) == 1, runner_calls
+    assert runner_calls[0][2] is True  # run_ai_with_tools flag
+
+
+async def test_reminder_create_tool_passes_run_at() -> None:
+    """The tool layer should pass run_at and run_ai_with_tools to the controller."""
+
+    class FakeReminderController:
+        def __init__(self):
+            self.calls: list[dict] = []
+
+        async def create_reminder_task(self, **kwargs):
+            self.calls.append(kwargs)
+            return {"success": True, "task": kwargs}
+
+    controller = FakeReminderController()
+    set_reminder_controller(controller)
+    token = set_tool_runtime_session("tg_789")
+    try:
+        future_ts = int(time.time()) + 120
+        result = await reminder_create_tool(
+            run_at=future_ts,
+            message="timestamp scheduled",
+            run_ai_with_tools=True,
+        )
+    finally:
+        reset_tool_runtime_session(token)
+        set_reminder_controller(None)
+
+    assert result["success"], result
+    assert controller.calls[0]["run_at"] == future_ts, controller.calls[0]
+    assert controller.calls[0]["run_ai_with_tools"] is True, controller.calls[0]
+    assert controller.calls[0]["session_id"] == "tg_789", controller.calls[0]
+
+
 if __name__ == "__main__":
     test_cron_expression_parser()
     asyncio.run(test_one_off_task_completes())
@@ -220,4 +311,8 @@ if __name__ == "__main__":
     asyncio.run(test_one_off_same_day_prefers_today())
     asyncio.run(test_one_off_same_day_past_time_is_rejected())
     asyncio.run(test_reminders_persist_to_db_and_reload_on_startup())
+    asyncio.run(test_unix_timestamp_run_at_creates_one_off())
+    asyncio.run(test_run_at_rejects_past_timestamp())
+    asyncio.run(test_run_ai_with_tools_flag_passthrough())
+    asyncio.run(test_reminder_create_tool_passes_run_at())
     print("Reminder scheduler tests passed")

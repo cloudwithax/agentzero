@@ -19,6 +19,28 @@ def _utc_now() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone.utc)
 
 
+def _validate_unix_timestamp(value: Any) -> Optional[datetime.datetime]:
+    """Validate and convert a Unix timestamp (seconds) to a UTC datetime.
+
+    Returns ``None`` when the value is absent/invalid so callers can
+    distinguish 'not provided' from 'provided but invalid'.
+    """
+    if value is None:
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    if seconds < 0:
+        return None
+    try:
+        return datetime.datetime.fromtimestamp(
+            seconds, tz=datetime.timezone.utc
+        )
+    except (ValueError, OverflowError):
+        return None
+
+
 def _parse_iso_datetime(value: Any) -> Optional[datetime.datetime]:
     """Parse an ISO datetime string with timezone awareness."""
     if not value:
@@ -280,7 +302,7 @@ class ReminderScheduler:
     def __init__(
         self,
         memory_store: EnhancedMemoryStore,
-        ai_runner: Optional[Callable[[str, str], Awaitable[str]]] = None,
+        ai_runner: Optional[Callable[[str, str, bool], Awaitable[str]]] = None,
         delivery_callback: Optional[
             Callable[[str, str], Awaitable[dict[str, Any]]]
         ] = None,
@@ -325,7 +347,7 @@ class ReminderScheduler:
 
     async def create_task(
         self,
-        cron: str,
+        cron: str = "",
         message: str = "",
         session_id: Optional[str] = None,
         one_off: bool = False,
@@ -333,18 +355,25 @@ class ReminderScheduler:
         ai_prompt: str = "",
         task_id: Optional[str] = None,
         name: str = "",
+        run_at: Optional[int] = None,
+        run_ai_with_tools: bool = False,
     ) -> dict[str, Any]:
-        """Create and persist a reminder task."""
+        """Create and persist a reminder task.
+
+        Supports two scheduling modes:
+
+        * **Unix timestamp** (``run_at``): preferred for short-duration one-off tasks
+          (e.g. 20 seconds from now).  When ``run_at`` is provided the task is
+          automatically treated as one-off regardless of the ``one_off`` flag.
+
+        * **Cron expression** (``cron``): preferred for recurring tasks.  Combined
+          with ``run_at`` the timestamp sets the first execution time and the cron
+          expression controls subsequent repeats.
+        """
         await self.start()
 
+        run_at_value = _validate_unix_timestamp(run_at)
         cron_expression = str(cron or "").strip()
-        if not cron_expression:
-            return {"success": False, "error": "cron is required"}
-
-        try:
-            parser = CronExpression(cron_expression)
-        except ValueError as exc:
-            return {"success": False, "error": f"invalid cron: {exc}"}
 
         normalized_name = str(name or "").strip()
         normalized_message = str(message or "").strip()
@@ -371,16 +400,39 @@ class ReminderScheduler:
             normalized_task_id = self._generate_task_id()
 
         now = _utc_now()
-        next_run, next_run_error = self._resolve_initial_next_run(
-            parser=parser,
-            now=now,
-            one_off=bool(one_off),
-        )
-        if next_run is None:
-            return {
-                "success": False,
-                "error": next_run_error or "unable to compute next run time",
-            }
+        if run_at_value is not None:
+            # Unix timestamp scheduling — short-duration / one-off path.
+            next_run = run_at_value
+            if run_at_value <= now:
+                return {
+                    "success": False,
+                    "error": "run_at must be in the future",
+                }
+            # When run_at is the sole scheduling method, treat as one-off.
+            if not cron_expression:
+                one_off = True
+            # Store the human-readable cron or a placeholder.
+            stored_cron = cron_expression or "@timestamp"
+        else:
+            if not cron_expression:
+                return {"success": False, "error": "cron or run_at is required"}
+
+            try:
+                parser = CronExpression(cron_expression)
+            except ValueError as exc:
+                return {"success": False, "error": f"invalid cron: {exc}"}
+
+            next_run, next_run_error = self._resolve_initial_next_run(
+                parser=parser,
+                now=now,
+                one_off=bool(one_off),
+            )
+            if next_run is None:
+                return {
+                    "success": False,
+                    "error": next_run_error or "unable to compute next run time",
+                }
+            stored_cron = cron_expression
 
         async with self._lock:
             if normalized_task_id in self._tasks:
@@ -393,12 +445,13 @@ class ReminderScheduler:
             task = {
                 "task_id": normalized_task_id,
                 "name": normalized_name,
-                "cron": cron_expression,
+                "cron": stored_cron,
                 "message": normalized_message,
                 "session_id": str(session_id or "").strip() or None,
                 "one_off": bool(one_off),
                 "run_ai": bool(run_ai),
                 "ai_prompt": normalized_prompt,
+                "run_ai_with_tools": bool(run_ai_with_tools),
                 "status": "active",
                 "enabled": True,
                 "run_count": 0,
@@ -595,6 +648,7 @@ class ReminderScheduler:
             cron = str(task.get("cron", "")).strip()
             max_runs = int(task.get("max_runs", 0) or 0)
             previous_run_count = int(task.get("run_count", 0) or 0)
+            run_ai_with_tools = bool(task.get("run_ai_with_tools", False))
 
         now = _utc_now()
         run_error = ""
@@ -604,7 +658,9 @@ class ReminderScheduler:
             if run_ai:
                 if not self.ai_runner:
                     raise RuntimeError("AI runner not configured")
-                output = await self.ai_runner(ai_prompt, task_id)
+                output = await self.ai_runner(
+                    ai_prompt, task_id, run_ai_with_tools
+                )
             else:
                 output = message
         except Exception as exc:
@@ -704,10 +760,12 @@ class ReminderScheduler:
             if not task_id or not cron:
                 continue
 
-            try:
-                CronExpression(cron)
-            except Exception:
-                continue
+            # Skip cron validation for @timestamp placeholder tasks.
+            if cron != "@timestamp":
+                try:
+                    CronExpression(cron)
+                except Exception:
+                    continue
 
             loaded_tasks[task_id] = {
                 "task_id": task_id,
@@ -718,6 +776,7 @@ class ReminderScheduler:
                 "one_off": bool(item.get("one_off", False)),
                 "run_ai": bool(item.get("run_ai", False)),
                 "ai_prompt": str(item.get("ai_prompt", "")).strip(),
+                "run_ai_with_tools": bool(item.get("run_ai_with_tools", False)),
                 "status": str(item.get("status", "active")),
                 "enabled": bool(item.get("enabled", True)),
                 "run_count": int(item.get("run_count", 0) or 0),
@@ -772,6 +831,7 @@ class ReminderScheduler:
                     "one_off": bool(task.get("one_off", False)),
                     "run_ai": bool(task.get("run_ai", False)),
                     "ai_prompt": task.get("ai_prompt"),
+                    "run_ai_with_tools": bool(task.get("run_ai_with_tools", False)),
                     "status": task.get("status"),
                     "enabled": bool(task.get("enabled", False)),
                     "run_count": int(task.get("run_count", 0) or 0),
@@ -815,6 +875,7 @@ class ReminderScheduler:
             "session_id": task.get("session_id"),
             "one_off": bool(task.get("one_off", False)),
             "run_ai": bool(task.get("run_ai", False)),
+            "run_ai_with_tools": bool(task.get("run_ai_with_tools", False)),
             "status": task.get("status", "unknown"),
             "enabled": bool(task.get("enabled", False)),
             "run_count": int(task.get("run_count", 0) or 0),

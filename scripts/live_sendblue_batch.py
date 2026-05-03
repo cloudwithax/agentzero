@@ -29,12 +29,12 @@ DEFAULT_CASES: list[dict[str, Any]] = [
         "name": "grep_read_prompt_rules",
         "prompt": (
             "Tool execution is mandatory. Use grep on prompts/system_prompt.md to find "
-            "consult_advisor and pseudo-tool guidance, then use read on that file. "
+            "pseudo-tool and workspace guidance, then use read on that file. "
             "Reply in exactly two lines:\n"
-            "advisor_rule: yes|no\n"
-            "pseudo_tool_rule: yes|no"
+            "pseudo_tool_rule: yes|no\n"
+            "workspace_rule: yes|no"
         ),
-        "expected_substrings": ["advisor_rule:", "pseudo_tool_rule:"],
+        "expected_substrings": ["pseudo_tool_rule:", "workspace_rule:"],
         "required_tools": ["grep", "read"],
     },
     {
@@ -55,52 +55,18 @@ DEFAULT_CASES: list[dict[str, Any]] = [
         "required_tools": ["grep"],
     },
     {
-        "name": "advisor_sequence_plan",
-        "prompt": (
-            "You must use tools and actually execute them. Do not read entire files. "
-            "First use grep to find consult_advisor in handler.py and tools.py, then use "
-            "only line-limited read() calls with limit <= 80 around the relevant sections. "
-            "Then call consult_advisor with this exact "
-            "question: What is the smallest coherent sequence to strengthen planning-heavy "
-            "executor behavior without widening scope? Reply using exactly these four lines:\n"
-            "decision: ...\n"
-            "why: ...\n"
-            "next: ...\n"
-            "risks: ..."
-        ),
-        "expected_substrings": ["decision:", "why:", "next:", "risks:"],
-        "required_tools": ["grep", "read", "consult_advisor"],
-    },
-    {
-        "name": "consult_reviewer_plan",
-        "prompt": (
-            "You must use tools and actually execute them. Do not read entire files. Use "
-            "grep to find consult_advisor in handler.py and tools.py and then use only "
-            "line-limited read() calls with limit <= 80 on the relevant sections plus "
-            "prompts/advisor_consultation.md. Then call consult_advisor with this exact "
-            "question: What is the smallest coherent first implementation slice for "
-            "consult_reviewer so it matches the advisor path without auto-invocation yet? "
-            "Reply using exactly these four lines:\n"
-            "decision: ...\n"
-            "why: ...\n"
-            "next: ...\n"
-            "risks: ..."
-        ),
-        "expected_substrings": ["decision:", "why:", "next:", "risks:"],
-        "required_tools": ["grep", "read", "consult_advisor"],
-    },
-    {
-        "name": "bash_grep_repo_snapshot",
+        "name": "repo_workspace_paths",
         "prompt": (
             "Tool execution is mandatory. First use bash to print the current working "
-            "directory. Then use grep to check whether consult_advisor appears in both "
-            "handler.py and tools.py. Reply in exactly three lines:\n"
+            "directory. Then use grep to find the handler.py or tools.py references to "
+            "MODEL_ID and PRIMARY_MODEL_ID. Use line-limited read() calls with limit <= 80 "
+            "on the relevant sections. Reply in exactly three lines:\n"
             "cwd: <cwd>\n"
-            "handler_seen: yes|no\n"
-            "tools_seen: yes|no"
+            "model_refs: <count>\n"
+            "primary_model: <id>"
         ),
-        "expected_substrings": ["cwd:", "handler_seen:", "tools_seen:"],
-        "required_tools": ["bash", "grep"],
+        "expected_substrings": ["cwd:", "model_refs:", "primary_model:"],
+        "required_tools": ["bash", "grep", "read"],
     },
 ]
 
@@ -121,20 +87,19 @@ def _build_summary(results: list[dict[str, Any]], started_at: float) -> dict[str
     pseudo_tool_opportunities = sum(
         1
         for result in results
-        if result.get("agentic_metrics", {}).get("pseudo_tool_rounds_before_first_tool", 0)
+        if result.get("agentic_metrics", {}).get(
+            "pseudo_tool_rounds_before_first_tool", 0
+        )
         > 0
     )
     pseudo_tool_recovered_cases = sum(
         1
         for result in results
-        if result.get("agentic_metrics", {}).get("pseudo_tool_rounds_before_first_tool", 0)
+        if result.get("agentic_metrics", {}).get(
+            "pseudo_tool_rounds_before_first_tool", 0
+        )
         > 0
         and result.get("agentic_metrics", {}).get("recovered_to_tool_execution")
-    )
-    advisor_cases = sum(
-        1
-        for result in results
-        if result.get("agentic_metrics", {}).get("consult_advisor_seen")
     )
 
     def _rate(numerator: int, denominator: int) -> float | None:
@@ -156,7 +121,6 @@ def _build_summary(results: list[dict[str, Any]], started_at: float) -> dict[str
         "pseudo_tool_recovery_rate_percent": _rate(
             pseudo_tool_recovered_cases, pseudo_tool_opportunities
         ),
-        "advisor_consultation_cases": advisor_cases,
     }
 
 

@@ -141,6 +141,7 @@ class MemoryStore:
                 one_off INTEGER DEFAULT 0,
                 run_ai INTEGER DEFAULT 0,
                 ai_prompt TEXT,
+                run_ai_with_tools INTEGER DEFAULT 0,
                 status TEXT,
                 enabled INTEGER DEFAULT 1,
                 run_count INTEGER DEFAULT 0,
@@ -166,6 +167,14 @@ class MemoryStore:
             ON reminders(created_at)
         """
         )
+
+        # Migration: add run_ai_with_tools column for existing databases.
+        try:
+            cursor.execute(
+                "ALTER TABLE reminders ADD COLUMN run_ai_with_tools INTEGER DEFAULT 0"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
 
         cursor.execute(
             """
@@ -1165,6 +1174,7 @@ class MemoryStore:
                     one_off,
                     run_ai,
                     ai_prompt,
+                    run_ai_with_tools,
                     status,
                     enabled,
                     run_count,
@@ -1175,7 +1185,7 @@ class MemoryStore:
                     created_at,
                     updated_at,
                     max_runs
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 (
                     str(task.get("task_id", "")).strip(),
@@ -1186,6 +1196,7 @@ class MemoryStore:
                     1 if bool(task.get("one_off", False)) else 0,
                     1 if bool(task.get("run_ai", False)) else 0,
                     str(task.get("ai_prompt", "")),
+                    1 if bool(task.get("run_ai_with_tools", False)) else 0,
                     str(task.get("status", "active")),
                     1 if bool(task.get("enabled", False)) else 0,
                     int(task.get("run_count", 0) or 0),
@@ -1217,6 +1228,7 @@ class MemoryStore:
                 one_off,
                 run_ai,
                 ai_prompt,
+                run_ai_with_tools,
                 status,
                 enabled,
                 run_count,
@@ -1246,16 +1258,17 @@ class MemoryStore:
                     "one_off": bool(row[5]),
                     "run_ai": bool(row[6]),
                     "ai_prompt": row[7] or "",
-                    "status": row[8] or "active",
-                    "enabled": bool(row[9]),
-                    "run_count": int(row[10] or 0),
-                    "last_run_at": row[11],
-                    "next_run_at": row[12],
-                    "last_result": row[13] or "",
-                    "last_error": row[14] or "",
-                    "created_at": row[15],
-                    "updated_at": row[16],
-                    "max_runs": int(row[17] or 0),
+                    "run_ai_with_tools": bool(row[8]),
+                    "status": row[9] or "active",
+                    "enabled": bool(row[10]),
+                    "run_count": int(row[11] or 0),
+                    "last_run_at": row[12],
+                    "next_run_at": row[13],
+                    "last_result": row[14] or "",
+                    "last_error": row[15] or "",
+                    "created_at": row[16],
+                    "updated_at": row[17],
+                    "max_runs": int(row[18] or 0),
                 }
             )
 

@@ -192,9 +192,7 @@ async def run_smoke(
         limit=6,
     )
     outbound_messages = [
-        event
-        for event in sendblue_posts
-        if event["url"].endswith("/api/send-message")
+        event for event in sendblue_posts if event["url"].endswith("/api/send-message")
     ]
     typing_events = [
         event
@@ -207,7 +205,9 @@ async def run_smoke(
 
     final_payload = outbound_messages[-1]["json"] if outbound_messages else {}
     final_content = str(final_payload.get("content", ""))
-    flat_tool_names = [name for round_names in tool_rounds for name in round_names if name]
+    flat_tool_names = [
+        name for round_names in tool_rounds for name in round_names if name
+    ]
     text_only_before_tool = []
     for snapshot in loop_response_snapshots:
         if snapshot["has_tool_calls"]:
@@ -232,14 +232,14 @@ async def run_smoke(
         ),
         "needed_recovery_before_tools": bool(text_only_before_tool),
         "recovered_to_tool_execution": bool(text_only_before_tool and tool_rounds),
-        "consult_advisor_seen": "consult_advisor" in set(flat_tool_names),
-        "consult_reviewer_seen": "consult_reviewer" in set(flat_tool_names),
     }
 
     normalized_final_content = final_content.lower()
     normalized_tools = set(flat_tool_names)
     missing_substrings = [
-        text for text in expected_substrings if text.lower() not in normalized_final_content
+        text
+        for text in expected_substrings
+        if text.lower() not in normalized_final_content
     ]
     missing_tools = [tool for tool in required_tools if tool not in normalized_tools]
 
@@ -272,7 +272,9 @@ async def run_smoke(
 
 
 async def main() -> int:
-    parser = argparse.ArgumentParser(description="Run a live Sendblue-style smoke test.")
+    parser = argparse.ArgumentParser(
+        description="Run a live Sendblue-style smoke test."
+    )
     parser.add_argument(
         "--phone-number",
         default=f"+1555{int(time.time()) % 10000000:07d}",

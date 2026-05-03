@@ -848,7 +848,7 @@ async def consortium_status_tool(task_id: Optional[str] = None):
 
 
 async def reminder_create_tool(
-    cron: str,
+    cron: str = "",
     message: str = "",
     session_id: Optional[str] = None,
     one_off: bool = False,
@@ -856,8 +856,18 @@ async def reminder_create_tool(
     ai_prompt: str = "",
     task_id: Optional[str] = None,
     name: str = "",
+    run_at: Optional[int] = None,
+    run_ai_with_tools: bool = False,
 ):
-    """Create a cron-based reminder task (one-off or recurring)."""
+    """Create a scheduled reminder task.
+
+    Supports two scheduling modes:
+    - Unix timestamp (run_at): for short-duration one-off tasks
+    - Cron expression (cron): for recurring tasks
+
+    Set run_ai=true with ai_prompt to have the AI generate text when the task fires.
+    Set run_ai_with_tools=true to give the AI full tool access during execution.
+    """
     try:
         if reminder_controller is None:
             return {"success": False, "error": "Reminder controller not initialized"}
@@ -873,6 +883,8 @@ async def reminder_create_tool(
             ai_prompt=ai_prompt,
             task_id=task_id,
             name=name,
+            run_at=run_at,
+            run_ai_with_tools=run_ai_with_tools,
         )
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -1681,6 +1693,7 @@ TOOLS = {
     "activate_skill": activate_skill_tool,
     "add_skill": add_skill_tool,
     "send_message": send_message_tool,
+    "declare_message_count": declare_message_count_tool,
     "send_tapback": send_tapback_tool,
     "send_reaction": send_tapback_tool,
     "send_telegram_reaction": send_telegram_reaction_tool,
@@ -1738,13 +1751,14 @@ def validate_tool_args(func_name: str, func_args: dict) -> tuple:
         "activate_skill": ["name"],
         "add_skill": ["url"],
         "send_message": ["text"],
+        "declare_message_count": ["count"],
         "send_tapback": ["message_handle", "reaction"],
         "send_reaction": ["message_handle", "reaction"],
         "send_telegram_reaction": ["chat_id", "message_id", "reaction"],
         "consortium_start": ["task"],
         "consortium_stop": ["task_id"],
         "consortium_status": [],
-        "reminder_create": ["cron"],
+        "reminder_create": [],  # either cron or run_at required, validated at runtime
         "reminder_list": [],
         "reminder_status": ["task_id"],
         "reminder_cancel": ["task_id"],
