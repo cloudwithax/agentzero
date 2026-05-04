@@ -11,25 +11,20 @@ from integrations import (
     _attachment_url_to_base64_data_url,
     _build_user_message_content,
     _build_user_message_content_async,
+    _build_user_message_content_from_normalized,
     _extract_agent_response_payload,
+    NVCF_MODEL_IDS,
 )
 
 
 def test_multimodal_message_blocks() -> None:
     """Build image_url blocks when a multimodal model is selected."""
-    previous_model = os.environ.get("MODEL_ID")
-    os.environ["MODEL_ID"] = "meta/llama-3.2-11b-vision-instruct"
-
-    try:
+    with patch("integrations._model_needs_nvcf_assets", return_value=False), \
+         patch("integrations._model_supports_multimodal", return_value=True):
         content = _build_user_message_content(
             "Please describe these.",
             ["https://img.example/a.png", "https://img.example/b.png"],
         )
-    finally:
-        if previous_model is None:
-            os.environ.pop("MODEL_ID", None)
-        else:
-            os.environ["MODEL_ID"] = previous_model
 
     assert isinstance(content, list)
     assert content[0] == {
@@ -52,19 +47,12 @@ def test_multimodal_message_blocks() -> None:
 
 def test_non_multimodal_fallback_text() -> None:
     """Fallback to plain text attachment list on non-multimodal models."""
-    previous_model = os.environ.get("MODEL_ID")
-    os.environ["MODEL_ID"] = "moonshotai/kimi-k2-instruct-0905"
-
-    try:
+    with patch("integrations._model_needs_nvcf_assets", return_value=False), \
+         patch("integrations._model_supports_multimodal", return_value=False):
         content = _build_user_message_content(
             "Summarize these images.",
             ["https://img.example/only.png"],
         )
-    finally:
-        if previous_model is None:
-            os.environ.pop("MODEL_ID", None)
-        else:
-            os.environ["MODEL_ID"] = previous_model
 
     assert isinstance(content, str)
     assert "Summarize these images." in content
@@ -74,12 +62,9 @@ def test_non_multimodal_fallback_text() -> None:
 
 def test_multimodal_message_blocks_respect_attachment_limit() -> None:
     """Cap inbound image blocks to configured MAX_IMAGE_ATTACHMENTS_PER_MESSAGE."""
-    previous_model = os.environ.get("MODEL_ID")
-    previous_limit = os.environ.get("MAX_IMAGE_ATTACHMENTS_PER_MESSAGE")
-    os.environ["MODEL_ID"] = "meta/llama-3.2-11b-vision-instruct"
-    os.environ["MAX_IMAGE_ATTACHMENTS_PER_MESSAGE"] = "2"
-
-    try:
+    with patch("integrations._model_needs_nvcf_assets", return_value=False), \
+         patch("integrations._model_supports_multimodal", return_value=True), \
+         patch.dict(os.environ, {"MAX_IMAGE_ATTACHMENTS_PER_MESSAGE": "2"}):
         content = _build_user_message_content(
             "Please describe all images.",
             [
@@ -88,15 +73,6 @@ def test_multimodal_message_blocks_respect_attachment_limit() -> None:
                 "https://img.example/c.png",
             ],
         )
-    finally:
-        if previous_model is None:
-            os.environ.pop("MODEL_ID", None)
-        else:
-            os.environ["MODEL_ID"] = previous_model
-        if previous_limit is None:
-            os.environ.pop("MAX_IMAGE_ATTACHMENTS_PER_MESSAGE", None)
-        else:
-            os.environ["MAX_IMAGE_ATTACHMENTS_PER_MESSAGE"] = previous_limit
 
     assert isinstance(content, list)
     assert content[0]["type"] == "text"
@@ -216,30 +192,20 @@ def test_attachment_data_url_to_base64_data_url_converts_to_jpeg() -> None:
 
 def test_build_user_message_content_async_uses_base64_and_drops_failed() -> None:
     """Async builder should keep only successful base64 JPEG conversions."""
-    previous_model = os.environ.get("MODEL_ID")
-    os.environ["MODEL_ID"] = "meta/llama-3.2-11b-vision-instruct"
-
     async def _fake_convert(_session, url: str) -> str | None:
         if url.endswith("a.png"):
             return "data:image/jpeg;base64,AAAA"
         return None
 
-    try:
-        with patch(
-            "integrations._attachment_url_to_base64_data_url",
-            side_effect=_fake_convert,
-        ):
-            content = asyncio.run(
-                _build_user_message_content_async(
-                    "Please analyze these images.",
-                    ["https://img.example/a.png", "https://img.example/b.png"],
-                )
+    with patch("integrations._model_needs_nvcf_assets", return_value=False), \
+         patch("integrations._model_supports_multimodal", return_value=True), \
+         patch("integrations._attachment_url_to_base64_data_url", side_effect=_fake_convert):
+        content = asyncio.run(
+            _build_user_message_content_async(
+                "Please analyze these images.",
+                ["https://img.example/a.png", "https://img.example/b.png"],
             )
-    finally:
-        if previous_model is None:
-            os.environ.pop("MODEL_ID", None)
-        else:
-            os.environ["MODEL_ID"] = previous_model
+        )
 
     assert isinstance(content, list)
     assert content[0]["type"] == "text"
@@ -251,6 +217,40 @@ def test_build_user_message_content_async_uses_base64_and_drops_failed() -> None
     assert len(content) == 2
 
 
+def test_build_user_message_content_from_normalized_nvcf_returns_text() -> None:
+    """NVCF models inline asset refs in plain text instead of image_url blocks."""
+    import integrations
+    saved = integrations.NVCF_MODEL_IDS.copy()
+    integrations.NVCF_MODEL_IDS = {"test/nvcf-model"}
+    try:
+        with patch("integrations._model_needs_nvcf_assets", return_value=True):
+            content = _build_user_message_content_from_normalized(
+                "What is this?",
+                ['<img src="data:image/jpeg;asset_id,abc123" />'],
+            )
+        assert isinstance(content, str)
+        assert "What is this?" in content
+        assert 'asset_id,abc123' in content
+    finally:
+        integrations.NVCF_MODEL_IDS = saved
+
+
+def test_build_user_message_content_from_normalized_multimodal_returns_list() -> None:
+    """Non-NVCF multimodal models return image_url block lists."""
+    with patch("integrations._model_needs_nvcf_assets", return_value=False), \
+         patch("integrations._model_supports_multimodal", return_value=True):
+        content = _build_user_message_content_from_normalized(
+            "Please describe these.",
+            ["https://img.example/a.png", "https://img.example/b.png"],
+        )
+    assert isinstance(content, list)
+    assert content[0]["type"] == "text"
+    assert content[1] == {
+        "type": "image_url",
+        "image_url": {"url": "https://img.example/a.png"},
+    }
+
+
 def main() -> int:
     test_multimodal_message_blocks()
     test_non_multimodal_fallback_text()
@@ -259,6 +259,8 @@ def main() -> int:
     test_attachment_url_to_base64_data_url_converts_to_jpeg()
     test_attachment_data_url_to_base64_data_url_converts_to_jpeg()
     test_build_user_message_content_async_uses_base64_and_drops_failed()
+    test_build_user_message_content_from_normalized_nvcf_returns_text()
+    test_build_user_message_content_from_normalized_multimodal_returns_list()
     print("All multimodal integration tests passed")
     return 0
 

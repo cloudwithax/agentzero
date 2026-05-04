@@ -81,6 +81,45 @@ TOOL_LEAK_PATTERNS = [
     "<function_",
 ]
 
+# Common code fence openings that indicate leaked code output.
+_CODE_LEAK_FENCE_PATTERNS = [
+    "```html",
+    "```css",
+    "```javascript",
+    "```js",
+    "```jsx",
+    "```ts",
+    "```tsx",
+    "```python",
+    "```py",
+    "```json",
+    "```xml",
+    "```svg",
+    "```go",
+    "```rs",
+    "```rust",
+    "```java",
+    "```cpp",
+    "```c++",
+    "```c",
+    "```php",
+    "```rb",
+    "```ruby",
+    "```sql",
+    "```yaml",
+    "```yml",
+    "```toml",
+    "```ini",
+    "```dockerfile",
+    "```makefile",
+    "```md",
+    "```markdown",
+    "```txt",
+    "```text",
+    "```diff",
+    "```",
+]
+
 # Matches fenced code blocks (``` ... ```) and inline code (`...`).
 _CODE_FENCE_RE = _re.compile(r"(```[\s\S]*?```|`[^`\n]+`)")
 
@@ -118,6 +157,10 @@ def detect_tool_leak(content: str) -> bool:
 
     content_lower = content.lower()
     if any(pattern in content_lower for pattern in TOOL_LEAK_PATTERNS):
+        return True
+
+    # Detect leaked code fences (HTML, CSS, JS, Python, etc.)
+    if any(pattern in content_lower for pattern in _CODE_LEAK_FENCE_PATTERNS):
         return True
 
     # Extra guard for raw shell command dumps without explicit tool_calls.

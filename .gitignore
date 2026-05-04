@@ -81,3 +81,5 @@ nohup.out
 test_image.png
 
 .venv/
+
+.herenow/

@@ -62,6 +62,10 @@ INTERNAL_PROMPT_RESIDUE_PATTERNS = (
     re.compile(
         r"(?im)^[ \t>*_`~-]*(?:send_tapback|send_telegram_reaction|send_reaction)\s*:[^\n]*$"
     ),
+    # Strip leaked code blocks (```\n...\n```) from visible text.
+    re.compile(r"```[\w]*[\s\S]*?```", re.DOTALL),
+    # Strip bare code fences that may be unmatched.
+    re.compile(r"```[\w]*\s*"),
 )
 
 
@@ -175,7 +179,7 @@ if _OPENAI_CLIENT_BASE_URL and _OPENAI_CLIENT_API_KEY:
         BASE_URL = BASE_URL + "/chat/completions"
     API_KEY = _OPENAI_CLIENT_API_KEY
     _DEFAULT_MODEL_ID = _OPENAI_CLIENT_MODEL or os.environ.get(
-        "MODEL_ID", "moonshotai/kimi-k2-instruct-0905"
+        "MODEL_ID", "moonshotai/kimi-k2.6"
     )
 else:
     BASE_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
@@ -183,7 +187,7 @@ else:
         "NVIDIA_API_KEY",
         "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",
     )
-    _DEFAULT_MODEL_ID = os.environ.get("MODEL_ID", "moonshotai/kimi-k2-instruct-0905")
+    _DEFAULT_MODEL_ID = os.environ.get("MODEL_ID", "moonshotai/kimi-k2.6")
 
 EXECUTOR_MODEL_ID = (
     os.environ.get("EXECUTOR_MODEL", "").strip()
@@ -204,6 +208,30 @@ REVIEWER_MODEL_ID = (
 PRIMARY_MODEL_ID = ADVISOR_MODEL_ID
 MODEL_ID = PRIMARY_MODEL_ID
 CONSORTIUM_MODEL_ID = os.environ.get("CONSORTIUM_MODEL", MODEL_ID).strip() or MODEL_ID
+
+# Catalog of known models available via NVIDIA API (May 2026).
+# Used by the /model command for quick selection.
+# Benchmarked TTFT shown from scripts/benchmark_models.py (single-sentence prompt).
+MODEL_CATALOG = [
+    # ── Fast & reliable (TTFT < 500ms) ────────────────────────────────
+    {"id": "meta/llama-3.2-90b-vision-instruct",        "name": "Llama 3.2 90B Vision",   "labels": ["multimodal", "ttft:139ms"]},
+    {"id": "nvidia/llama-3.1-nemotron-nano-vl-8b-v1",  "name": "Nemotron Nano VL 8B",    "labels": ["multimodal", "small", "ttft:159ms"]},
+    {"id": "meta/llama-4-maverick-17b-128e-instruct",   "name": "Llama 4 Maverick",       "labels": ["multimodal", "128K_ctx", "ttft:232ms"]},
+    {"id": "moonshotai/kimi-k2.6",                      "name": "Kimi K2.6",              "labels": ["multimodal", "1T_params", "ttft:253ms"]},
+    {"id": "mistralai/mistral-small-4-119b-2603",       "name": "Mistral Small 4",        "labels": ["multimodal", "ttft:289ms"]},
+    {"id": "qwen/qwen3.5-122b-a10b",                    "name": "Qwen 3.5 122B",          "labels": ["agentic", "tool_calling", "ttft:330ms"]},
+    {"id": "qwen/qwen3-next-80b-a3b-instruct",          "name": "Qwen 3 Next 80B",        "labels": ["general", "ttft:409ms"]},
+    # ── Working but slower ────────────────────────────────────────────
+    {"id": "nvidia/nemotron-3-super-120b-a12b",         "name": "Nemotron 3 Super 120B",  "labels": ["agentic", "tool_calling", "planning", "ttft:1.8s"]},
+    {"id": "z-ai/glm-5.1",                              "name": "GLM 5.1",                "labels": ["agentic", "coding", "ttft:23.6s"]},
+    # ── Intermittent (timeouts, no tokens) ────────────────────────────
+    {"id": "moonshotai/kimi-k2-instruct-0905",           "name": "Kimi K2",                "labels": ["general", "tool_calling", "may_timeout"]},
+    {"id": "deepseek-ai/deepseek-v4-pro",               "name": "DeepSeek V4 Pro",        "labels": ["coding", "1M_ctx", "may_timeout"]},
+    {"id": "deepseek-ai/deepseek-v3.1-terminus",        "name": "DeepSeek V3.1",          "labels": ["tool_calling", "think_mode", "may_timeout"]},
+    {"id": "nvidia/llama-3.3-nemotron-super-49b-v1.5",  "name": "Nemotron Super 49B",     "labels": ["general", "no_stream_tokens"]},
+    {"id": "minimaxai/minimax-m2.7",                    "name": "MiniMax M2.7",           "labels": ["coding", "no_stream_tokens"]},
+    {"id": "google/gemma-4-31b-it",                     "name": "Gemma 4 31B",            "labels": ["multimodal", "unstable"]},
+]
 
 # Workspace — all agent-created files must live here.
 _DEFAULT_WORKSPACE = os.path.join(
@@ -1336,7 +1364,29 @@ class AgentHandler:
             return str(parsed["text"])
         return content
 
-    def _build_request_payload_template(self) -> dict[str, Any]:
+    def get_session_model_override(self, session_id: str) -> Optional[str]:
+        """Return the per-session model override, or None to use the default."""
+        if not session_id or not self.memory_store:
+            return None
+        key = f"model_override:{session_id}"
+        val = self.memory_store.get_agent_state(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+        return None
+
+    def set_session_model_override(self, session_id: str, model_id: Optional[str]) -> None:
+        """Persist a per-session model override.  Pass None to clear."""
+        if not session_id or not self.memory_store:
+            return
+        key = f"model_override:{session_id}"
+        if model_id is None:
+            # Deleting a single agent_state key isn't wired, so write an empty
+            # string and treat it as "no override" on read.
+            self.memory_store.set_agent_state(key, "")
+        else:
+            self.memory_store.set_agent_state(key, model_id.strip())
+
+    def _build_request_payload_template(self, session_id: Optional[str] = None) -> dict[str, Any]:
         """Build base payload with dynamic tool registration (including skills)."""
         payload = BASE_PAYLOAD.copy()
         payload["tools"] = list(BASE_PAYLOAD.get("tools", []))
@@ -1348,6 +1398,12 @@ class AgentHandler:
                     payload["tools"].append(tool_schema)
             except Exception:
                 logger.exception("Failed to append activate_skill tool schema")
+
+        # Apply per-session model override if one is stored.
+        if session_id:
+            override = self.get_session_model_override(session_id)
+            if override:
+                payload["model"] = override
 
         return payload
 
@@ -4155,7 +4211,7 @@ class AgentHandler:
             context_window=128000,
             buffer_tokens=2000,
         )
-        payload_template = self._build_request_payload_template()
+        payload_template = self._build_request_payload_template(session_id=session_id)
         current_payload = payload_template.copy()
         current_payload["messages"] = messages
 

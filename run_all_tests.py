@@ -1,6 +1,7 @@
+import asyncio
 import os
-import subprocess
 import sys
+import time
 
 
 tests = [
@@ -29,31 +30,71 @@ tests = [
     "tests/test_credentials.py",
 ]
 
+CONCURRENCY = int(os.environ.get("AGENTZERO_TEST_CONCURRENCY", "6"))
+STAGGER_SECONDS = float(os.environ.get("AGENTZERO_TEST_STAGGER", "0.3"))
 
-def main() -> int:
+
+async def _run_one(test_path: str, env: dict[str, str]) -> tuple[str, int, str, str]:
+    """Run a single test and return (path, returncode, stdout, stderr)."""
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        test_path,
+        env=env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    out_str = stdout.decode(errors="replace")
+    err_str = stderr.decode(errors="replace")
+    return (test_path, proc.returncode or 0, out_str, err_str)
+
+
+async def main_async() -> int:
     env = os.environ.copy()
     existing_pythonpath = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = "." if not existing_pythonpath else f".:{existing_pythonpath}"
-    # Enable live-API tests by default in CI/runner; set to "0" to skip
     if "AGENTZERO_LIVE_TESTS" not in env:
         env["AGENTZERO_LIVE_TESTS"] = "1"
 
-    failures: list[str] = []
+    sem = asyncio.Semaphore(CONCURRENCY)
 
-    for test_path in tests:
-        print(f"\n--- Running {test_path} ---")
-        result = subprocess.run([sys.executable, test_path], env=env)
-        if result.returncode != 0:
-            failures.append(test_path)
+    async def _bounded_run(test_path: str, index: int) -> tuple[str, int, str, str]:
+        async with sem:
+            # Stagger start to avoid thundering-herd on live API tests.
+            await asyncio.sleep(index * STAGGER_SECONDS)
+            print(f"[{index+1}/{len(tests)}] Running {test_path} ...", flush=True)
+            t0 = time.monotonic()
+            result = await _run_one(test_path, env)
+            elapsed = time.monotonic() - t0
+            status = "PASS" if result[1] == 0 else "FAIL"
+            print(f"      ({test_path}) → {status}  ({elapsed:.1f}s)", flush=True)
+            return result
 
+    tasks = [_bounded_run(p, i) for i, p in enumerate(tests)]
+    results = await asyncio.gather(*tasks)
+
+    failures: list[tuple[str, str]] = []
+    for path, rc, stdout, stderr in results:
+        if rc != 0:
+            failures.append((path, stderr.strip() or stdout.strip()))
+
+    print()
     if failures:
-        print("\nFailed tests:")
-        for test_path in failures:
-            print(f" - {test_path}")
+        print(f"FAILED: {len(failures)}/{len(tests)}")
+        for path, err in failures:
+            print(f"\n── {path} ──")
+            # Show last 40 lines of error output.
+            lines = err.splitlines()
+            for line in lines[-40:]:
+                print(f"    {line}")
         return 1
 
-    print("\nAll tests passed.")
+    print(f"All {len(tests)} tests passed.", flush=True)
     return 0
+
+
+def main() -> int:
+    return asyncio.run(main_async())
 
 
 if __name__ == "__main__":

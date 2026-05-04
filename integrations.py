@@ -19,7 +19,7 @@ from urllib.parse import urlparse
 import aiohttp
 from aiohttp import web
 
-from handler import AgentHandler, PRIMARY_MODEL_ID
+from handler import AgentHandler, PRIMARY_MODEL_ID, MODEL_CATALOG, MODEL_ID
 
 logger = logging.getLogger(__name__)
 
@@ -35,24 +35,122 @@ _telegram_content_dedup_keys: set[str] = set()
 _TELEGRAM_DEDUP_TTL_SECONDS = 60
 _TELEGRAM_CONTENT_DEDUP_WINDOW = 30
 
-# Valid multimodal models for image inputs.
+# Valid multimodal models for image inputs (from NVIDIA API, May 2026).
+# Source: https://build.nvidia.com/explore/vision + https://integrate.api.nvidia.com/v1/models
 MULTIMODAL_MODEL_IDS = {
+    # Multimodal APIs section
     "black-forest-labs/flux.1-kontext-dev",
     "google/paligemma",
     "meta/llama-3.2-11b-vision-instruct",
     "meta/llama-3.2-90b-vision-instruct",
     "meta/llama-4-maverick-17b-128e-instruct",
-    "meta/llama-4-scout-17b-16e-instruct",
-    "microsoft/phi-3.5-vision-instruct",
-    "moonshotai/kimi-k2.5",
     "nvidia/llama-3.1-nemotron-nano-vl-8b-v1",
+    "nvidia/nemotron-3-content-safety",
     "qwen/qwen3.5-397b-a17b",
+    # Visual Models section (chat-capable multimodal)
+    "adept/fuyu-8b",
+    "google/gemma-3-27b-it",
+    "google/gemma-3n-e2b-it",
+    "google/gemma-3n-e4b-it",
+    "google/gemma-4-31b-it",
+    "microsoft/kosmos-2",
+    "microsoft/phi-3-vision-128k-instruct",
+    "microsoft/phi-4-multimodal-instruct",
+    "mistralai/mistral-small-4-119b-2603",
+    "moonshotai/kimi-k2.6",
+    "nvidia/cosmos-reason2-8b",
+    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+    "nvidia/nemotron-nano-12b-v2-vl",
+    "nvidia/neva-22b",
 }
+
+# Models that need NVCF asset upload for images (Visual Models section).
+# These models support <img src="data:image/{fmt};asset_id,{id}" /> in content.
+NVCF_MODEL_IDS: set[str] = set()
+# NVCF asset upload is available for models that require it, but currently
+# the base64 image_url path works for all models.  Add model IDs here only
+# when a model genuinely cannot process inline base64 images.
+
+# NVCF Asset API configuration.
+NVCF_ASSET_API_URL = "https://api.nvcf.nvidia.com/v2/nvcf/assets"
+# Images larger than this (in bytes) are uploaded as NVCF assets instead of
+# inline base64 data URLs.
+NVCF_ASSET_THRESHOLD_BYTES = 50 * 1024  # 50 KB
+
+async def _nvcf_upload_asset(
+    session: aiohttp.ClientSession,
+    image_bytes: bytes,
+    content_type: str,
+    api_key: str,
+) -> str | None:
+    """Upload an image as an NVCF asset; return the asset ID for referencing."""
+    if not image_bytes:
+        return None
+
+    # 1. Create asset — get assetId + pre-signed upload URL.
+    async with session.post(
+        NVCF_ASSET_API_URL,
+        json={"contentType": content_type, "description": "User image attachment"},
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+    ) as resp:
+        if resp.status != 200:
+            logger.warning("NVCF create asset returned %s: %s", resp.status, await resp.text())
+            return None
+        try:
+            create_data = await resp.json()
+        except Exception:
+            logger.warning("NVCF create asset response was not valid JSON")
+            return None
+
+    asset_id = create_data.get("assetId")
+    upload_url = create_data.get("uploadUrl")
+    if not asset_id or not upload_url:
+        logger.warning("NVCF create asset missing assetId/uploadUrl in response")
+        return None
+
+    # 2. Upload image bytes to the pre-signed S3 URL using a fresh session
+    #    (no auth headers — the pre-signed URL already carries credentials).
+    upload_content_type = "image/jpeg"  # always JPEG after conversion
+    async with aiohttp.ClientSession() as upload_session:
+        async with upload_session.put(
+            upload_url,
+            data=image_bytes,
+            headers={"Content-Type": upload_content_type},
+        ) as put_resp:
+            if put_resp.status not in (200, 201, 204):
+                logger.warning("NVCF asset upload PUT returned %s", put_resp.status)
+                return None
+
+    logger.debug("NVCF asset uploaded: %s (%d bytes)", asset_id, len(image_bytes))
+    return asset_id
+
+
+def _nvcf_format_asset_ref(asset_id: str, content_type: str = "image/jpeg") -> str:
+    """Format an NVCF asset reference for use in chat message content."""
+    fmt = content_type.split("/")[-1] if "/" in content_type else "jpeg"
+    return f'<img src="data:image/{fmt};asset_id,{asset_id}" />'
+
+
+def _model_needs_nvcf_assets() -> bool:
+    """Return True if the active model uses NVCF asset refs for images."""
+    if not NVCF_MODEL_IDS:
+        return False
+    from handler import PRIMARY_MODEL_ID  # late import to avoid circular
+    return PRIMARY_MODEL_ID.lower() in NVCF_MODEL_IDS
+
+
+def _model_supports_multimodal_nvcf() -> bool:
+    """Extended multimodal check that also considers NVCF models."""
+    return _model_supports_multimodal() or _model_needs_nvcf_assets()
 
 NVIDIA_WHISPER_GRPC_SERVER = "grpc.nvcf.nvidia.com:443"
 NVIDIA_WHISPER_FUNCTION_ID = "d8dd4e9b-fbf5-4fb0-9dba-8cf436c8d965"
 VOICE_MEMO_MAX_BYTES_DEFAULT = 25 * 1024 * 1024
 MAX_IMAGE_ATTACHMENTS_PER_MESSAGE_DEFAULT = 8
+MAX_IMAGE_DIMENSION = 2048  # max width or height in pixels for inbound images
 VOICE_MEMO_FALLBACK_EXTENSION = ".opus"
 VOICE_MEMO_FFMPEG_BIN_DEFAULT = "ffmpeg"
 VOICE_MEMO_CONVERTED_FILENAME = "voice-memo-converted.wav"
@@ -312,7 +410,73 @@ BUILTIN_SESSION_COMMANDS = {
     "/memory_stats",
     "/memorycadence",
     "/skills",
+    "/model",
 }
+
+
+def _format_model_selection(handler: AgentHandler, session_id: str) -> str:
+    """Build a numbered model-picker string for the /model command."""
+    current = handler.get_session_model_override(session_id)
+    default_label = current or MODEL_ID
+    lines = [f"*Current model:* {default_label}", "", "Reply with a number or name to switch:"]
+
+    for i, entry in enumerate(MODEL_CATALOG, 1):
+        marker = "» " if entry["id"] == current else "  "
+        labels = ", ".join(entry["labels"])
+        lines.append(f"{marker}{i}. {entry['name']}  *({labels})*")
+
+    lines.append("")
+    lines.append("0. *default* — use env configured model")
+    return "\n".join(lines)
+
+
+def _resolve_model_selection(selection: str) -> Optional[str]:
+    """Resolve a user's model selection to a catalog entry id.
+
+    Returns None for "default" / "0".  Returns the model id on match.
+    """
+    sel = selection.strip().lower()
+    if not sel or sel in ("default", "0"):
+        return None  # clear override
+
+    # Try numeric index
+    try:
+        idx = int(sel)
+        if 1 <= idx <= len(MODEL_CATALOG):
+            return MODEL_CATALOG[idx - 1]["id"]
+        return None  # out of range
+    except ValueError:
+        pass
+
+    # Try fuzzy name/substring match
+    for entry in MODEL_CATALOG:
+        if sel == entry["id"].lower():
+            return entry["id"]
+        if sel in entry["name"].lower():
+            return entry["id"]
+        if sel in entry["id"].lower().replace("/", " ").replace("-", " "):
+            return entry["id"]
+
+    return None  # no match
+
+
+def _handle_model_command(
+    handler: AgentHandler, session_id: str, arg_text: str
+) -> str:
+    """Handle /model [selection] — show list or switch model."""
+    if not arg_text:
+        return _format_model_selection(handler, session_id)
+
+    resolved = _resolve_model_selection(arg_text)
+    if resolved is None and arg_text.lower().strip() not in ("default", "0"):
+        return (
+            f"Unknown model selection: \"{arg_text}\". "
+            f"Use /model to see the list."
+        )
+
+    handler.set_session_model_override(session_id, resolved)
+    label = resolved or MODEL_ID
+    return f"Model set to: *{label}*"
 
 
 def _parse_skill_invocation(text: str) -> tuple[str, str]:
@@ -1995,8 +2159,10 @@ def _convert_image_with_imagemagick_sync(
                 input_path,
                 "-auto-orient",
                 "-strip",
+                "-resize",
+                f"{MAX_IMAGE_DIMENSION}x{MAX_IMAGE_DIMENSION}>",
                 "-quality",
-                "95",
+                "92",
                 output_path,
             ]
             subprocess.run(command, check=True, capture_output=True)
@@ -2059,6 +2225,89 @@ def _decode_image_base64_data_url(source_url: str) -> tuple[bytes | None, str | 
         content_type = "image/jpeg"
 
     return image_bytes, content_type
+
+
+async def _attachment_url_to_model_ref(
+    session: aiohttp.ClientSession,
+    source_url: str,
+    *,
+    use_nvcf: bool = False,
+) -> str | None:
+    """Convert an image URL to a model-compatible image reference.
+
+    For NVCF models, large images are uploaded as NVCF assets and returned as
+    ``<img src="data:image/jpeg;asset_id,..." />`` tags.  Smaller images and
+    non-NVCF models use base64 JPEG data URLs.
+    """
+    # First, download and convert to JPEG bytes (shared path).
+    normalized_source = str(source_url or "").strip()
+    if not normalized_source:
+        return None
+
+    try:
+        image_bytes, content_type = _decode_image_base64_data_url(normalized_source)
+        if image_bytes is None:
+            async with session.get(normalized_source) as source_response:
+                if source_response.status != 200:
+                    logger.warning(
+                        "Attachment download failed (status=%s): %s",
+                        source_response.status,
+                        normalized_source,
+                    )
+                    return None
+                image_bytes = await source_response.read()
+                if not image_bytes:
+                    logger.warning(
+                        "Attachment download returned empty body: %s",
+                        normalized_source,
+                    )
+                    return None
+                content_type = _normalize_image_content_type(
+                    source_response.headers.get("Content-Type"),
+                    normalized_source,
+                )
+            if not content_type:
+                logger.warning("Skipping non-image attachment URL: %s", normalized_source)
+                return None
+
+        source_extension = _guess_source_extension(content_type, normalized_source)
+        loop = asyncio.get_running_loop()
+        converted_bytes = await loop.run_in_executor(
+            None,
+            _convert_image_with_imagemagick_sync,
+            image_bytes,
+            source_extension,
+            ".jpg",
+        )
+        if not converted_bytes:
+            logger.warning(
+                "Failed to convert image attachment to JPEG: %s",
+                normalized_source,
+            )
+            return None
+
+        # NVCF path: upload large images as NVCF assets.
+        if use_nvcf and len(converted_bytes) > NVCF_ASSET_THRESHOLD_BYTES:
+            api_key = _resolve_nvcf_api_key()
+            asset_id = await _nvcf_upload_asset(session, converted_bytes, content_type, api_key)
+            if asset_id:
+                return _nvcf_format_asset_ref(asset_id, content_type)
+            # Fall through to base64 if NVCF upload fails.
+            logger.warning("NVCF upload failed, falling back to base64 data URL")
+
+        # Standard path: base64 data URL.
+        encoded = base64.b64encode(converted_bytes).decode("ascii")
+        return f"data:image/jpeg;base64,{encoded}"
+
+    except Exception as e:
+        logger.warning("Failed to convert attachment URL to model ref: %s", e)
+        return None
+
+
+def _resolve_nvcf_api_key() -> str:
+    """Return the API key for NVCF asset API calls."""
+    import handler
+    return handler.API_KEY
 
 
 async def _attachment_url_to_base64_data_url(
@@ -2158,6 +2407,19 @@ def _build_user_message_content_from_normalized(
     if not normalized_attachments:
         return normalized_text
 
+    # NVCF models: embed asset ref tags inline in text content.
+    if _model_needs_nvcf_assets():
+        text_block = normalized_text or "Analyze these images."
+        if normalized_text:
+            text_block = (
+                "IMPORTANT: You can view and analyze the attached images in this "
+                "message. Do not claim you cannot view images.\n\n"
+                f"User message: {normalized_text}"
+            )
+        for ref in normalized_attachments:
+            text_block += "\n" + ref
+        return text_block
+
     if _model_supports_multimodal():
         text_block = normalized_text or "Analyze these images."
         if normalized_text:
@@ -2205,20 +2467,24 @@ async def _build_user_message_content_async(
             normalized_attachments,
         )
 
+    use_nvcf = _model_needs_nvcf_assets()
     converted_attachments: list[str] = []
     dropped_count = 0
     async with aiohttp.ClientSession() as session:
         for url in normalized_attachments:
-            data_url = await _attachment_url_to_base64_data_url(session, url)
-            if data_url:
-                converted_attachments.append(data_url)
+            if use_nvcf:
+                ref = await _attachment_url_to_model_ref(session, url, use_nvcf=True)
+            else:
+                ref = await _attachment_url_to_base64_data_url(session, url)
+            if ref:
+                converted_attachments.append(ref)
             else:
                 dropped_count += 1
 
     if dropped_count > 0:
         conversion_note = (
             f"[Image conversion warning: dropped {dropped_count} image"
-            f"{'' if dropped_count == 1 else 's'} due to JPEG/base64 conversion failure.]"
+            f"{'' if dropped_count == 1 else 's'} due to conversion failure.]"
         )
         normalized_text = (
             f"{normalized_text}\n\n{conversion_note}"
@@ -3487,7 +3753,10 @@ async def handle_imessage(
     if command == "/skills":
         return _format_available_skills(handler)
 
-    # Check for /clear command
+    if command == "/model":
+        arg_text = _parse_slash_command(text)[1]
+        return _handle_model_command(handler, session_id, arg_text)
+
     if command == "/clear":
         try:
             deleted_count = handler.memory_store.clear_conversation_history(session_id)
@@ -4127,6 +4396,21 @@ async def telegram_skills(
     await update.message.reply_text(_format_available_skills(handler))
 
 
+async def telegram_model(
+    handler: AgentHandler, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
+):
+    """Handle /model command - select or view the active model."""
+    if update.message is None or update.effective_user is None:
+        return
+    user_id = update.effective_user.id
+    session_id = f"tg_{user_id}"
+    arg_text = (context.args[0] if context.args else "").strip()
+    await update.message.reply_text(
+        _handle_model_command(handler, session_id, arg_text),
+        parse_mode="Markdown",
+    )
+
+
 async def telegram_unknown_command(
     handler: AgentHandler,
     update: "Update",
@@ -4329,6 +4613,12 @@ def run_telegram_bot(handler: AgentHandler):
         )
     )
     app.add_handler(
+        CommandHandler(
+            "model",
+            lambda update, context: telegram_model(handler, update, context),
+        )
+    )
+    app.add_handler(
         MessageHandler(
             (filters.TEXT | filters.PHOTO | filters.Document.IMAGE) & ~filters.COMMAND,
             lambda update, context: telegram_handle_msg(handler, update, context),
@@ -4385,6 +4675,12 @@ async def run_telegram_bot_async(handler: AgentHandler):
         CommandHandler(
             "skills",
             lambda update, context: telegram_skills(handler, update, context),
+        )
+    )
+    app.add_handler(
+        CommandHandler(
+            "model",
+            lambda update, context: telegram_model(handler, update, context),
         )
     )
     app.add_handler(

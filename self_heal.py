@@ -3,7 +3,7 @@ Self-healing subsystem for AgentZero.
 
 When a code/tool/config error occurs during agent execution, this module:
 1. Classifies the error (code/tool vs transient)
-2. Consults Claude Code via the Agent SDK (local subscription, no API key)
+2. Consults the agent's own NVIDIA API model for analysis and patches
 3. Applies the fix in an isolated git worktree
 4. Commits and merges back to the main worktree with a full audit trail
 """
@@ -26,7 +26,7 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 _SELF_HEAL_ENABLED = os.environ.get("SELF_HEAL_ENABLED", "1") == "1"
-_SELF_HEAL_CLAUDE_MODEL = os.environ.get("SELF_HEAL_CLAUDE_MODEL") or None
+SELF_HEAL_MODEL = os.environ.get("SELF_HEAL_MODEL", "").strip() or None
 _SELF_HEAL_COOLDOWN_SECONDS = int(os.environ.get("SELF_HEAL_COOLDOWN_SECONDS", "120"))
 _SELF_HEAL_TIMEOUT_SECONDS = int(os.environ.get("SELF_HEAL_TIMEOUT_SECONDS", "180"))
 _SELF_HEAL_AUTO_MERGE = os.environ.get("SELF_HEAL_AUTO_MERGE", "1") == "1"
@@ -257,13 +257,15 @@ class GitWorktreeManager:
             self.remove_worktree(session_id)
 
 
-class ClaudeAgentSDKHealer:
+class AgentSelfHealer:
+    """Heals errors by calling the agent's own NVIDIA API model."""
+
     def __init__(
         self,
         model: Optional[str] = None,
         timeout: int = _SELF_HEAL_TIMEOUT_SECONDS,
     ):
-        self.model = model or _SELF_HEAL_CLAUDE_MODEL
+        self.model = model or SELF_HEAL_MODEL
         self.timeout = timeout
 
     async def consult(
@@ -271,88 +273,108 @@ class ClaudeAgentSDKHealer:
         error_report: SelfHealErrorReport,
         worktree_path: str,
     ) -> Optional[dict[str, Any]]:
-        try:
-            from claude_agent_sdk import (
-                ClaudeAgentOptions,
-                query,
-            )
-        except ImportError:
-            logger.error("claude_agent_sdk not installed; cannot consult Claude")
-            return None
-
         prompt = self._build_prompt(error_report, worktree_path)
-
-        options = ClaudeAgentOptions(
-            model=self.model,
-            cwd=worktree_path,
-            permission_mode="bypassPermissions",
-            max_turns=8,
-        )
-
         try:
             result = await asyncio.wait_for(
-                self._run_query(prompt, options),
+                self._run_query(prompt),
                 timeout=self.timeout,
             )
             return result
         except asyncio.TimeoutError:
-            logger.error("Claude consultation timed out after %ds", self.timeout)
+            logger.error("Self-heal consultation timed out after %ds", self.timeout)
             return None
         except Exception:
-            logger.error("Claude consultation failed", exc_info=True)
+            logger.error("Self-heal consultation failed", exc_info=True)
             return None
 
-    async def _run_query(self, prompt: str, options: Any) -> Optional[dict[str, Any]]:
-        from claude_agent_sdk import query
+    async def _run_query(self, prompt: str) -> Optional[dict[str, Any]]:
+        from api import api_call_with_retry, process_response
 
-        collected_output = None
-        result_text = None
+        try:
+            from handler import BASE_URL, API_KEY, MODEL_ID, BASE_PAYLOAD
+        except ImportError:
+            logger.error("Cannot import handler config for self-heal")
+            return None
 
-        async for message in query(prompt=prompt, options=options):
-            if hasattr(message, "structured_output") and message.structured_output:
-                raw = message.structured_output
-                if isinstance(raw, dict):
-                    collected_output = raw
-                elif isinstance(raw, str):
-                    try:
-                        collected_output = json.loads(raw)
-                    except json.JSONDecodeError:
-                        logger.warning("structured_output was not valid JSON string")
+        model = self.model or MODEL_ID
+        headers = {"Authorization": f"Bearer {API_KEY}"}
 
-            if hasattr(message, "result") and message.result:
-                result_text = message.result
+        payload = {
+            "model": model,
+            "temperature": 0.3,
+            "top_p": 0.9,
+            "max_tokens": 4096,
+            "stream": False,
+            "tools": [],
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a code-healing agent. Analyze errors and produce "
+                        "precise fixes. You MUST respond with ONLY a JSON object — "
+                        "no markdown, no explanation outside the JSON."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+        }
 
-            if hasattr(message, "content") and isinstance(message.content, list):
-                for block in message.content:
-                    block_type = type(block).__name__
-                    if block_type == "ToolUseBlock" and hasattr(block, "input"):
-                        tool_input = block.input
-                        if isinstance(tool_input, dict) and "patches" in tool_input:
-                            collected_output = tool_input
+        try:
+            import aiohttp
 
-        if collected_output is None and result_text:
-            cleaned = result_text.strip()
-            if cleaned.startswith("```"):
-                cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
-                cleaned = re.sub(r"\s*```$", "", cleaned)
-            json_match = re.search(r"\{[\s\S]*\}", cleaned)
-            if json_match:
-                json_str = json_match.group(0)
-                try:
-                    parsed = json.loads(json_str)
-                    if isinstance(parsed, dict):
-                        collected_output = parsed
-                except json.JSONDecodeError:
-                    logger.warning("Failed to parse extracted JSON from result text")
-            else:
-                try:
-                    parsed = json.loads(cleaned)
-                    if isinstance(parsed, dict):
-                        collected_output = parsed
-                except json.JSONDecodeError:
-                    logger.warning("Failed to parse result text as JSON")
+            async with aiohttp.ClientSession() as session:
+                response_data = await api_call_with_retry(
+                    session,
+                    BASE_URL,
+                    payload,
+                    headers,
+                    max_retries=3,
+                    stream=False,
+                )
+        except Exception:
+            logger.error("API call failed during self-heal", exc_info=True)
+            return None
 
-        return collected_output
+        if "error" in response_data:
+            err_msg = response_data.get("error", {})
+            if isinstance(err_msg, dict):
+                err_msg = err_msg.get("message", str(err_msg))
+            logger.error("Self-heal API error: %s", err_msg)
+            return None
+
+        result_text = ""
+        choices = response_data.get("choices", [])
+        if choices:
+            message = choices[0].get("message", {})
+            result_text = message.get("content", "") or ""
+
+        if not result_text:
+            logger.warning("Self-heal returned empty response")
+            return None
+
+        cleaned = result_text.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+            cleaned = re.sub(r"\s*```$", "", cleaned)
+
+        json_match = re.search(r"\{[\s\S]*\}", cleaned)
+        if json_match:
+            json_str = json_match.group(0)
+            try:
+                parsed = json.loads(json_str)
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                logger.warning("Failed to parse extracted JSON from self-heal response")
+        else:
+            try:
+                parsed = json.loads(cleaned)
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                logger.warning("Failed to parse self-heal response as JSON")
+
+        return None
 
     def _build_prompt(
         self, error_report: SelfHealErrorReport, worktree_path: str
@@ -484,7 +506,7 @@ class SelfHealManager:
         self._acp_agent = acp_agent
         self._classifier = ErrorClassifier()
         self._wt_manager = GitWorktreeManager(repo_root=repo_root)
-        self._healer = ClaudeAgentSDKHealer()
+        self._healer = AgentSelfHealer()
         self._heal_history: list[dict[str, Any]] = []
         self._last_heal_time: float = 0
         self._session_attempts: dict[str, int] = {}
@@ -592,22 +614,22 @@ class SelfHealManager:
             return HealResult(success=False, error="Failed to create git worktree")
 
         try:
-            claude_result = await self._healer.consult(report, worktree_path)
+            heal_result = await self._healer.consult(report, worktree_path)
 
-            if not claude_result:
+            if not heal_result:
                 return HealResult(
                     success=False,
-                    error="Claude consultation returned no result",
+                    error="Self-heal consultation returned no result",
                     worktree_path=worktree_path,
                 )
 
-            patches_data = claude_result.get("patches", [])
-            explanation = claude_result.get("explanation", "")
+            patches_data = heal_result.get("patches", [])
+            explanation = heal_result.get("explanation", "")
 
             if not patches_data:
                 return HealResult(
                     success=False,
-                    error="No patches returned from Claude",
+                    error="No patches returned from self-heal",
                     worktree_path=worktree_path,
                 )
 
