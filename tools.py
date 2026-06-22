@@ -737,6 +737,35 @@ async def recall_tool(query: str, top_k: int = 5, topic: Optional[str] = None):
                     "created_at": memory.created_at,
                 }
             )
+
+        # Keyword search returns nothing for vague/enumeration queries
+        # ("export every memory", "what do you remember", "memory") even when the
+        # store is full.  Never let that read as an empty store: fall back to the
+        # most recent memories and label them so the model doesn't claim they
+        # matched the query.  Use ``get_recent_memories`` to enumerate instead.
+        if not memories:
+            recent = memory_store.get_recent_memories(limit=max(top_k, 10))
+            if recent:
+                return {
+                    "success": True,
+                    "count": len(recent),
+                    "note": (
+                        "No direct keyword matches for this query; returning the "
+                        "most recent memories instead. The memory store is NOT "
+                        "empty. Use get_recent_memories to enumerate all memories."
+                    ),
+                    "memories": [
+                        {
+                            "id": m.id,
+                            "content": m.content,
+                            "similarity": 0.0,
+                            "metadata": m.metadata,
+                            "created_at": m.created_at,
+                        }
+                        for m in recent
+                    ],
+                }
+
         return {
             "success": True,
             "count": len(memories),
@@ -808,8 +837,12 @@ async def memory_stats_tool():
         return {"success": False, "error": str(e)}
 
 
-async def consortium_start_tool(task: str, task_id: Optional[str] = None):
-    """Start a consortium task in the background."""
+async def consortium_start_tool(task: str, task_id: Optional[str] = None, **_ignored):
+    """Start a consortium task in the background.
+
+    Extra keyword arguments are accepted and ignored so a natural model call
+    that includes unsupported fields does not raise a ``TypeError``.
+    """
     try:
         if consortium_controller is None:
             return {"success": False, "error": "Consortium controller not initialized"}
@@ -858,12 +891,15 @@ async def reminder_create_tool(
     name: str = "",
     run_at: Optional[int] = None,
     run_ai_with_tools: bool = False,
+    delay_seconds: Optional[int] = None,
 ):
     """Create a scheduled reminder task.
 
-    Supports two scheduling modes:
-    - Unix timestamp (run_at): for short-duration one-off tasks
-    - Cron expression (cron): for recurring tasks
+    Supports three scheduling modes:
+    - Relative delay (delay_seconds): simplest for "remind me in N seconds/minutes" —
+      no timestamp/timezone math required.
+    - Unix timestamp (run_at): for one-off tasks at a specific epoch.
+    - Cron expression (cron): for recurring tasks.
 
     Set run_ai=true with ai_prompt to have the AI generate text when the task fires.
     Set run_ai_with_tools=true to give the AI full tool access during execution.
@@ -885,6 +921,7 @@ async def reminder_create_tool(
             name=name,
             run_at=run_at,
             run_ai_with_tools=run_ai_with_tools,
+            delay_seconds=delay_seconds,
         )
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -1035,7 +1072,7 @@ def parse_search_results(text: str) -> list:
 
 # Web search tool using MCP protocol (stateless - no API key required)
 async def web_search_tool(
-    query: str, numResults: int = 5, category: Optional[str] = None, type: str = "auto"
+    query: str, numResults: int = 5, category: Optional[str] = None, search_type: str = "auto"
 ):
     """Search the web using Exa MCP server (no API key required, has rate limits).
 
@@ -1043,7 +1080,7 @@ async def web_search_tool(
         query: The search query string
         numResults: Number of results to return (1-100, default: 5)
         category: Optional category filter (company, research paper, news, people)
-        type: Search type (auto, neural, fast, deep, deep-reasoning, instant)
+        search_type: Search type (auto, neural, fast, deep, deep-reasoning, instant)
     """
     try:
         # Quick cache check — avoid redundant API calls
@@ -1662,6 +1699,152 @@ async def self_heal_status_tool() -> dict[str, Any]:
     return {"success": True, **status}
 
 
+# ---------------------------------------------------------------------------
+# Interactive browser automation (CloakBrowser — stealth Chromium)
+# ---------------------------------------------------------------------------
+# A single persistent browser session is held in-process across tool calls so
+# the model can navigate/click/type/read/screenshot interactively within and
+# across turns. The session is shared process-wide (single-user agent).
+_browser_session: dict[str, Any] = {"browser": None, "page": None}
+_browser_lock = asyncio.Lock()
+
+
+def _browser_screenshot_dir() -> str:
+    d = os.path.join(AGENT_WORKSPACE, "browser_screenshots")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+async def _ensure_browser_page():
+    """Return the active page, launching the headless browser on first use."""
+    if _browser_session["page"] is not None:
+        return _browser_session["page"]
+    import cloakbrowser  # lazy: pulls in playwright + downloads binary on first run
+
+    cloakbrowser.ensure_binary()
+    browser = await cloakbrowser.launch_async(headless=True)
+    page = await browser.new_page()
+    _browser_session["browser"] = browser
+    _browser_session["page"] = page
+    return page
+
+
+def _open_browser_page():
+    """Return the current page without launching, or None if no session is open."""
+    return _browser_session["page"]
+
+
+async def browser_open_tool(**_ignored):
+    """Open (or reuse) the persistent stealth browser session."""
+    try:
+        async with _browser_lock:
+            page = await _ensure_browser_page()
+        return {"success": True, "content": "Browser session is open.", "url": page.url}
+    except ImportError:
+        return {
+            "success": False,
+            "error": "cloakbrowser is not installed (pip install cloakbrowser)",
+        }
+    except Exception as e:
+        return {"success": False, "error": f"Failed to open browser: {e}"}
+
+
+async def browser_navigate_tool(url: str, wait_until: str = "domcontentloaded", **_ignored):
+    """Navigate the browser to a URL (opens the session if needed)."""
+    try:
+        async with _browser_lock:
+            page = await _ensure_browser_page()
+            resp = await page.goto(url, wait_until=wait_until, timeout=45000)
+            status = resp.status if resp else None
+            title = await page.title()
+        return {"success": True, "url": page.url, "status": status, "title": title}
+    except ImportError:
+        return {
+            "success": False,
+            "error": "cloakbrowser is not installed (pip install cloakbrowser)",
+        }
+    except Exception as e:
+        return {"success": False, "error": f"Navigation failed: {e}"}
+
+
+async def browser_click_tool(selector: str, **_ignored):
+    """Click an element matching a CSS selector on the current page."""
+    try:
+        async with _browser_lock:
+            page = _open_browser_page()
+            if page is None:
+                return {"success": False, "error": "No browser page open. Call browser_navigate first."}
+            await page.click(selector, timeout=15000)
+            title = await page.title()
+        return {"success": True, "clicked": selector, "url": page.url, "title": title}
+    except Exception as e:
+        return {"success": False, "error": f"Click failed for {selector!r}: {e}"}
+
+
+async def browser_type_tool(selector: str, text: str, **_ignored):
+    """Fill text into an input/textarea matching a CSS selector."""
+    try:
+        async with _browser_lock:
+            page = _open_browser_page()
+            if page is None:
+                return {"success": False, "error": "No browser page open. Call browser_navigate first."}
+            await page.fill(selector, text, timeout=15000)
+        return {"success": True, "typed_into": selector}
+    except Exception as e:
+        return {"success": False, "error": f"Type failed for {selector!r}: {e}"}
+
+
+async def browser_read_tool(selector: Optional[str] = None, max_chars: int = 5000, **_ignored):
+    """Read the visible text of the current page (or a specific element)."""
+    try:
+        page = _open_browser_page()
+        if page is None:
+            return {"success": False, "error": "No browser page open. Call browser_navigate first."}
+        text = await page.inner_text(selector or "body", timeout=15000)
+        title = await page.title()
+        return {
+            "success": True,
+            "url": page.url,
+            "title": title,
+            "content": text[:max_chars],
+            "truncated": len(text) > max_chars,
+        }
+    except Exception as e:
+        return {"success": False, "error": f"Read failed: {e}"}
+
+
+async def browser_screenshot_tool(filename: Optional[str] = None, full_page: bool = False, **_ignored):
+    """Capture a PNG screenshot of the current page to the workspace."""
+    try:
+        page = _open_browser_page()
+        if page is None:
+            return {"success": False, "error": "No browser page open. Call browser_navigate first."}
+        name = filename or f"screenshot_{int(time.time())}.png"
+        if not name.endswith(".png"):
+            name += ".png"
+        path = os.path.join(_browser_screenshot_dir(), os.path.basename(name))
+        await page.screenshot(path=path, full_page=full_page)
+        return {"success": True, "path": path, "url": page.url}
+    except Exception as e:
+        return {"success": False, "error": f"Screenshot failed: {e}"}
+
+
+async def browser_close_tool(**_ignored):
+    """Close the persistent browser session and free resources."""
+    try:
+        async with _browser_lock:
+            browser = _browser_session.get("browser")
+            if browser is not None:
+                await browser.close()
+            _browser_session["browser"] = None
+            _browser_session["page"] = None
+        return {"success": True, "content": "Browser session closed."}
+    except Exception as e:
+        _browser_session["browser"] = None
+        _browser_session["page"] = None
+        return {"success": False, "error": f"Close failed (session reset): {e}"}
+
+
 import inspect
 
 
@@ -1719,6 +1902,16 @@ TOOLS = {
     "list_credentials": list_credentials_tool,
     # Self-healing tools
     "self_heal_status": self_heal_status_tool,
+    # Interactive browser automation (CloakBrowser)
+    "browser_open": browser_open_tool,
+    "browser_navigate": browser_navigate_tool,
+    "browser_goto": browser_navigate_tool,  # alias
+    "browser_click": browser_click_tool,
+    "browser_type": browser_type_tool,
+    "browser_fill": browser_type_tool,  # alias
+    "browser_read": browser_read_tool,
+    "browser_screenshot": browser_screenshot_tool,
+    "browser_close": browser_close_tool,
 }
 
 
@@ -1758,7 +1951,7 @@ def validate_tool_args(func_name: str, func_args: dict) -> tuple:
         "consortium_start": ["task"],
         "consortium_stop": ["task_id"],
         "consortium_status": [],
-        "reminder_create": [],  # either cron or run_at required, validated at runtime
+        "reminder_create": [],  # one of delay_seconds/run_at/cron required, validated at runtime
         "reminder_list": [],
         "reminder_status": ["task_id"],
         "reminder_cancel": ["task_id"],
@@ -1779,6 +1972,15 @@ def validate_tool_args(func_name: str, func_args: dict) -> tuple:
         "delete_credential": ["key"],
         "list_credentials": [],
         "self_heal_status": [],
+        "browser_open": [],
+        "browser_navigate": ["url"],
+        "browser_goto": ["url"],
+        "browser_click": ["selector"],
+        "browser_type": ["selector", "text"],
+        "browser_fill": ["selector", "text"],
+        "browser_read": [],
+        "browser_screenshot": [],
+        "browser_close": [],
     }
 
     if func_name in required_params:

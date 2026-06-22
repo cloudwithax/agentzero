@@ -17,7 +17,6 @@ from examples import AdaptiveFewShotManager, ExampleBank
 from handler import (
     AgentHandler,
     FINAL_RESPONSE_MAX_TOKENS,
-    REQUEST_FRESHNESS_INSTRUCTION,
 )
 from memory import EnhancedMemoryStore, Memory
 from planning import TaskAnalyzer, TaskPlanner

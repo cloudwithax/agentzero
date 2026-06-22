@@ -328,6 +328,76 @@ async def test_live_agent_uses_glob_tool() -> None:
     print(f"  PASS — reply: {text[:100]}")
 
 
+async def test_browser_tools_registered() -> None:
+    """Browser automation tools should be registered, validated, and exposed."""
+    from tools import validate_tool_args
+
+    print("Testing browser tool registration...")
+    for name in (
+        "browser_open",
+        "browser_navigate",
+        "browser_click",
+        "browser_type",
+        "browser_read",
+        "browser_screenshot",
+        "browser_close",
+    ):
+        assert name in TOOLS, f"{name} missing from TOOLS"
+
+    # Required-arg validation
+    ok, _ = validate_tool_args("browser_navigate", {})
+    assert not ok, "browser_navigate should require url"
+    ok, _ = validate_tool_args("browser_navigate", {"url": "https://example.com"})
+    assert ok, "browser_navigate with url should validate"
+    ok, _ = validate_tool_args("browser_click", {})
+    assert not ok, "browser_click should require selector"
+    ok, _ = validate_tool_args("browser_type", {"selector": "#q"})
+    assert not ok, "browser_type should require selector and text"
+
+    # Exposed in the model-visible schema
+    schema_names = {
+        t["function"]["name"]
+        for t in BASE_PAYLOAD.get("tools", [])
+        if t.get("type") == "function"
+    }
+    for name in ("browser_open", "browser_navigate", "browser_click", "browser_type", "browser_read", "browser_screenshot", "browser_close"):
+        assert name in schema_names, f"{name} not exposed in BASE_PAYLOAD"
+    print("✓ browser tools registered, validated, and exposed")
+
+
+async def test_browser_tools_require_open_session() -> None:
+    """Action tools should fail gracefully when no page is open (no launch)."""
+    print("Testing browser tools without an open session...")
+    for name, kwargs in (
+        ("browser_click", {"selector": "a"}),
+        ("browser_type", {"selector": "#q", "text": "hi"}),
+        ("browser_read", {}),
+        ("browser_screenshot", {}),
+    ):
+        result = await TOOLS[name](**kwargs)
+        assert not result["success"], f"{name} should fail with no page"
+        assert "No browser page open" in result["error"], f"{name}: {result}"
+    print("✓ browser action tools fail gracefully without a session")
+
+
+async def test_live_browser_navigate() -> None:
+    """Live: launch CloakBrowser, navigate, read, screenshot, close."""
+    if os.environ.get("AGENTZERO_LIVE_TESTS") != "1":
+        print("[SKIP] Live browser navigate test")
+        return
+    print("Testing live CloakBrowser navigation...")
+    nav = await TOOLS["browser_navigate"](url="https://example.com")
+    assert nav["success"], f"navigate failed: {nav}"
+    assert nav["status"] == 200, f"unexpected status: {nav}"
+    read = await TOOLS["browser_read"]()
+    assert read["success"] and "Example Domain" in read["content"], f"read failed: {read}"
+    shot = await TOOLS["browser_screenshot"]()
+    assert shot["success"] and os.path.exists(shot["path"]), f"screenshot failed: {shot}"
+    closed = await TOOLS["browser_close"]()
+    assert closed["success"], f"close failed: {closed}"
+    print(f"  PASS — navigated, read {len(read['content'])} chars, shot at {shot['path']}")
+
+
 if __name__ == "__main__":
     asyncio.run(test_tools_work())
     asyncio.run(test_payload_isolation())
@@ -335,6 +405,8 @@ if __name__ == "__main__":
     asyncio.run(test_tool_result_format())
     asyncio.run(test_remember_tool_persists_runtime_session_id())
     asyncio.run(test_remember_tool_rewrites_assistant_name_from_user_turn())
+    asyncio.run(test_browser_tools_registered())
+    asyncio.run(test_browser_tools_require_open_session())
     print("Deterministic tests passed!")
 
     print("\n--- Live-API integration tests ---")
@@ -342,4 +414,5 @@ if __name__ == "__main__":
     asyncio.run(test_live_agent_uses_bash_tool())
     asyncio.run(test_live_agent_uses_write_tool())
     asyncio.run(test_live_agent_uses_glob_tool())
+    asyncio.run(test_live_browser_navigate())
     print("\nAll tests passed!")

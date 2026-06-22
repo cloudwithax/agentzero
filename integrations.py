@@ -19,7 +19,14 @@ from urllib.parse import urlparse
 import aiohttp
 from aiohttp import web
 
-from handler import AgentHandler, PRIMARY_MODEL_ID, MODEL_CATALOG, MODEL_ID
+from handler import (
+    AgentHandler,
+    PRIMARY_MODEL_ID,
+    MODEL_CATALOG,
+    MODEL_ID,
+    API_KEY,
+    BASE_URL,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,20 +69,21 @@ MULTIMODAL_MODEL_IDS = {
     "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
     "nvidia/nemotron-nano-12b-v2-vl",
     "nvidia/neva-22b",
+    "stepfun-ai/step-3.7-flash",
 }
 
-# Models that need NVCF asset upload for images (Visual Models section).
-# These models support <img src="data:image/{fmt};asset_id,{id}" /> in content.
+# Model used for image description - all images are forwarded to this model
+# with "describe what is in this image" and the response is fed back to the main model.
+IMAGE_DESCRIBER_MODEL = "mistralai/mistral-small-4-119b-2603"
+
+# Models that use NVCF asset upload for images.
+# Kept empty until a model genuinely requires NVCF asset refs.
+# All models in MULTIMODAL_MODEL_IDS use base64 image_url blocks instead.
 NVCF_MODEL_IDS: set[str] = set()
-# NVCF asset upload is available for models that require it, but currently
-# the base64 image_url path works for all models.  Add model IDs here only
-# when a model genuinely cannot process inline base64 images.
 
 # NVCF Asset API configuration.
 NVCF_ASSET_API_URL = "https://api.nvcf.nvidia.com/v2/nvcf/assets"
-# Images larger than this (in bytes) are uploaded as NVCF assets instead of
-# inline base64 data URLs.
-NVCF_ASSET_THRESHOLD_BYTES = 50 * 1024  # 50 KB
+
 
 async def _nvcf_upload_asset(
     session: aiohttp.ClientSession,
@@ -97,7 +105,9 @@ async def _nvcf_upload_asset(
         },
     ) as resp:
         if resp.status != 200:
-            logger.warning("NVCF create asset returned %s: %s", resp.status, await resp.text())
+            logger.warning(
+                "NVCF create asset returned %s: %s", resp.status, await resp.text()
+            )
             return None
         try:
             create_data = await resp.json()
@@ -113,12 +123,11 @@ async def _nvcf_upload_asset(
 
     # 2. Upload image bytes to the pre-signed S3 URL using a fresh session
     #    (no auth headers — the pre-signed URL already carries credentials).
-    upload_content_type = "image/jpeg"  # always JPEG after conversion
     async with aiohttp.ClientSession() as upload_session:
         async with upload_session.put(
             upload_url,
             data=image_bytes,
-            headers={"Content-Type": upload_content_type},
+            headers={"Content-Type": content_type},
         ) as put_resp:
             if put_resp.status not in (200, 201, 204):
                 logger.warning("NVCF asset upload PUT returned %s", put_resp.status)
@@ -134,11 +143,106 @@ def _nvcf_format_asset_ref(asset_id: str, content_type: str = "image/jpeg") -> s
     return f'<img src="data:image/{fmt};asset_id,{asset_id}" />'
 
 
+async def _describe_image_with_mistral(
+    session: aiohttp.ClientSession,
+    image_bytes: bytes,
+    content_type: str = "image/jpeg",
+) -> str | None:
+    """Send an image to the Mistral describer model and return its description."""
+    if not image_bytes:
+        return None
+
+    api_key = API_KEY
+    if not api_key:
+        logger.warning("Cannot describe image: API_KEY not configured")
+        return None
+
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    image_url = f"data:{content_type};base64,{encoded}"
+
+    payload = {
+        "model": IMAGE_DESCRIBER_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe what is in this image"},
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ],
+            }
+        ],
+        "max_tokens": 1024,
+        "stream": False,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    try:
+        async with session.post(BASE_URL, json=payload, headers=headers) as resp:
+            if resp.status != 200:
+                logger.warning(
+                    "Image description request failed (status=%s): %s",
+                    resp.status,
+                    await resp.text(),
+                )
+                return None
+            response_data = await resp.json()
+    except Exception as e:
+        logger.warning("Image description request failed: %s", e)
+        return None
+
+    if "error" in response_data:
+        logger.warning("Image description API error: %s", response_data["error"])
+        return None
+
+    choices = response_data.get("choices", [])
+    if not choices:
+        logger.warning("Image description returned no choices")
+        return None
+
+    message = choices[0].get("message", {})
+    description = message.get("content", "")
+    if isinstance(description, list):
+        description = " ".join(
+            part.get("text", "") if isinstance(part, dict) else str(part)
+            for part in description
+        )
+
+    description = str(description).strip()
+    if not description:
+        logger.warning("Image description returned empty content")
+        return None
+
+    return description
+
+
+async def _describe_images_with_mistral(
+    session: aiohttp.ClientSession,
+    image_data: list[tuple[bytes, str]],
+) -> list[str | None]:
+    """Describe multiple images using the Mistral describer model.
+
+    Returns a list of descriptions (or None for failed images).
+    """
+    results: list[str | None] = []
+    for image_bytes, content_type in image_data:
+        description = await _describe_image_with_mistral(
+            session, image_bytes, content_type
+        )
+        results.append(description)
+    return results
+
+
 def _model_needs_nvcf_assets() -> bool:
     """Return True if the active model uses NVCF asset refs for images."""
     if not NVCF_MODEL_IDS:
         return False
     from handler import PRIMARY_MODEL_ID  # late import to avoid circular
+
     return PRIMARY_MODEL_ID.lower() in NVCF_MODEL_IDS
 
 
@@ -146,8 +250,13 @@ def _model_supports_multimodal_nvcf() -> bool:
     """Extended multimodal check that also considers NVCF models."""
     return _model_supports_multimodal() or _model_needs_nvcf_assets()
 
+
 NVIDIA_WHISPER_GRPC_SERVER = "grpc.nvcf.nvidia.com:443"
-NVIDIA_WHISPER_FUNCTION_ID = "d8dd4e9b-fbf5-4fb0-9dba-8cf436c8d965"
+# NVIDIA Parakeet 1.1B RNNT multilingual ASR (NVCF function). Requires 16 kHz
+# mono LINEAR_PCM audio, so inbound voice memos are converted to WAV first.
+NVIDIA_WHISPER_FUNCTION_ID = "71203149-d3b7-4460-8231-1be2543a1fca"
+# Sample rate the ffmpeg converter produces and the ASR config must declare.
+VOICE_MEMO_SAMPLE_RATE_HZ = 16000
 VOICE_MEMO_MAX_BYTES_DEFAULT = 25 * 1024 * 1024
 MAX_IMAGE_ATTACHMENTS_PER_MESSAGE_DEFAULT = 8
 MAX_IMAGE_DIMENSION = 2048  # max width or height in pixels for inbound images
@@ -418,7 +527,11 @@ def _format_model_selection(handler: AgentHandler, session_id: str) -> str:
     """Build a numbered model-picker string for the /model command."""
     current = handler.get_session_model_override(session_id)
     default_label = current or MODEL_ID
-    lines = [f"*Current model:* {default_label}", "", "Reply with a number or name to switch:"]
+    lines = [
+        f"*Current model:* {default_label}",
+        "",
+        "Reply with a number or name to switch:",
+    ]
 
     for i, entry in enumerate(MODEL_CATALOG, 1):
         marker = "» " if entry["id"] == current else "  "
@@ -460,19 +573,14 @@ def _resolve_model_selection(selection: str) -> Optional[str]:
     return None  # no match
 
 
-def _handle_model_command(
-    handler: AgentHandler, session_id: str, arg_text: str
-) -> str:
+def _handle_model_command(handler: AgentHandler, session_id: str, arg_text: str) -> str:
     """Handle /model [selection] — show list or switch model."""
     if not arg_text:
         return _format_model_selection(handler, session_id)
 
     resolved = _resolve_model_selection(arg_text)
     if resolved is None and arg_text.lower().strip() not in ("default", "0"):
-        return (
-            f"Unknown model selection: \"{arg_text}\". "
-            f"Use /model to see the list."
-        )
+        return f'Unknown model selection: "{arg_text}". Use /model to see the list.'
 
     handler.set_session_model_override(session_id, resolved)
     label = resolved or MODEL_ID
@@ -612,25 +720,6 @@ def _format_memory_cadence_stats(handler: Any, session_id: str) -> str:
     else:
         since_last_text = str(max(0, session_messages - latest_message_index))
 
-    dream_text = "not available"
-    if hasattr(handler.memory_store, "get_agent_state"):
-        try:
-            dream_profile = handler.memory_store.get_agent_state("dream.profile", {})
-            if isinstance(dream_profile, dict) and dream_profile.get("hours"):
-                hours = [
-                    int(hour)
-                    for hour in dream_profile.get("hours", [])
-                    if isinstance(hour, int)
-                ]
-                if hours:
-                    dream_text = ", ".join(f"{hour:02d}:00" for hour in hours)
-                else:
-                    dream_text = str(dream_profile.get("reason", "learning"))
-            elif isinstance(dream_profile, dict):
-                dream_text = str(dream_profile.get("reason", "learning"))
-        except Exception:
-            dream_text = "unknown"
-
     return (
         "Memory stats:\n"
         f"- Total memories: {overall.get('total_memories', 0)}\n"
@@ -639,7 +728,6 @@ def _format_memory_cadence_stats(handler: Any, session_id: str) -> str:
         f"- Session memories: {session_memory_count}\n"
         f"- Messages per memory: {ratio_text} (target 10-20)\n"
         f"- Messages since last memory: {since_last_text}\n"
-        f"- Dream off-peak hours: {dream_text}"
     )
 
 
@@ -1159,8 +1247,13 @@ def _transcribe_audio_bytes_with_whisper_sync(
     function_id: str,
     language_code: str,
     model_name: str,
+    sample_rate_hertz: int = VOICE_MEMO_SAMPLE_RATE_HZ,
 ) -> str | None:
-    """Run blocking Riva gRPC transcription for a single audio payload."""
+    """Run blocking Riva gRPC transcription for a single audio payload.
+
+    ``audio_bytes`` must be 16 kHz mono LINEAR_PCM (WAV) — the Parakeet ASR
+    model rejects other formats and requires an explicit sample rate.
+    """
     try:
         import riva.client  # type: ignore[import-not-found]
     except Exception as e:
@@ -1184,6 +1277,8 @@ def _transcribe_audio_bytes_with_whisper_sync(
         "max_alternatives": 1,
         "enable_automatic_punctuation": True,
         "verbatim_transcripts": False,
+        "encoding": riva.client.AudioEncoding.LINEAR_PCM,
+        "sample_rate_hertz": sample_rate_hertz,
     }
     if model_name:
         config_kwargs["model"] = model_name
@@ -1192,8 +1287,8 @@ def _transcribe_audio_bytes_with_whisper_sync(
         auth = riva.client.Auth(
             use_ssl=True,
             uri=grpc_server,
-            metadata_args=metadata,
-            options=options,
+            metadata_args=metadata,  # type: ignore[arg-type]
+            options=options,  # type: ignore[arg-type]
         )
         asr_service = riva.client.ASRService(auth)
         config = riva.client.RecognitionConfig(**config_kwargs)
@@ -1253,22 +1348,9 @@ async def _transcribe_audio_bytes_with_whisper(
     model_name = _voice_memo_env(config_prefix, "VOICE_MEMO_MODEL", "").strip()
 
     loop = asyncio.get_running_loop()
-    transcript = await loop.run_in_executor(
-        None,
-        _transcribe_audio_bytes_with_whisper_sync,
-        audio_bytes,
-        api_key,
-        grpc_server,
-        function_id,
-        language_code,
-        model_name,
-    )
-    if transcript:
-        return transcript
 
-    if not _is_native_imessage_m4a(filename, content_type):
-        return None
-
+    # Parakeet ASR only accepts 16 kHz mono LINEAR_PCM, so convert every inbound
+    # format (m4a/caf/opus/ogg/mp3/…) to WAV with ffmpeg before transcribing.
     converted_payload = await loop.run_in_executor(
         None,
         _convert_m4a_audio_with_ffmpeg_sync,
@@ -1277,10 +1359,13 @@ async def _transcribe_audio_bytes_with_whisper(
         config_prefix,
     )
     if not converted_payload:
+        logger.warning(
+            "Voice memo transcription skipped: could not convert %s to WAV (ffmpeg required)",
+            filename,
+        )
         return None
 
     converted_bytes, _, _ = converted_payload
-    logger.info("Retrying voice memo transcription after ffmpeg voice memo conversion")
     return await loop.run_in_executor(
         None,
         _transcribe_audio_bytes_with_whisper_sync,
@@ -1290,6 +1375,7 @@ async def _transcribe_audio_bytes_with_whisper(
         function_id,
         language_code,
         model_name,
+        VOICE_MEMO_SAMPLE_RATE_HZ,
     )
 
 
@@ -1361,7 +1447,9 @@ async def _transcribe_voice_memo_attachments(
     normalized_text = (text or "").strip()
     normalized_attachments = _normalize_attachment_urls(attachment_urls)
 
-    if not normalized_attachments or not _voice_memo_transcription_enabled(config_prefix):
+    if not normalized_attachments or not _voice_memo_transcription_enabled(
+        config_prefix
+    ):
         return normalized_text, normalized_attachments
 
     voice_memo_urls, passthrough_urls = _split_voice_memo_attachments(
@@ -2115,6 +2203,122 @@ def _normalize_image_content_type(
     return None
 
 
+def _is_heic_bytes(image_bytes: bytes) -> bool:
+    """Detect HEIC/HEIF container via ftyp box magic bytes."""
+    if len(image_bytes) < 12:
+        return False
+    # HEIC files start with a ftyp box: 4 bytes size, 'ftyp', then brand
+    box_type = image_bytes[4:8]
+    if box_type != b"ftyp":
+        return False
+    brands = (
+        (image_bytes[8:12], image_bytes[12:16])
+        if len(image_bytes) >= 16
+        else (image_bytes[8:12],)
+    )
+    return any(
+        b in {b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1"} for b in brands
+    )
+
+
+def _convert_image_with_pillow_sync(image_bytes: bytes) -> bytes | None:
+    """Resize and convert image bytes to JPEG using Pillow (with pillow_heif for HEIC)."""
+    import io
+
+    try:
+        from PIL import Image
+        import pillow_heif
+
+        pillow_heif.register_heif_opener()
+    except ImportError:
+        logger.warning("Pillow/pillow_heif not available; cannot convert image")
+        return None
+
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        if max(img.size) > MAX_IMAGE_DIMENSION:
+            ratio = MAX_IMAGE_DIMENSION / max(img.size)
+            new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
+            img = img.resize(new_size, Image.LANCZOS)  # type: ignore[attr-defined]
+
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        converted = buf.getvalue()
+
+        if not converted:
+            logger.warning("Pillow image conversion produced empty output")
+            return None
+
+        return converted
+    except Exception as e:
+        logger.warning("Pillow image conversion failed: %s", e)
+        return None
+
+
+def _convert_image_with_ffmpeg_sync(image_bytes: bytes) -> bytes | None:
+    """Resize and convert image bytes to JPEG using ffmpeg.
+
+    Does NOT handle HEIC/HEIF (ffmpeg static builds decode only the thumbnail).
+    """
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffmpeg_bin:
+        return None
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="agentzero-image-ffmpeg-") as tmp_dir:
+            input_path = os.path.join(tmp_dir, "input")
+            output_path = os.path.join(tmp_dir, "output.jpg")
+
+            with open(input_path, "wb") as f:
+                f.write(image_bytes)
+
+            command = [
+                ffmpeg_bin,
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                input_path,
+                "-vf",
+                f"scale='min({MAX_IMAGE_DIMENSION},iw)':-2",
+                "-q:v",
+                "3",
+                "-frames:v",
+                "1",
+                "-an",
+                output_path,
+            ]
+            subprocess.run(command, check=True, capture_output=True)
+
+            with open(output_path, "rb") as f:
+                converted = f.read()
+
+            if not converted:
+                return None
+
+            return converted
+    except Exception:
+        return None
+
+
+def _resize_image_to_jpeg_sync(image_bytes: bytes) -> bytes | None:
+    """Resize and convert image bytes to JPEG.
+
+    HEIC/HEIF goes through Pillow+pillow_heif (ffmpeg can't decode them correctly).
+    Everything else tries ffmpeg first, falls back to Pillow.
+    """
+    if _is_heic_bytes(image_bytes):
+        return _convert_image_with_pillow_sync(image_bytes)
+
+    result = _convert_image_with_ffmpeg_sync(image_bytes)
+    if result is not None:
+        return result
+
+    return _convert_image_with_pillow_sync(image_bytes)
+
+
 def _resolve_imagemagick_command() -> str | None:
     """Resolve ImageMagick executable path from env or common command names."""
     requested = os.environ.get(IMAGE_MAGICK_BIN_ENV, "").strip()
@@ -2235,11 +2439,10 @@ async def _attachment_url_to_model_ref(
 ) -> str | None:
     """Convert an image URL to a model-compatible image reference.
 
-    For NVCF models, large images are uploaded as NVCF assets and returned as
-    ``<img src="data:image/jpeg;asset_id,..." />`` tags.  Smaller images and
-    non-NVCF models use base64 JPEG data URLs.
+    For NVCF models, images are uploaded as NVCF assets and returned as
+    ``<img src="data:image/{fmt};asset_id,{id}" />`` tags.  Falls back
+    to a base64 data URL if the NVCF upload fails or *use_nvcf* is False.
     """
-    # First, download and convert to JPEG bytes (shared path).
     normalized_source = str(source_url or "").strip()
     if not normalized_source:
         return None
@@ -2267,37 +2470,33 @@ async def _attachment_url_to_model_ref(
                     normalized_source,
                 )
             if not content_type:
-                logger.warning("Skipping non-image attachment URL: %s", normalized_source)
+                logger.warning(
+                    "Skipping non-image attachment URL: %s", normalized_source
+                )
                 return None
 
-        source_extension = _guess_source_extension(content_type, normalized_source)
-        loop = asyncio.get_running_loop()
-        converted_bytes = await loop.run_in_executor(
-            None,
-            _convert_image_with_imagemagick_sync,
-            image_bytes,
-            source_extension,
-            ".jpg",
-        )
-        if not converted_bytes:
+        resized = _resize_image_to_jpeg_sync(image_bytes)
+        if resized:
+            image_bytes = resized
+            content_type = "image/jpeg"
+        else:
             logger.warning(
-                "Failed to convert image attachment to JPEG: %s",
+                "image resize failed for NVCF attachment, sending as-is: %s",
                 normalized_source,
             )
-            return None
 
-        # NVCF path: upload large images as NVCF assets.
-        if use_nvcf and len(converted_bytes) > NVCF_ASSET_THRESHOLD_BYTES:
+        if use_nvcf:
             api_key = _resolve_nvcf_api_key()
-            asset_id = await _nvcf_upload_asset(session, converted_bytes, content_type, api_key)
+            upload_content_type = content_type if content_type else "image/jpeg"
+            asset_id = await _nvcf_upload_asset(
+                session, image_bytes, upload_content_type, api_key
+            )
             if asset_id:
-                return _nvcf_format_asset_ref(asset_id, content_type)
-            # Fall through to base64 if NVCF upload fails.
+                return _nvcf_format_asset_ref(asset_id, upload_content_type)
             logger.warning("NVCF upload failed, falling back to base64 data URL")
 
-        # Standard path: base64 data URL.
-        encoded = base64.b64encode(converted_bytes).decode("ascii")
-        return f"data:image/jpeg;base64,{encoded}"
+        encoded = base64.b64encode(image_bytes).decode("ascii")
+        return f"data:{content_type};base64,{encoded}"
 
     except Exception as e:
         logger.warning("Failed to convert attachment URL to model ref: %s", e)
@@ -2307,6 +2506,7 @@ async def _attachment_url_to_model_ref(
 def _resolve_nvcf_api_key() -> str:
     """Return the API key for NVCF asset API calls."""
     import handler
+
     return handler.API_KEY
 
 
@@ -2314,7 +2514,7 @@ async def _attachment_url_to_base64_data_url(
     session: aiohttp.ClientSession,
     source_url: str,
 ) -> str | None:
-    """Convert an image URL/data URL into a base64 JPEG data URL via ImageMagick."""
+    """Convert an image URL/data URL into a resized JPEG base64 data URL."""
     normalized_source = str(source_url or "").strip()
     if not normalized_source:
         return None
@@ -2343,34 +2543,75 @@ async def _attachment_url_to_base64_data_url(
                     source_response.headers.get("Content-Type"),
                     normalized_source,
                 )
-
             if not content_type:
                 logger.warning(
                     "Skipping non-image attachment URL: %s", normalized_source
                 )
                 return None
 
-        source_extension = _guess_source_extension(content_type, normalized_source)
-        loop = asyncio.get_running_loop()
-        converted_bytes = await loop.run_in_executor(
-            None,
-            _convert_image_with_imagemagick_sync,
-            image_bytes,
-            source_extension,
-            ".jpg",
-        )
-        if not converted_bytes:
+        resized = _resize_image_to_jpeg_sync(image_bytes)
+        if resized:
+            image_bytes = resized
+            content_type = "image/jpeg"
+        else:
             logger.warning(
-                "Failed to convert image attachment to JPEG base64 data URL: %s",
+                "image resize failed for attachment, sending as-is: %s",
                 normalized_source,
             )
-            return None
 
-        encoded = base64.b64encode(converted_bytes).decode("ascii")
-        return f"data:image/jpeg;base64,{encoded}"
+        encoded = base64.b64encode(image_bytes).decode("ascii")
+        return f"data:{content_type};base64,{encoded}"
     except Exception as e:
         logger.warning("Failed to convert attachment URL to base64 data URL: %s", e)
         return None
+
+
+async def _download_image_bytes(
+    session: aiohttp.ClientSession,
+    source_url: str,
+) -> tuple[bytes | None, str | None]:
+    """Download an image URL and return (image_bytes, content_type)."""
+    normalized_source = str(source_url or "").strip()
+    if not normalized_source:
+        return None, None
+
+    try:
+        image_bytes, content_type = _decode_image_base64_data_url(normalized_source)
+        if image_bytes is None:
+            async with session.get(normalized_source) as source_response:
+                if source_response.status != 200:
+                    logger.warning(
+                        "Image download failed (status=%s): %s",
+                        source_response.status,
+                        normalized_source,
+                    )
+                    return None, None
+
+                image_bytes = await source_response.read()
+                if not image_bytes:
+                    logger.warning(
+                        "Image download returned empty body: %s",
+                        normalized_source,
+                    )
+                    return None, None
+
+                content_type = _normalize_image_content_type(
+                    source_response.headers.get("Content-Type"),
+                    normalized_source,
+                )
+            if not content_type:
+                logger.warning("Skipping non-image URL: %s", normalized_source)
+                return None, None
+
+        resized = _resize_image_to_jpeg_sync(image_bytes)
+        if resized:
+            image_bytes = resized
+            content_type = "image/jpeg"
+
+        return image_bytes, content_type
+    except Exception as e:
+        logger.warning("Failed to download image bytes from %s: %s", source_url, e)
+        return None, None
 
 
 def _apply_image_attachment_limit(
@@ -2402,47 +2643,28 @@ def _apply_image_attachment_limit(
 def _build_user_message_content_from_normalized(
     normalized_text: str,
     normalized_attachments: list[str],
-) -> str | list[dict[str, Any]]:
-    """Build model content from normalized text and attachment URLs."""
+) -> str:
+    """Build model content from normalized text and attachment URLs.
+
+    Note: Images are now described by the Mistral describer model before
+    reaching the main model, so this function only returns text.
+    The normalized_attachments parameter is kept for backwards compatibility
+    but image URLs are no longer included in the output.
+    """
     if not normalized_attachments:
         return normalized_text
 
-    # NVCF models: embed asset ref tags inline in text content.
-    if _model_needs_nvcf_assets():
-        text_block = normalized_text or "Analyze these images."
-        if normalized_text:
-            text_block = (
-                "IMPORTANT: You can view and analyze the attached images in this "
-                "message. Do not claim you cannot view images.\n\n"
-                f"User message: {normalized_text}"
-            )
-        for ref in normalized_attachments:
-            text_block += "\n" + ref
-        return text_block
-
-    if _model_supports_multimodal():
-        text_block = normalized_text or "Analyze these images."
-        if normalized_text:
-            text_block = (
-                "IMPORTANT: You can view and analyze the attached images in this "
-                "message. Do not claim you cannot view images.\n\n"
-                f"User message: {normalized_text}"
-            )
-        content: list[dict[str, Any]] = [{"type": "text", "text": text_block}]
-        for url in normalized_attachments:
-            content.append({"type": "image_url", "image_url": {"url": url}})
-        return content
-
+    # Images are now described by the describer model, so we just return text.
+    # If there were attachments, they should have been processed by
+    # _build_user_message_content_async before reaching this point.
     attachment_lines = "\n".join(f"- {url}" for url in normalized_attachments)
     if normalized_text:
-        return f"{normalized_text}\n\n[Image attachments]\n{attachment_lines}"
-    return f"[Image attachments]\n{attachment_lines}"
+        return f"{normalized_text}\n\n[Image attachments - described by vision model]\n{attachment_lines}"
+    return f"[Image attachments - described by vision model]\n{attachment_lines}"
 
 
-def _build_user_message_content(
-    text: str, attachment_urls: list[str]
-) -> str | list[dict[str, Any]]:
-    """Build model input content, using image blocks for multimodal models."""
+def _build_user_message_content(text: str, attachment_urls: list[str]) -> str:
+    """Build model input content. Images are described by the describer model."""
     normalized_text, normalized_attachments = _apply_image_attachment_limit(
         text,
         attachment_urls,
@@ -2456,7 +2678,13 @@ def _build_user_message_content(
 async def _build_user_message_content_async(
     text: str, attachment_urls: list[str]
 ) -> str | list[dict[str, Any]]:
-    """Build user message content with strict base64 JPEG image attachments."""
+    """Build user message content from text and image attachments.
+
+    When the primary model is natively multimodal, images are passed directly
+    to it as base64 ``image_url`` blocks (no separate vision model). Otherwise
+    images are forwarded to the Mistral describer model and the descriptions
+    are fed back as text.
+    """
     normalized_text, normalized_attachments = _apply_image_attachment_limit(
         text,
         attachment_urls,
@@ -2467,35 +2695,76 @@ async def _build_user_message_content_async(
             normalized_attachments,
         )
 
-    use_nvcf = _model_needs_nvcf_assets()
-    converted_attachments: list[str] = []
-    dropped_count = 0
+    # Native multimodal: pass images straight to the primary model.
+    if _model_supports_multimodal():
+        image_blocks: list[dict[str, Any]] = []
+        failed_count = 0
+        async with aiohttp.ClientSession() as session:
+            for url in normalized_attachments:
+                data_url = await _attachment_url_to_base64_data_url(session, url)
+                if data_url:
+                    image_blocks.append(
+                        {"type": "image_url", "image_url": {"url": data_url}}
+                    )
+                else:
+                    failed_count += 1
+
+        if image_blocks:
+            text_part = normalized_text
+            if failed_count:
+                note = (
+                    f"[Note: {failed_count} image"
+                    f"{'s' if failed_count > 1 else ''} could not be processed]"
+                )
+                text_part = f"{text_part}\n\n{note}" if text_part else note
+            content: list[dict[str, Any]] = []
+            if text_part:
+                content.append({"type": "text", "text": text_part})
+            content.extend(image_blocks)
+            return content
+
+        # All conversions failed — degrade to text rather than dropping the turn.
+        fallback = "[Image attachment could not be processed]"
+        return f"{normalized_text}\n\n{fallback}" if normalized_text else fallback
+
+    # Non-multimodal model: download all images and send to the describer model
+    image_data: list[tuple[bytes, str]] = []
+    failed_count = 0
     async with aiohttp.ClientSession() as session:
         for url in normalized_attachments:
-            if use_nvcf:
-                ref = await _attachment_url_to_model_ref(session, url, use_nvcf=True)
+            image_bytes, content_type = await _download_image_bytes(session, url)
+            if image_bytes and content_type:
+                image_data.append((image_bytes, content_type))
             else:
-                ref = await _attachment_url_to_base64_data_url(session, url)
-            if ref:
-                converted_attachments.append(ref)
+                failed_count += 1
+
+        descriptions: list[str | None] = []
+        if image_data:
+            descriptions = await _describe_images_with_mistral(session, image_data)
+
+    # Build text with image descriptions
+    description_parts: list[str] = []
+    for i, desc in enumerate(descriptions):
+        if desc:
+            if len(descriptions) == 1:
+                description_parts.append(f"[Image description]\n{desc}")
             else:
-                dropped_count += 1
+                description_parts.append(f"[Image {i + 1} description]\n{desc}")
 
-    if dropped_count > 0:
-        conversion_note = (
-            f"[Image conversion warning: dropped {dropped_count} image"
-            f"{'' if dropped_count == 1 else 's'} due to conversion failure.]"
-        )
-        normalized_text = (
-            f"{normalized_text}\n\n{conversion_note}"
-            if normalized_text
-            else conversion_note
+    if failed_count > 0:
+        description_parts.append(
+            f"[Note: {failed_count} image{'s' if failed_count > 1 else ''} "
+            f"could not be processed]"
         )
 
-    return _build_user_message_content_from_normalized(
-        normalized_text,
-        converted_attachments,
-    )
+    if description_parts:
+        image_context = "\n\n".join(description_parts)
+        if normalized_text:
+            normalized_text = f"{normalized_text}\n\n{image_context}"
+        else:
+            normalized_text = image_context
+
+    return normalized_text
 
 
 async def _build_imessage_user_content(
@@ -3182,7 +3451,11 @@ async def send_imessage(
                     "status": resp.status,
                 }
 
-        return last_result or {"success": True, "skipped": True, "reason": "empty payload"}
+        return last_result or {
+            "success": True,
+            "skipped": True,
+            "reason": "empty payload",
+        }
     except Exception as e:
         return {"success": False, "error": str(e)}
     finally:
@@ -4378,7 +4651,7 @@ async def telegram_clear(
 async def telegram_memory_stats(
     handler: AgentHandler, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
 ):
-    """Handle /memorystats command - show memory cadence and dream profile status."""
+    """Handle /memorystats command - show memory cadence and stats."""
     if update.message is None or update.effective_user is None:
         return
 
@@ -4560,7 +4833,7 @@ async def telegram_handle_msg(
     )
 
 
-async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+async def telegram_error_handler(update: object, context: "ContextTypes.DEFAULT_TYPE"):
     """Handle errors in the Telegram bot."""
     logger.error(f"Telegram bot error: {context.error}", exc_info=context.error)
 

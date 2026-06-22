@@ -14,8 +14,10 @@ inline inside ``process_response`` and adds:
 """
 
 import asyncio
+import base64
 import logging
 import json
+import os
 import re
 from typing import Any, Awaitable, Callable, Optional
 
@@ -31,196 +33,292 @@ from api import (
     safe_strip_markdown,
 )
 from tools import (
+    get_send_message_buffer,
+    init_declared_message_count,
+    init_send_message_buffer,
+    reset_declared_message_count,
+    reset_send_message_buffer,
     reset_tool_runtime_messages,
     set_tool_runtime_messages,
 )
 
-# Patterns that indicate the model is narrating intended actions instead of
-# executing them. When detected in a text-only response (no tool_calls), the
-# loop nudges the model to actually make the calls.
-_ACTION_INTENT_PATTERNS = re.compile(
-    r"(?i)"
-    r"(?:activating\s+(?:the\s+)?(?:`[^`]+`|[\w-]+)\s+skill)"
-    r"|(?:stand\s+by\s+while\s+i)"
-    r"|(?:let\s+me\s+(?:actually\s+)?(?:(?:\w+\s+){0,4})?(?:run|execute|call|create|write|inspect|check|verify|investigate|debug|review|push|publish|post|upload|deploy))"
-    r"|(?:i(?:'m|\s+am)\s+(?:going\s+to|about\s+to|now\s+going\s+to)\s+(?:run|execute|call|create|write|activate|inspect|check|verify|investigate|debug|review|push|publish|post|upload|deploy))"
-    r"|(?:sending\s+`?(?:like|love|dislike|laugh|emphasize|question)`?\s+to\b)"
-    r"|(?:react(?:ing|ion)\s+with\s+`?(?:like|love|dislike|laugh|emphasize|question)`?\b)"
-    r"|(?:\b(?:running|writing|creating|building|scaffolding|fixing|inspecting|checking|verifying|investigating|debugging|reviewing|pushing|publishing|posting|uploading|deploying)\b.{0,80}\b(?:now|rn)\b)"
-    r"|(?:running\s+the\s+.{3,60}\s+(?:script|command|tool))"
-    r"|(?:i\s+need\s+to:\s*\n)"
-)
-_TOOL_REQUIREMENT_PATTERNS = re.compile(
-    r"(?is)"
-    r"(?:tool\s+execution\s+is\s+mandatory)"
-    r"|(?:must\s+(?:use|call|execute|run).{0,40}(?:tool|tool_call))"
-    r"|(?:do\s+not\s+answer.{0,80}(?:without|unless).{0,40}(?:tool|tool_call))"
-    r"|(?:if\s+you\s+do\s+not\s+execute.{0,60}fail)"
-)
-_PSEUDO_TOOL_TAG_PATTERN = re.compile(r"<[A-Za-z_][\w]*\([^<>]*\)>")
-_PSEUDO_TOOL_XML_PATTERN = re.compile(
-    r"(?is)<(?:"
-    r"read|write|edit|glob|grep|bash|web_search|webfetch|codesearch|"
-    r"activate_skill|add_skill|"
-    r"send_tapback|send_telegram_reaction|send_reaction|"
-    r"consortium_[a-z_]+|reminder_[a-z_]+"
-    r")\b[^>]*>"
-)
-_PSEUDO_FUNCTION_XML_PATTERN = re.compile(r"(?is)<function_[A-Za-z_][\w-]*\b")
-_PSEUDO_TOOL_MARKDOWN_PATTERN = re.compile(
-    r"(?im)(?:^|[\r\n])\s*[*_`~][*_`~ ]*"
-    r"(?:read|write|edit|glob|grep|bash|web_search|webfetch|codesearch|"
-    r"activate_skill|add_skill|"
-    r"send_tapback|send_telegram_reaction|send_reaction|"
-    r"consortium_[a-z_]+|reminder_[a-z_]+)"
-    r"\s*(?:[:(])"
-)
-# Catches bare tool_name{json} pseudo-tool format (e.g. send_message{"text": "hi"})
-_PSEUDO_TOOL_BARE_JSON_PATTERN = re.compile(
-    r"(?m)(?:^|[\r\n])\s*(?:"
-    r"read|write|edit|glob|grep|bash|web_search|webfetch|codesearch|"
-    r"activate_skill|add_skill|"
-    r"send_message|send_tapback|send_telegram_reaction|send_reaction|"
-    r"declare_message_count|remember|recall|"
-    r"consortium_[a-z_]+|reminder_[a-z_]+"
-    r")\{"
-)
-TAPBACK_ACK_PATTERN = re.compile(
-    r"(?is)^\s*"
-    r"(?:done|ok(?:ay)?|sent)[.!]?\s*$"
-    r"|^\s*(?:done[.!]?\s*)?"
-    r"(?:"
-    r"(?:(?:i\s+)?(?:sent|sending|reacted)\b.{0,220}\b(?:tapback|reaction)\b.{0,220})"
-    r"|"
-    r"(?:(?:i\s+)?(?:sent|sending|reacted)\b.{0,220}\b(?:like|love|dislike|laugh|emphasize|question)\b.{0,220}\b(?:to\s+your|message)\b.{0,220})"
-    r")"
-    r"\s*$"
-)
-_BARE_REACTION_PATTERN = re.compile(
-    r"^(?:like|love|dislike|laugh|emphasize|question)[.!]?\s*$",
-    re.IGNORECASE,
-)
-_SHORT_REACTION_ACK_PREFIX_PATTERN = re.compile(
-    r"^(?:sent|sending|reacted|done)\b",
-    re.IGNORECASE,
-)
+# Matches a literal <DONE> completion-protocol marker on its own line or
+# surrounded by whitespace. Stripped from visible text after send_message
+# delivers the real reply.
+_DONE_MARKER_RE = re.compile(r"(?im)^\s*<\s*DONE\s*>\s*$")
+
+
+def _model_supports_multimodal_blocks(model_id: Optional[str]) -> bool:
+    """True when ``model_id`` accepts inline image_url content blocks."""
+    if not model_id:
+        return False
+    try:
+        from integrations import MULTIMODAL_MODEL_IDS
+    except Exception:
+        return False
+    return model_id.lower() in MULTIMODAL_MODEL_IDS
+
+
+def _browser_screenshot_paths(
+    message: dict[str, Any], tool_results: list[dict[str, Any]]
+) -> list[str]:
+    """Return file paths produced by successful browser_screenshot tool calls."""
+    id_to_name = {
+        tc.get("id"): tc.get("function", {}).get("name")
+        for tc in message.get("tool_calls", []) or []
+    }
+    paths: list[str] = []
+    for res in tool_results:
+        if id_to_name.get(res.get("tool_call_id")) != "browser_screenshot":
+            continue
+        content = res.get("content")
+        if not isinstance(content, str):
+            continue
+        try:
+            data = json.loads(content)
+        except Exception:
+            continue
+        if isinstance(data, dict) and data.get("success") and data.get("path"):
+            paths.append(data["path"])
+    return paths
+
+
+def _screenshot_file_to_data_url(path: str) -> Optional[str]:
+    """Read a screenshot file and return a base64 image data URL (resized JPEG)."""
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+        if not raw:
+            return None
+        try:
+            from integrations import _resize_image_to_jpeg_sync
+
+            resized = _resize_image_to_jpeg_sync(raw)
+        except Exception:
+            resized = None
+        if resized:
+            return "data:image/jpeg;base64," + base64.b64encode(resized).decode("ascii")
+        return "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+    except Exception as e:
+        logger.warning("Failed to load browser screenshot %s: %s", path, e)
+        return None
+
+
+def _inject_browser_screenshots(
+    messages: list[dict[str, Any]],
+    message: dict[str, Any],
+    tool_results: list[dict[str, Any]],
+    model_id: Optional[str],
+) -> int:
+    """Append captured browser screenshots as a multimodal user message.
+
+    Screenshots produced by ``browser_screenshot`` are saved to disk and the
+    tool only returns a path (which the model cannot see). For natively
+    multimodal models, inject the actual image so the next round can view it.
+    Returns the number of screenshots injected.
+    """
+    if not _model_supports_multimodal_blocks(model_id):
+        return 0
+    paths = _browser_screenshot_paths(message, tool_results)
+    if not paths:
+        return 0
+    blocks: list[dict[str, Any]] = [
+        {"type": "text", "text": "[Browser screenshot — here is what the page looks like:]"}
+    ]
+    for path in paths:
+        data_url = _screenshot_file_to_data_url(path)
+        if data_url:
+            blocks.append({"type": "image_url", "image_url": {"url": data_url}})
+    if len(blocks) <= 1:
+        return 0
+    messages.append({"role": "user", "content": blocks})
+    return len(blocks) - 1
+
+
+def _strip_done_marker(text: str) -> str:
+    if not text:
+        return text
+    return _DONE_MARKER_RE.sub("", text).strip()
+
+
+def _assemble_send_message_buffer_response(
+    buffer: list[dict[str, Any]],
+    fallback_text: str,
+    accumulated_attachments: list[str],
+) -> Optional[str]:
+    """Build the loop's final response from a non-empty send_message buffer.
+
+    Channel-bound entries (imessage/telegram) were already delivered by the
+    send_message tool, so we return a ``delivered_via_tool`` envelope and
+    integration code skips re-sending.  For non-channel sessions (CLI,
+    OpenAI-compat, tests) we concatenate the buffered bubbles into the
+    visible response so callers see the actual reply text.
+    """
+    if not buffer:
+        return None
+
+    channels = {str(record.get("channel") or "").strip() for record in buffer}
+    bound_channels = {"imessage", "telegram"}
+    delivered_via_tool = bool(channels & bound_channels)
+
+    buffered_attachments: list[str] = list(accumulated_attachments)
+    bubble_texts: list[str] = []
+    for record in buffer:
+        text = str(record.get("text") or "").strip()
+        if text:
+            bubble_texts.append(text)
+        for url in record.get("attachments") or []:
+            normalized = str(url).strip()
+            if normalized and normalized not in buffered_attachments:
+                buffered_attachments.append(normalized)
+
+    if delivered_via_tool:
+        envelope: dict[str, Any] = {
+            "delivered_via_tool": True,
+            "text": "",
+            "attachments": [],
+        }
+        return json.dumps(envelope)
+
+    visible_text = "\n\n".join(bubble_texts) if bubble_texts else fallback_text
+    if buffered_attachments:
+        return json.dumps(
+            {"text": visible_text, "attachments": buffered_attachments}
+        )
+    return visible_text
 
 logger = logging.getLogger(__name__)
 
 # Safety cap: maximum number of tool-call rounds before we force a final answer.
 DEFAULT_MAX_ITERATIONS = 10
-DEFAULT_MAX_ACTION_INTENT_RETRIES = 3
-DEFAULT_MAX_TAPBACK_REPLY_RETRIES = 1
-REACTION_TOOL_NAMES = {"send_tapback", "send_telegram_reaction", "send_reaction"}
-REACTION_WORD_NAMES = {
-    "love",
-    "like",
-    "dislike",
-    "laugh",
-    "emphasize",
-    "question",
-    "party",
-    "clap",
-    "cry",
-    "sob",
-    "scream",
-    "mindblown",
-    "pray",
-    "cool",
-    "100",
-    "hearts",
-    "starry",
-    "angry",
-    "devil",
-    "ghost",
-    "clown",
-    "shrug",
-    "eyes",
-    "kiss",
-    "hug",
-    "salute",
-    "nerd",
-    "trophy",
-    "heartbreak",
-    "heartonfire",
-    "vomit",
-    "poo",
-    "ok",
-    "whale",
-    "dove",
-    "unicorn",
-    "moai",
-    "banana",
-    "strawberry",
-    "champagne",
-    "hotdog",
-    "yawn",
-    "woozy",
-    "sleep",
-    "scared",
-    "handshake",
-    "halo",
-    "grin",
-    "alien",
-    "lightning",
-    "moon",
-    "cursing",
-    "zany",
-    "lipstick",
-    "nailpolish",
-    "middlefinger",
-    "coder",
-    "pill",
-    "pumpkin",
-    "cupid",
-    "hearteyes",
-    "writing",
-    "santa",
-    "christmas",
-    "snowman",
-    "seenoevil",
-}
-_SKILL_URL_PATTERN = re.compile(
-    r"https?://\S*?skill\S*?\.md(?:\b|[?#]|$)",
-    re.IGNORECASE,
-)
-_SKILL_URL_HESITATION_PATTERNS = re.compile(
-    r"(?i)"
-    r"(?:prompt[-\s]?injection)"
-    r"|(?:suspicious)"
-    r"|(?:unsafe|untrusted)"
-    r"|(?:can't|cannot|won't|will not|should not).{0,80}(?:install|add|fetch)"
-    r"|(?:manual(?:ly)?\s+review)"
-)
-
-# ── Tool context optimization thresholds ──────────────────────────────────────
-
-
-def contains_action_intent_narration(text: str) -> bool:
-    """Return True when text looks like narrated work instead of executed work."""
-    if not text:
-        return False
-    return bool(_ACTION_INTENT_PATTERNS.search(text))
-
-
-def latest_user_skill_url(messages: list[dict[str, Any]]) -> str:
-    """Return the latest user-provided skill URL, if present."""
-    for message in reversed(messages):
-        if message.get("role") != "user":
-            continue
-        candidate = _message_content_to_text(message.get("content", ""))
-        stripped = candidate.strip()
-        if stripped.startswith("[System:"):
-            continue
-        match = _SKILL_URL_PATTERN.search(candidate)
-        if match:
-            return match.group(0)
-        break
-
-    return ""
-
 
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
+
+
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    """Read a non-negative int env var, falling back to ``default`` on error."""
+    try:
+        return max(minimum, int(os.environ.get(name, str(default)).strip()))
+    except (ValueError, AttributeError):
+        return default
+
+
+# ── Tool-call history compaction ──────────────────────────────────────────────
+# After a tool round executes, the assistant message (including the verbatim
+# tool-call ``arguments``) is retained in ``messages`` and re-sent on every
+# subsequent API call.  Large arguments — most commonly a whole file passed to
+# ``write`` — bloat every following request, wasting tokens and stressing the
+# provider into transient truncation errors.  Once a tool has executed, the
+# model only needs to *remember that it ran*, not the full payload, so we
+# replace large string fields with a compact, readable placeholder in the
+# retained copy.  Keyed on argument size (generic), not on tool identity.
+_COMPACT_TOOL_ARGS = os.environ.get("AGENTZERO_COMPACT_TOOL_ARGS", "1").strip() != "0"
+# Min serialized-arguments length before a tool call is considered for compaction.
+_COMPACT_TOOL_ARG_THRESHOLD = _env_int(
+    "AGENTZERO_COMPACT_TOOL_ARG_THRESHOLD", 2000, minimum=200
+)
+# Min individual string-field length before that field is elided.
+_COMPACT_FIELD_THRESHOLD = _env_int(
+    "AGENTZERO_COMPACT_FIELD_THRESHOLD", 1000, minimum=100
+)
+
+
+def _compact_executed_tool_call_args(
+    message: dict[str, Any], round_number: int
+) -> dict[str, Any]:
+    """Return a history-safe copy of an assistant message with large tool-call
+    ``arguments`` elided.
+
+    The input ``message`` is never mutated — the tool calls it carries have
+    already executed with full fidelity; only the copy retained in history is
+    shrunk.  Large string fields inside each call's JSON ``arguments`` are
+    replaced with a ``<elided N chars …>`` placeholder so the model keeps the
+    fact of the action (tool name, target, size) without re-uploading the
+    payload on every later round.  Idempotent: placeholders are below the
+    threshold, so re-compacting is a no-op.
+    """
+    if not _COMPACT_TOOL_ARGS:
+        return message
+    tool_calls = message.get("tool_calls")
+    if not isinstance(tool_calls, list) or not tool_calls:
+        return message
+
+    new_tool_calls: list[dict[str, Any]] = []
+    changed = False
+    reclaimed = 0
+    for tool_call in tool_calls:
+        if not isinstance(tool_call, dict):
+            new_tool_calls.append(tool_call)
+            continue
+        function = tool_call.get("function")
+        raw_args = function.get("arguments") if isinstance(function, dict) else None
+        if not isinstance(raw_args, str) or len(raw_args) < _COMPACT_TOOL_ARG_THRESHOLD:
+            new_tool_calls.append(tool_call)
+            continue
+
+        compacted_args, field_reclaimed = _compact_arguments_string(
+            raw_args, round_number
+        )
+        if compacted_args == raw_args:
+            new_tool_calls.append(tool_call)
+            continue
+
+        changed = True
+        reclaimed += field_reclaimed
+        new_function = dict(function)
+        new_function["arguments"] = compacted_args
+        new_call = dict(tool_call)
+        new_call["function"] = new_function
+        new_tool_calls.append(new_call)
+
+    if not changed:
+        return message
+
+    logger.info(
+        "Agentic loop: compacted tool-call arguments in retained history "
+        "(round %d, reclaimed ~%d chars).",
+        round_number,
+        reclaimed,
+    )
+    new_message = dict(message)
+    new_message["tool_calls"] = new_tool_calls
+    return new_message
+
+
+def _compact_arguments_string(raw_args: str, round_number: int) -> tuple[str, int]:
+    """Elide large string fields in a JSON ``arguments`` string.
+
+    Returns ``(compacted_string, chars_reclaimed)``.  Falls back to truncating
+    the raw string when it is not valid JSON (e.g. recovered/leaked calls).
+    """
+    try:
+        parsed = json.loads(raw_args)
+    except (json.JSONDecodeError, TypeError):
+        # Not valid JSON — truncate the raw blob but keep a readable marker.
+        head = raw_args[:_COMPACT_FIELD_THRESHOLD]
+        reclaimed = len(raw_args) - len(head)
+        return (
+            f"{head}…[elided {reclaimed} chars — executed in round {round_number}]",
+            reclaimed,
+        )
+
+    if not isinstance(parsed, dict):
+        return raw_args, 0
+
+    reclaimed = 0
+    new_parsed: dict[str, Any] = {}
+    for key, value in parsed.items():
+        if isinstance(value, str) and len(value) >= _COMPACT_FIELD_THRESHOLD:
+            reclaimed += len(value)
+            new_parsed[key] = (
+                f"<elided {len(value)} chars — '{key}' written in round {round_number}>"
+            )
+        else:
+            new_parsed[key] = value
+
+    if reclaimed == 0:
+        return raw_args, 0
+    return json.dumps(new_parsed), reclaimed
 
 
 def extract_outbound_attachments(
@@ -263,199 +361,104 @@ def extract_outbound_attachments(
     return urls
 
 
-def user_explicitly_requires_tool_execution(
-    messages: list[dict[str, Any]], allowed_tool_names: set[str]
-) -> bool:
-    """Return True when the latest real user turn explicitly requires tools."""
-    latest_user_text = ""
-    for message in reversed(messages):
-        if message.get("role") != "user":
-            continue
-        candidate = _message_content_to_text(message.get("content", ""))
-        stripped = candidate.strip()
-        if stripped.startswith("[System:"):
-            continue
-        latest_user_text = candidate
-        break
+# Markers that mean the failed round is a transient provider hiccup (most often
+# the provider failing to serialize the model's own tool-call output) rather
+# than a permanent client error.  Used to decide whether a tools-stripped
+# graceful finish is worth attempting before surfacing a raw error.
+_RECOVERABLE_ERROR_MARKERS = (
+    "unterminated string",
+    "expecting value",
+    "expecting ',' delimiter",
+    "expecting property name",
+    "invalid \\escape",
+    "extra data",
+    "jsondecode",
+    "internal server error",
+    "internal error",
+    "service unavailable",
+    "temporarily unavailable",
+    "bad gateway",
+    "gateway timeout",
+    "timeout",
+    "timed out",
+    "overloaded",
+    "try again",
+    "please retry",
+    "upstream",
+    # A rate limit exhausted in api_call_with_retry is also recoverable: a
+    # tools-stripped graceful finish re-runs through api_call_with_retry, whose
+    # own retry/backoff gives the rolling window time to clear.  Worst case it
+    # also fails and we fall back to the raw-error path — never worse than today.
+    "rate limit",
+    "rate_limit",
+)
 
-    if not latest_user_text:
+
+def _looks_recoverable(error_msg: str) -> bool:
+    """Return True when a failed round looks transient enough to retry as text."""
+    if not error_msg:
         return False
-
-    if _TOOL_REQUIREMENT_PATTERNS.search(latest_user_text):
-        return True
-
-    lowered = latest_user_text.lower()
-    if "tool" in lowered and re.search(r"(?i)\b(?:use|call|execute|run)\b", lowered):
-        return True
-
-    for tool_name in allowed_tool_names:
-        if re.search(
-            rf"(?i)\b(?:use|call|execute|run)\s+(?:the\s+)?`?{re.escape(tool_name)}`?(?:\s+tool)?\b",
-            latest_user_text,
-        ):
-            return True
-
-    return False
+    lowered = error_msg.lower()
+    return any(marker in lowered for marker in _RECOVERABLE_ERROR_MARKERS)
 
 
-def is_bare_reaction_word(text: str) -> bool:
-    """Return True when text is just a tapback reaction word with no other content."""
-    if not text:
-        return False
-    return bool(_BARE_REACTION_PATTERN.match(text.strip()))
-
-
-def contains_pseudo_tool_syntax(text: str) -> bool:
-    """Return True when text contains fake angle-bracket tool markup."""
-    if not text:
-        return False
-    return bool(
-        _PSEUDO_TOOL_TAG_PATTERN.search(text)
-        or _PSEUDO_TOOL_XML_PATTERN.search(text)
-        or _PSEUDO_FUNCTION_XML_PATTERN.search(text)
-        or _PSEUDO_TOOL_MARKDOWN_PATTERN.search(text)
-        or _PSEUDO_TOOL_BARE_JSON_PATTERN.search(text)
-    )
-
-
-def text_contains_reaction_emoji(text: str) -> bool:
-    """Return True when text contains any Telegram reaction emoji."""
-    if not text:
-        return False
-    try:
-        from integrations import TELEGRAM_REACTION_EMOJI_MAP
-
-        return any(emoji in text for emoji in TELEGRAM_REACTION_EMOJI_MAP.values())
-    except ImportError:
-        return False
-
-
-def conversation_exposes_reaction_targets(messages: list[dict[str, Any]]) -> bool:
-    """Return True when the prompt context includes concrete reaction targets."""
-    for message in messages:
-        content = _message_content_to_text(message.get("content", ""))
-        if (
-            "[Available Telegram reaction targets" in content
-            or "[Available iMessage tapback handles" in content
-        ):
-            return True
-    return False
-
-
-def looks_like_short_reaction_ack(text: str) -> bool:
-    """Return True for terse `sent! ❤️`-style acknowledgements."""
-    normalized = (text or "").strip()
-    if not normalized or len(normalized) > 32:
-        return False
-    if not _SHORT_REACTION_ACK_PREFIX_PATTERN.match(normalized):
-        return False
-
-    remainder = _SHORT_REACTION_ACK_PREFIX_PATTERN.sub("", normalized, count=1).strip()
-    if not remainder:
-        return False
-
-    compact = re.sub(r"[\s.!?]+", "", remainder)
-    if not compact:
-        return False
-
-    if re.fullmatch(r"[^\w]+", compact):
-        return True
-
-    lowered = compact.lower()
-    return lowered in REACTION_WORD_NAMES
-
-
-def needs_tapback_followup_reply(text: str, executed_tool_names: list[str]) -> bool:
-    """Return True when a reaction-only turn still needs a normal text reply."""
-    if not text or not executed_tool_names:
-        return False
-
-    normalized_tool_names = {name for name in executed_tool_names if name}
-    if len(normalized_tool_names) != 1 or not normalized_tool_names.issubset(
-        REACTION_TOOL_NAMES
-    ):
-        return False
-
-    return bool(
-        TAPBACK_ACK_PATTERN.match(text.strip())
-    ) or looks_like_short_reaction_ack(text)
-
-
-def _extract_tool_rounds(
+async def _attempt_graceful_finish(
+    *,
     messages: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Walk messages and identify tool call rounds.
+    session: aiohttp.ClientSession,
+    base_url: str,
+    api_key: str,
+    base_payload: dict[str, Any],
+    executed_tool_names: list[str],
+) -> Optional[str]:
+    """Make a tools-stripped call so the model summarises completed work.
 
-    Each round = one assistant message with tool_calls + its consecutive tool
-    role result messages.  Non-tool messages (system, user, text-only assistant)
-    are tagged as "passthrough" and always kept.
-
-    Returns list of dicts:
-      - passthrough: {"type": "passthrough", "messages": [...], "start_pos": int, "end_pos": int}
-      - round:       {"type": "round", "round_index": int, "assistant_msg": dict,
-                       "tool_result_msgs": [...], "start_pos": int, "end_pos": int}
+    Used when a tool round already did real work but the *next* round failed on
+    a transient provider parse/serialize error.  Stripping tools removes the
+    large/complex tool-call serialization that the provider was choking on, so
+    the model can usually produce a clean plain-text summary.  Returns the
+    summary text, or ``None`` if the recovery attempt also fails (caller then
+    falls back to the raw error path).
     """
-    segments: list[dict[str, Any]] = []
-    passthrough_buf: list[dict[str, Any]] = []
-    passthrough_start: int | None = None
-    round_index = 0
-    i = 0
-
-    while i < len(messages):
-        msg = messages[i]
-
-        # Detect assistant message with tool_calls
-        if msg.get("role") == "assistant" and msg.get("tool_calls"):
-            # Flush passthrough buffer
-            if passthrough_buf:
-                segments.append(
-                    {
-                        "type": "passthrough",
-                        "messages": list(passthrough_buf),
-                        "start_pos": passthrough_start,
-                        "end_pos": i - 1,
-                    }
-                )
-                passthrough_buf.clear()
-                passthrough_start = None
-
-            assistant_pos = i
-            tool_results: list[dict[str, Any]] = []
-            j = i + 1
-            while j < len(messages) and messages[j].get("role") == "tool":
-                tool_results.append(messages[j])
-                j += 1
-
-            segments.append(
-                {
-                    "type": "round",
-                    "round_index": round_index,
-                    "assistant_msg": msg,
-                    "tool_result_msgs": tool_results,
-                    "start_pos": assistant_pos,
-                    "end_pos": j - 1,
-                }
-            )
-            round_index += 1
-            i = j
-        else:
-            if passthrough_start is None:
-                passthrough_start = i
-            passthrough_buf.append(msg)
-            i += 1
-
-    # Flush remaining passthrough
-    if passthrough_buf:
-        segments.append(
-            {
-                "type": "passthrough",
-                "messages": list(passthrough_buf),
-                "start_pos": passthrough_start,
-                "end_pos": len(messages) - 1,
-            }
+    finish_messages = list(messages)
+    finish_messages.append(
+        {
+            "role": "user",
+            "content": (
+                "[System: The previous step hit a temporary provider error. Do "
+                "NOT call any tools. In plain text, tell the user what you have "
+                "completed so far and give them a clear final answer now.]"
+            ),
+        }
+    )
+    finish_payload = {k: v for k, v in base_payload.items() if k != "tools"}
+    finish_payload["messages"] = finish_messages
+    try:
+        finish_data = await api_call_with_retry(
+            session,
+            base_url,
+            finish_payload,
+            {"Authorization": f"Bearer {api_key}"},
         )
+    except Exception:  # noqa: BLE001 — recovery is best-effort
+        logger.exception("Graceful-finish recovery attempt raised.")
+        return None
 
-    return segments
+    if "error" in finish_data or not finish_data.get("choices"):
+        return None
+
+    text = _message_content_to_text(
+        finish_data["choices"][0]["message"].get("content", "")
+    ).strip()
+    if not text or detect_tool_leak(text):
+        return None
+
+    logger.info(
+        "Agentic loop: recovered from transient round error via tools-stripped "
+        "finish (tools_executed=%s).",
+        executed_tool_names,
+    )
+    return text
 
 
 async def run_agentic_loop(
@@ -467,8 +470,6 @@ async def run_agentic_loop(
     stream_chunk_callback: Optional[Callable[[str], Awaitable[None]]] = None,
     max_iterations: int = DEFAULT_MAX_ITERATIONS,
     max_tool_leak_retries: int = 1,
-    max_action_intent_retries: int = DEFAULT_MAX_ACTION_INTENT_RETRIES,
-    max_tapback_reply_retries: int = DEFAULT_MAX_TAPBACK_REPLY_RETRIES,
     initial_response_data: Optional[dict[str, Any]] = None,
 ) -> str:
     """Run the agentic loop until the model produces a final text answer.
@@ -503,8 +504,6 @@ async def run_agentic_loop(
         stream_chunk_callback=stream_chunk_callback,
         max_iterations=max_iterations,
         max_tool_leak_retries=max_tool_leak_retries,
-        max_action_intent_retries=max_action_intent_retries,
-        max_tapback_reply_retries=max_tapback_reply_retries,
         initial_response_data=initial_response_data,
         allowed_tool_names=allowed_tool_names,
         allowed_tool_names_set=allowed_tool_names_set,
@@ -521,22 +520,85 @@ async def _run_agentic_loop_inner(
     stream_chunk_callback: Optional[Callable[[str], Awaitable[None]]],
     max_iterations: int,
     max_tool_leak_retries: int,
-    max_action_intent_retries: int,
-    max_tapback_reply_retries: int,
     initial_response_data: Optional[dict[str, Any]],
     allowed_tool_names: list[str],
     allowed_tool_names_set: set[str],
 ) -> str:
     tool_leak_retries_used = 0
-    action_intent_retries_used = 0
-    tapback_reply_retries_used = 0
     executed_tool_rounds = 0
     executed_tool_names: list[str] = []
     pending_response_data: Optional[dict[str, Any]] = initial_response_data
     accumulated_attachments: list[str] = []
 
+    # Track send_message tool deliveries so the final return can reflect
+    # what the model actually sent to the user.  Channel-bound deliveries
+    # (iMessage/Telegram) happen out-of-band inside the tool; non-channel
+    # sessions rely on the loop to assemble buffered bubbles into the
+    # visible response.
+    send_buffer_token = init_send_message_buffer()
+    declared_count_token = init_declared_message_count()
+    try:
+        return await _run_agentic_loop_body(
+            messages=messages,
+            session=session,
+            base_url=base_url,
+            api_key=api_key,
+            base_payload=base_payload,
+            stream_chunk_callback=stream_chunk_callback,
+            max_iterations=max_iterations,
+            max_tool_leak_retries=max_tool_leak_retries,
+            initial_response_data=initial_response_data,
+            allowed_tool_names=allowed_tool_names,
+            allowed_tool_names_set=allowed_tool_names_set,
+            tool_leak_retries_used=tool_leak_retries_used,
+            executed_tool_rounds=executed_tool_rounds,
+            executed_tool_names=executed_tool_names,
+            pending_response_data=pending_response_data,
+            accumulated_attachments=accumulated_attachments,
+        )
+    except Exception as exc:
+        # Catch-all so a failure ANYWHERE in the loop (tool execution, payload
+        # mutation, parsing, etc.) surfaces as a clean Error string that bubbles
+        # to the caller instead of crashing the turn.
+        logger.exception(
+            "Agentic loop crashed (tools_executed=%s)", executed_tool_names
+        )
+        tools_context = (
+            f", tools_executed={executed_tool_names}" if executed_tool_names else ""
+        )
+        return f"Error: {exc} [agentic_loop{tools_context}]"
+    finally:
+        reset_send_message_buffer(send_buffer_token)
+        reset_declared_message_count(declared_count_token)
+
+
+async def _run_agentic_loop_body(
+    *,
+    messages: list[dict[str, Any]],
+    session: aiohttp.ClientSession,
+    base_url: str,
+    api_key: str,
+    base_payload: dict[str, Any],
+    stream_chunk_callback: Optional[Callable[[str], Awaitable[None]]],
+    max_iterations: int,
+    max_tool_leak_retries: int,
+    initial_response_data: Optional[dict[str, Any]],
+    allowed_tool_names: list[str],
+    allowed_tool_names_set: set[str],
+    tool_leak_retries_used: int,
+    executed_tool_rounds: int,
+    executed_tool_names: list[str],
+    pending_response_data: Optional[dict[str, Any]],
+    accumulated_attachments: list[str],
+) -> str:
     for iteration in range(max_iterations + 1):  # +1 so the forced-finish call is free
         forced_finish = iteration == max_iterations
+        logger.debug(
+            "Loop iter %d/%d starting (forced_finish=%s)",
+            iteration + 1,
+            max_iterations,
+            forced_finish,
+        )
 
         if pending_response_data is not None:
             # Use the pre-fetched response for this iteration (no API call needed).
@@ -585,6 +647,24 @@ async def _run_agentic_loop_inner(
             logger.error(
                 "Agentic loop API error (iteration %d): %s", iteration, error_msg
             )
+
+            # If tool rounds already executed real work (e.g. a website was
+            # written) and the failure is a transient provider parse/serialize
+            # error on the *next* round, don't dump raw parser guts at the user.
+            # Make one tools-stripped attempt to have the model summarise what it
+            # accomplished in plain text instead.
+            if executed_tool_names and not forced_finish and _looks_recoverable(error_msg):
+                recovered = await _attempt_graceful_finish(
+                    messages=messages,
+                    session=session,
+                    base_url=base_url,
+                    api_key=api_key,
+                    base_payload=base_payload,
+                    executed_tool_names=executed_tool_names,
+                )
+                if recovered:
+                    return recovered
+
             tools_context = (
                 f", tools_executed={executed_tool_names}" if executed_tool_names else ""
             )
@@ -621,168 +701,12 @@ async def _run_agentic_loop_inner(
         # ── No tool calls → the model is done ────────────────────────────────
         if not tool_calls:
             content_text = _message_content_to_text(message.get("content", ""))
-            explicit_tool_required = (
-                executed_tool_rounds == 0
-                and user_explicitly_requires_tool_execution(
-                    messages, allowed_tool_names_set
-                )
-            )
-            requested_skill_url = (
-                latest_user_skill_url(messages)
-                if "add_skill" in allowed_tool_names_set
-                else ""
-            )
-            pseudo_tool_syntax_detected = contains_pseudo_tool_syntax(content_text)
-            reaction_ack_without_tool = (
-                not forced_finish
-                and executed_tool_rounds == 0
-                and conversation_exposes_reaction_targets(messages)
-                and text_contains_reaction_emoji(content_text)
-            )
 
-            if (
-                not forced_finish
-                and content_text
-                and pseudo_tool_syntax_detected
-                and action_intent_retries_used < max_action_intent_retries
-            ):
-                action_intent_retries_used += 1
-                logger.warning(
-                    "Agentic loop: detected invalid pseudo-tool syntax instead of real tool calls; "
-                    "nudging model to emit structured tool_calls (attempt %d/%d).",
-                    action_intent_retries_used,
-                    max_action_intent_retries,
-                )
-                messages.append(message)
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "[System: You wrote pseudo-tool syntax but produced zero "
-                            "tool calls. Text like <read(...)> is never executed. "
-                            "Make real structured tool_calls. Do not reply with "
-                            "text — make the tool call.]"
-                        ),
-                    },
-                )
-                continue
-
-            if (
-                not forced_finish
-                and requested_skill_url
-                and executed_tool_rounds == 0
-                and action_intent_retries_used < max_action_intent_retries
-            ):
-                action_intent_retries_used += 1
-                hesitation = bool(_SKILL_URL_HESITATION_PATTERNS.search(content_text))
-                logger.warning(
-                    "Agentic loop: user provided a skill URL but model returned text instead "
-                    "of calling add_skill; nudging install flow%s (attempt %d/%d).",
-                    " after self-blocking" if hesitation else "",
-                    action_intent_retries_used,
-                    max_action_intent_retries,
-                )
-                messages.append(message)
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "[System: You were given a skill URL but produced zero "
-                            "tool calls. Call add_skill with the URL: "
-                            f"{requested_skill_url} — do not reply with text, "
-                            "make the tool call.]"
-                        ),
-                    }
-                )
-                continue
-
-            # Detect "narrating actions without executing them" — the model
-            # describes what it will do but didn't make any tool calls.
-            # Give it one chance to actually execute.
-            # Only fire before any tool rounds have completed — after that,
-            # "let me publish" / "running the script" announcements are
-            # legitimate workflow narration, not tool avoidance.
-            if (
-                not forced_finish
-                and content_text
-                and (
-                    (
-                        executed_tool_rounds == 0
-                        and contains_action_intent_narration(content_text)
-                    )
-                    or is_bare_reaction_word(content_text)
-                    or reaction_ack_without_tool
-                    or explicit_tool_required
-                )
-                and action_intent_retries_used < max_action_intent_retries
-            ):
-                action_intent_retries_used += 1
-                if is_bare_reaction_word(content_text) or reaction_ack_without_tool:
-                    reason = "send a reaction"
-                    tool_hint = (
-                        "Call send_telegram_reaction with chat_id, message_id, "
-                        "and reaction from the available targets above"
-                    )
-                else:
-                    reason = "take action"
-                    tool_hint = "Make the tool_calls you described"
-                logger.warning(
-                    "Agentic loop: model tried to %s but produced zero "
-                    "tool calls (attempt %d/%d): %s",
-                    reason,
-                    action_intent_retries_used,
-                    max_action_intent_retries,
-                    content_text.strip()[:80],
-                )
-                messages.append(message)
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            f"[System: You tried to {reason} but produced zero "
-                            f"tool calls. {tool_hint}. Do not reply with "
-                            "text — make the tool call.]"
-                        ),
-                    },
-                )
-                continue
-
-            if (
-                needs_tapback_followup_reply(content_text, executed_tool_names)
-                and tapback_reply_retries_used < max_tapback_reply_retries
-            ):
-                tapback_reply_retries_used += 1
-                logger.warning(
-                    "Agentic loop: reaction tool executed but model replied with "
-                    "acknowledgement-only text; requesting a normal conversational "
-                    "follow-up (attempt %d/%d).",
-                    tapback_reply_retries_used,
-                    max_tapback_reply_retries,
-                )
-                messages.append(message)
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "[System: Reaction sent. Now reply to the user's "
-                            "actual message in plain text. Do not mention "
-                            "reactions, tool calls, or internal actions.]"
-                        ),
-                    }
-                )
-                retry_payload = {k: v for k, v in base_payload.items() if k != "tools"}
-                retry_payload["messages"] = messages
-                retry_data = await api_call_with_retry(
-                    session,
-                    base_url,
-                    retry_payload,
-                    {"Authorization": f"Bearer {api_key}"},
-                )
-                if retry_data.get("choices"):
-                    retry_msg = retry_data["choices"][0]["message"]
-                    content_text = _message_content_to_text(
-                        retry_msg.get("content", "")
-                    )
+            # Tool-call behavior (call tools instead of narrating, no pseudo-tool
+            # syntax, react via send_tapback/send_telegram_reaction, install skill
+            # URLs, don't claim success on tool errors) is enforced via the system
+            # prompt rather than code-side retry nudges. The model is trusted to
+            # call tools when appropriate; whatever it returns here is final.
 
             # Check for leaked tool content in the final response.
             if detect_tool_leak(content_text):
@@ -839,6 +763,21 @@ async def _run_agentic_loop_inner(
                     )
 
             final_text = safe_strip_markdown(content_text) if content_text else ""
+            # Strip the <DONE> completion-protocol marker from visible text;
+            # it is a signal to the loop, not user-facing content.
+            final_text = _strip_done_marker(final_text)
+
+            # If the model delivered via send_message this turn, the buffer
+            # is authoritative for the visible reply.  Channel-bound sends
+            # were already dispatched out-of-band; assemble accordingly.
+            buffered_response = _assemble_send_message_buffer_response(
+                get_send_message_buffer(),
+                fallback_text=final_text,
+                accumulated_attachments=accumulated_attachments,
+            )
+            if buffered_response is not None:
+                return buffered_response
+
             if accumulated_attachments:
                 return json.dumps(
                     {
@@ -867,14 +806,33 @@ async def _run_agentic_loop_inner(
             if tool_call.get("function", {}).get("name")
         )
 
-        logger.debug(
-            "Agentic loop iteration %d: executed %d tool call(s).",
-            iteration + 1,
+        logger.info(
+            "Loop iter %d: executed %d tool call(s): %s",
+            executed_tool_rounds,
             len(tool_calls),
+            ", ".join(
+                tc.get("function", {}).get("name", "?") for tc in tool_calls
+            ),
         )
 
-        messages.append(message)
+        # Retain a compacted copy so large tool-call argument payloads (e.g. a
+        # whole file passed to write) are not re-sent on every later round.
+        # ``message`` itself already executed with full args above.
+        messages.append(
+            _compact_executed_tool_call_args(message, round_number=executed_tool_rounds)
+        )
         messages.extend(tool_results)
+
+        # Surface browser screenshots to natively multimodal models so the
+        # model can actually see the page it just captured.
+        injected = _inject_browser_screenshots(
+            messages, message, tool_results, base_payload.get("model")
+        )
+        if injected:
+            logger.info(
+                "Agentic loop: injected %d browser screenshot(s) into multimodal context",
+                injected,
+            )
 
     # Unreachable — the forced_finish branch always returns — but satisfies mypy.
     return "Task completed."

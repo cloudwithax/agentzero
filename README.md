@@ -59,23 +59,13 @@ Multimodal/NVIDIA asset handling:
 - `NVCF_ASSET_UPLOAD_ENABLED` - Upload inbound multimodal image URLs to NVIDIA NVCF Assets before inference and pass `asset_id` references (default: `1`, set `0` to disable).
 - This is enabled by default for supported multimodal models and helps with large/private channel attachment URLs that cannot be fetched reliably by the model endpoint.
 
-Optional memory cadence and consolidation settings:
+Optional memory cadence settings:
 
 - `AUTO_MEMORY_ENABLED` - Enable automatic memory extraction from completed turns (default: `1`).
 - `AUTO_MEMORY_MIN_MESSAGES_PER_MEMORY` - Lower bound for cadence gating (default: `10`).
 - `AUTO_MEMORY_TARGET_MESSAGES_PER_MEMORY` - Preferred cadence interval (default: `15`).
 - `AUTO_MEMORY_MAX_MESSAGES_PER_MEMORY` - Upper bound before forced capture (default: `20`).
-- `AUTO_MEMORY_DEDUPE_THRESHOLD` - Similarity threshold for skipping near-duplicate memory candidates (default: `0.90`).
-- `MEMORY_DREAM_ENABLED` - Enable background-style dream consolidation (default: `1`).
-- `MEMORY_DREAM_LOOKBACK_DAYS` - Activity lookback used to infer off-peak hours (default: `21`).
-- `MEMORY_DREAM_MIN_DAYS` - Minimum distinct active days before learned scheduling is considered reliable (default: `14`).
-- `MEMORY_DREAM_OFFPEAK_WINDOW_HOURS` - Width of the inferred off-peak window used for consolidation (default: `6`).
-- `MEMORY_DREAM_MIN_INTERVAL_HOURS` - Minimum spacing between dream runs (default: `24`).
-- `MEMORY_DREAM_MIN_CANDIDATES` - Minimum eligible short-term memories required to run consolidation (default: `4`).
-- `MEMORY_DREAM_CANDIDATE_LIMIT` - Max short-term candidate memories passed into a dream cycle (default: `24`).
-- `MEMORY_DREAM_MIN_AGE_HOURS` - Minimum source-memory age for dream consolidation eligibility (default: `24`).
-
-## Usage
+- `AUTO_MEMORY_DEDUPE_THRESHOLD` - Similarity threshold for skipping near-duplicate memory candidates (default: `0.90`).## Usage
 
 ### Run the agent:
 
@@ -115,7 +105,6 @@ This will run the agent with both Telegram and iMessage (using SendBlue) channel
 - Sendblue image attachments (single + multiple)
 - Sendblue voice memo transcription with NVIDIA Parakeet CTC 0.6B ASR
 - Auto memory extraction with cadence control (default target: ~1 memory per 15 messages)
-- Dream-style long-term memory consolidation during inferred off-peak hours
 
 ## License
 

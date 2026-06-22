@@ -41,6 +41,21 @@ def _validate_unix_timestamp(value: Any) -> Optional[datetime.datetime]:
         return None
 
 
+def _coerce_delay_seconds(value: Any) -> Optional[int]:
+    """Coerce a relative delay into whole seconds.
+
+    Returns ``None`` when absent/unparseable so the caller can fall back to
+    other scheduling modes; returns a (possibly non-positive) int otherwise so
+    the caller can validate and report a clear error.
+    """
+    if value is None:
+        return None
+    try:
+        return int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+
+
 def _parse_iso_datetime(value: Any) -> Optional[datetime.datetime]:
     """Parse an ISO datetime string with timezone awareness."""
     if not value:
@@ -357,20 +372,39 @@ class ReminderScheduler:
         name: str = "",
         run_at: Optional[int] = None,
         run_ai_with_tools: bool = False,
+        delay_seconds: Optional[int] = None,
     ) -> dict[str, Any]:
         """Create and persist a reminder task.
 
-        Supports two scheduling modes:
+        Supports three scheduling modes:
 
-        * **Unix timestamp** (``run_at``): preferred for short-duration one-off tasks
-          (e.g. 20 seconds from now).  When ``run_at`` is provided the task is
-          automatically treated as one-off regardless of the ``one_off`` flag.
+        * **Relative delay** (``delay_seconds``): the simplest and most robust path
+          for "remind me in N seconds/minutes" requests — the caller never has to
+          compute an absolute timestamp or worry about timezones.  The first/only
+          run is scheduled at ``now + delay_seconds``.  Treated as one-off unless a
+          ``cron`` is also given.
+
+        * **Unix timestamp** (``run_at``): for one-off tasks at a specific epoch.
+          When ``run_at`` is the only schedule, the task is treated as one-off.
 
         * **Cron expression** (``cron``): preferred for recurring tasks.  Combined
           with ``run_at`` the timestamp sets the first execution time and the cron
           expression controls subsequent repeats.
         """
         await self.start()
+
+        now = _utc_now()
+
+        # Relative delay → absolute run_at computed server-side (no client clock
+        # math / timezone guesswork).  Takes precedence only when run_at is absent.
+        delay_value = _coerce_delay_seconds(delay_seconds)
+        if delay_value is not None and run_at is None:
+            if delay_value <= 0:
+                return {
+                    "success": False,
+                    "error": "delay_seconds must be a positive number of seconds",
+                }
+            run_at = int(now.timestamp()) + delay_value
 
         run_at_value = _validate_unix_timestamp(run_at)
         cron_expression = str(cron or "").strip()
@@ -399,7 +433,6 @@ class ReminderScheduler:
         if not normalized_task_id:
             normalized_task_id = self._generate_task_id()
 
-        now = _utc_now()
         if run_at_value is not None:
             # Unix timestamp scheduling — short-duration / one-off path.
             next_run = run_at_value

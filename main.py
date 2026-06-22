@@ -32,12 +32,10 @@ from acp import ACPAgent  # noqa: E402
 from self_heal import SelfHealManager, GitWorktreeManager  # noqa: E402
 
 # Setup logging
-requested_log_level = os.environ.get("LOG_LEVEL", "INFO").strip().upper()
-resolved_log_level = getattr(logging, requested_log_level, None)
-if not isinstance(resolved_log_level, int):
-    resolved_log_level = logging.INFO
+from logging_setup import configure_logging  # noqa: E402
 
-logging.basicConfig(level=resolved_log_level)
+requested_log_level = os.environ.get("LOG_LEVEL", "INFO").strip().upper()
+resolved_log_level = configure_logging()
 logger = logging.getLogger(__name__)
 
 if requested_log_level and not isinstance(

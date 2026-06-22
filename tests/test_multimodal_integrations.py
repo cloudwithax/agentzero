@@ -5,7 +5,9 @@ import asyncio
 import base64
 import json
 import os
-from unittest.mock import patch
+import struct
+import zlib
+from unittest.mock import patch, AsyncMock
 
 from integrations import (
     _attachment_url_to_base64_data_url,
@@ -17,38 +19,29 @@ from integrations import (
 )
 
 
-def test_multimodal_message_blocks() -> None:
-    """Build image_url blocks when a multimodal model is selected."""
-    with patch("integrations._model_needs_nvcf_assets", return_value=False), \
-         patch("integrations._model_supports_multimodal", return_value=True):
+def test_build_user_message_content_returns_text_with_attachments() -> None:
+    """Build user message content returns text (images are described by describer model)."""
+    with (
+        patch("integrations._model_needs_nvcf_assets", return_value=False),
+        patch("integrations._model_supports_multimodal", return_value=True),
+    ):
         content = _build_user_message_content(
             "Please describe these.",
             ["https://img.example/a.png", "https://img.example/b.png"],
         )
 
-    assert isinstance(content, list)
-    assert content[0] == {
-        "type": "text",
-        "text": (
-            "IMPORTANT: You can view and analyze the attached images in this "
-            "message. Do not claim you cannot view images.\n\n"
-            "User message: Please describe these."
-        ),
-    }
-    assert content[1] == {
-        "type": "image_url",
-        "image_url": {"url": "https://img.example/a.png"},
-    }
-    assert content[2] == {
-        "type": "image_url",
-        "image_url": {"url": "https://img.example/b.png"},
-    }
+    assert isinstance(content, str)
+    assert "Please describe these." in content
+    assert "https://img.example/a.png" in content
+    assert "https://img.example/b.png" in content
 
 
 def test_non_multimodal_fallback_text() -> None:
     """Fallback to plain text attachment list on non-multimodal models."""
-    with patch("integrations._model_needs_nvcf_assets", return_value=False), \
-         patch("integrations._model_supports_multimodal", return_value=False):
+    with (
+        patch("integrations._model_needs_nvcf_assets", return_value=False),
+        patch("integrations._model_supports_multimodal", return_value=False),
+    ):
         content = _build_user_message_content(
             "Summarize these images.",
             ["https://img.example/only.png"],
@@ -56,15 +49,16 @@ def test_non_multimodal_fallback_text() -> None:
 
     assert isinstance(content, str)
     assert "Summarize these images." in content
-    assert "[Image attachments]" in content
     assert "https://img.example/only.png" in content
 
 
-def test_multimodal_message_blocks_respect_attachment_limit() -> None:
-    """Cap inbound image blocks to configured MAX_IMAGE_ATTACHMENTS_PER_MESSAGE."""
-    with patch("integrations._model_needs_nvcf_assets", return_value=False), \
-         patch("integrations._model_supports_multimodal", return_value=True), \
-         patch.dict(os.environ, {"MAX_IMAGE_ATTACHMENTS_PER_MESSAGE": "2"}):
+def test_build_user_message_content_respect_attachment_limit() -> None:
+    """Cap inbound image attachments to configured MAX_IMAGE_ATTACHMENTS_PER_MESSAGE."""
+    with (
+        patch("integrations._model_needs_nvcf_assets", return_value=False),
+        patch("integrations._model_supports_multimodal", return_value=True),
+        patch.dict(os.environ, {"MAX_IMAGE_ATTACHMENTS_PER_MESSAGE": "2"}),
+    ):
         content = _build_user_message_content(
             "Please describe all images.",
             [
@@ -74,18 +68,11 @@ def test_multimodal_message_blocks_respect_attachment_limit() -> None:
             ],
         )
 
-    assert isinstance(content, list)
-    assert content[0]["type"] == "text"
-    assert "included 2 of 3 images" in content[0]["text"]
-    assert content[1] == {
-        "type": "image_url",
-        "image_url": {"url": "https://img.example/a.png"},
-    }
-    assert content[2] == {
-        "type": "image_url",
-        "image_url": {"url": "https://img.example/b.png"},
-    }
-    assert len(content) == 3
+    assert isinstance(content, str)
+    assert "included 2 of 3 images" in content
+    assert "https://img.example/a.png" in content
+    assert "https://img.example/b.png" in content
+    assert "https://img.example/c.png" not in content
 
 
 def test_extract_structured_response_payload() -> None:
@@ -132,8 +119,8 @@ class _FakeSession:
         return self.response
 
 
-def test_attachment_url_to_base64_data_url_converts_to_jpeg() -> None:
-    """Always convert remote image URLs to JPEG base64 data URLs."""
+def test_attachment_url_to_base64_data_url_preserves_original() -> None:
+    """Remote image URLs are base64-encoded unaltered (no ImageMagick compression)."""
     session = _FakeSession(
         _FakeResponse(
             status=200,
@@ -142,28 +129,19 @@ def test_attachment_url_to_base64_data_url_converts_to_jpeg() -> None:
         )
     )
 
-    with patch(
-        "integrations._convert_image_with_imagemagick_sync",
-        return_value=b"jpeg-converted-bytes",
-    ) as convert_mock:
-        result = asyncio.run(
-            _attachment_url_to_base64_data_url(session, "https://img.example/one.png")
-        )
+    result = asyncio.run(
+        _attachment_url_to_base64_data_url(session, "https://img.example/one.png")  # type: ignore[arg-type]
+    )
 
     assert result == (
-        "data:image/jpeg;base64,"
-        + base64.b64encode(b"jpeg-converted-bytes").decode("ascii")
+        "data:image/png;base64," + base64.b64encode(b"fake-image-bytes").decode("ascii")
     )
     assert session.requested_urls == ["https://img.example/one.png"]
-    assert convert_mock.call_count == 1
-    args = convert_mock.call_args.args
-    assert args[0] == b"fake-image-bytes"
-    assert args[1] == ".png"
-    assert args[2] == ".jpg"
 
 
-def test_attachment_data_url_to_base64_data_url_converts_to_jpeg() -> None:
-    """Always re-encode image data URLs as JPEG base64 data URLs."""
+def test_attachment_data_url_to_base64_data_url_preserves_original() -> None:
+    """Image data URLs are re-encoded unaltered with their original content type."""
+
     class _NoNetworkSession:
         def get(self, _url: str):
             raise AssertionError("Network fetch should not run for data URLs")
@@ -171,35 +149,39 @@ def test_attachment_data_url_to_base64_data_url_converts_to_jpeg() -> None:
     encoded_png = base64.b64encode(b"fake-png").decode("ascii")
     source_data_url = f"data:image/png;base64,{encoded_png}"
 
-    with patch(
-        "integrations._convert_image_with_imagemagick_sync",
-        return_value=b"jpeg-from-data-url",
-    ) as convert_mock:
-        result = asyncio.run(
-            _attachment_url_to_base64_data_url(_NoNetworkSession(), source_data_url)
-        )
+    result = asyncio.run(
+        _attachment_url_to_base64_data_url(_NoNetworkSession(), source_data_url)  # type: ignore[arg-type]
+    )
 
     assert result == (
-        "data:image/jpeg;base64,"
-        + base64.b64encode(b"jpeg-from-data-url").decode("ascii")
+        "data:image/png;base64," + base64.b64encode(b"fake-png").decode("ascii")
     )
-    assert convert_mock.call_count == 1
-    args = convert_mock.call_args.args
-    assert args[0] == b"fake-png"
-    assert args[1] == ".png"
-    assert args[2] == ".jpg"
 
 
-def test_build_user_message_content_async_uses_base64_and_drops_failed() -> None:
-    """Async builder should keep only successful base64 JPEG conversions."""
-    async def _fake_convert(_session, url: str) -> str | None:
+def test_build_user_message_content_async_describes_images_non_multimodal() -> None:
+    """Non-multimodal models describe images via the Mistral describer model."""
+
+    async def _fake_download(session, url):
         if url.endswith("a.png"):
-            return "data:image/jpeg;base64,AAAA"
-        return None
+            return b"fake-image-bytes-a", "image/png"
+        elif url.endswith("b.png"):
+            return b"fake-image-bytes-b", "image/png"
+        return None, None
 
-    with patch("integrations._model_needs_nvcf_assets", return_value=False), \
-         patch("integrations._model_supports_multimodal", return_value=True), \
-         patch("integrations._attachment_url_to_base64_data_url", side_effect=_fake_convert):
+    fake_description = "A beautiful sunset over the ocean"
+
+    async def _fake_describe_images(session, image_data):
+        return [fake_description] * len(image_data)
+
+    with (
+        patch("integrations._model_needs_nvcf_assets", return_value=False),
+        patch("integrations._model_supports_multimodal", return_value=False),
+        patch("integrations._download_image_bytes", side_effect=_fake_download),
+        patch(
+            "integrations._describe_images_with_mistral",
+            side_effect=_fake_describe_images,
+        ),
+    ):
         content = asyncio.run(
             _build_user_message_content_async(
                 "Please analyze these images.",
@@ -207,19 +189,102 @@ def test_build_user_message_content_async_uses_base64_and_drops_failed() -> None
             )
         )
 
-    assert isinstance(content, list)
-    assert content[0]["type"] == "text"
-    assert "Image conversion warning: dropped 1 image" in content[0]["text"]
-    assert content[1] == {
-        "type": "image_url",
-        "image_url": {"url": "data:image/jpeg;base64,AAAA"},
-    }
-    assert len(content) == 2
+    assert isinstance(content, str)
+    assert "Please analyze these images." in content
+    assert "[Image 1 description]" in content
+    assert "[Image 2 description]" in content
+    assert fake_description in content
+
+
+def test_build_user_message_content_async_handles_failed_images() -> None:
+    """Non-multimodal describer path should handle failed image downloads gracefully."""
+
+    async def _fake_download(session, url):
+        if url.endswith("a.png"):
+            return b"fake-image-bytes-a", "image/png"
+        return None, None
+
+    fake_description = "A beautiful sunset"
+
+    async def _fake_describe_images(session, image_data):
+        return [fake_description]
+
+    with (
+        patch("integrations._model_needs_nvcf_assets", return_value=False),
+        patch("integrations._model_supports_multimodal", return_value=False),
+        patch("integrations._download_image_bytes", side_effect=_fake_download),
+        patch(
+            "integrations._describe_images_with_mistral",
+            side_effect=_fake_describe_images,
+        ),
+    ):
+        content = asyncio.run(
+            _build_user_message_content_async(
+                "Please analyze.",
+                ["https://img.example/a.png", "https://img.example/b.png"],
+            )
+        )
+
+    assert isinstance(content, str)
+    assert "Please analyze." in content
+    assert "1 image could not be processed" in content
+
+
+def test_build_user_message_content_async_multimodal_returns_image_blocks() -> None:
+    """Native multimodal models receive image_url blocks, not Mistral descriptions."""
+
+    async def _fake_data_url(session, url):
+        return f"data:image/jpeg;base64,FAKE-{url[-5:]}"
+
+    async def _should_not_run(*args, **kwargs):  # pragma: no cover - guard
+        raise AssertionError("describer must not run for multimodal models")
+
+    with (
+        patch("integrations._model_needs_nvcf_assets", return_value=False),
+        patch("integrations._model_supports_multimodal", return_value=True),
+        patch(
+            "integrations._attachment_url_to_base64_data_url",
+            side_effect=_fake_data_url,
+        ),
+        patch(
+            "integrations._describe_images_with_mistral",
+            side_effect=_should_not_run,
+        ),
+    ):
+        content = asyncio.run(
+            _build_user_message_content_async(
+                "What do you see?",
+                ["https://img.example/a.png", "https://img.example/b.png"],
+            )
+        )
+
+    assert isinstance(content, list), f"Expected multimodal block list, got {type(content)}"
+    text_blocks = [b for b in content if b.get("type") == "text"]
+    image_blocks = [b for b in content if b.get("type") == "image_url"]
+    assert any("What do you see?" in b["text"] for b in text_blocks)
+    assert len(image_blocks) == 2
+    assert all(
+        b["image_url"]["url"].startswith("data:image/jpeg;base64,") for b in image_blocks
+    )
+
+
+def test_build_user_message_content_async_no_attachments() -> None:
+    """Async builder should return text-only when no attachments."""
+    content = asyncio.run(
+        _build_user_message_content_async(
+            "Hello, how are you?",
+            [],
+        )
+    )
+
+    assert isinstance(content, str)
+    assert content == "Hello, how are you?"
 
 
 def test_build_user_message_content_from_normalized_nvcf_returns_text() -> None:
     """NVCF models inline asset refs in plain text instead of image_url blocks."""
     import integrations
+
     saved = integrations.NVCF_MODEL_IDS.copy()
     integrations.NVCF_MODEL_IDS = {"test/nvcf-model"}
     try:
@@ -230,37 +295,104 @@ def test_build_user_message_content_from_normalized_nvcf_returns_text() -> None:
             )
         assert isinstance(content, str)
         assert "What is this?" in content
-        assert 'asset_id,abc123' in content
+        assert "asset_id,abc123" in content
     finally:
         integrations.NVCF_MODEL_IDS = saved
 
 
-def test_build_user_message_content_from_normalized_multimodal_returns_list() -> None:
-    """Non-NVCF multimodal models return image_url block lists."""
-    with patch("integrations._model_needs_nvcf_assets", return_value=False), \
-         patch("integrations._model_supports_multimodal", return_value=True):
+def test_build_user_message_content_from_normalized_multimodal_returns_text() -> None:
+    """Multimodal models now return text only (images are described by describer)."""
+    with (
+        patch("integrations._model_needs_nvcf_assets", return_value=False),
+        patch("integrations._model_supports_multimodal", return_value=True),
+    ):
         content = _build_user_message_content_from_normalized(
             "Please describe these.",
             ["https://img.example/a.png", "https://img.example/b.png"],
         )
-    assert isinstance(content, list)
-    assert content[0]["type"] == "text"
-    assert content[1] == {
-        "type": "image_url",
-        "image_url": {"url": "https://img.example/a.png"},
-    }
+    assert isinstance(content, str)
+    assert "Please describe these." in content
+    assert "https://img.example/a.png" in content
+
+
+def test_nvcf_model_ids_empty_by_default() -> None:
+    """NVCF_MODEL_IDS should be empty so no models hit the broken NVCF upload path."""
+    assert NVCF_MODEL_IDS == set(), (
+        "NVCF_MODEL_IDS must be empty until a model genuinely requires NVCF asset refs. "
+        "Otherwise multimodal models fall back to base64 data URLs embedded as plain text."
+    )
+
+
+def test_async_builder_falls_back_to_text_when_conversion_fails() -> None:
+    """Multimodal path degrades to text when every image conversion fails."""
+
+    async def _fail_data_url(session, url):
+        return None
+
+    with (
+        patch("integrations._model_needs_nvcf_assets", return_value=False),
+        patch("integrations._model_supports_multimodal", return_value=True),
+        patch(
+            "integrations._attachment_url_to_base64_data_url",
+            side_effect=_fail_data_url,
+        ),
+    ):
+        content = asyncio.run(
+            _build_user_message_content_async(
+                "What do you see?",
+                ["https://img.example/photo.jpg"],
+            )
+        )
+
+    assert isinstance(content, str)
+    assert "What do you see?" in content
+    assert "could not be processed" in content
+
+
+def test_resize_image_to_jpeg_sync_converts_png_to_jpeg() -> None:
+    """_resize_image_to_jpeg_sync converts any image format to resized JPEG."""
+    from integrations import _resize_image_to_jpeg_sync
+
+    def _make_minimal_png(width: int, height: int) -> bytes:
+        def _chunk(chunk_type: bytes, data: bytes) -> bytes:
+            c = chunk_type + data
+            return (
+                struct.pack(">I", len(data))
+                + c
+                + struct.pack(">I", zlib.crc32(c) & 0xFFFFFFFF)
+            )
+
+        sig = b"\x89PNG\r\n\x1a\n"
+        ihdr = _chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        raw = b""
+        for y in range(height):
+            raw += b"\x00" + b"\xff\x00\x00" * width
+        idat = _chunk(b"IDAT", zlib.compress(raw))
+        iend = _chunk(b"IEND", b"")
+        return sig + ihdr + idat + iend
+
+    png_bytes = _make_minimal_png(200, 100)
+    result = _resize_image_to_jpeg_sync(png_bytes)
+    assert result is not None
+    assert result[:3] == b"\xff\xd8\xff"
 
 
 def main() -> int:
-    test_multimodal_message_blocks()
+    test_build_user_message_content_returns_text_with_attachments()
     test_non_multimodal_fallback_text()
-    test_multimodal_message_blocks_respect_attachment_limit()
+    test_build_user_message_content_respect_attachment_limit()
     test_extract_structured_response_payload()
-    test_attachment_url_to_base64_data_url_converts_to_jpeg()
-    test_attachment_data_url_to_base64_data_url_converts_to_jpeg()
-    test_build_user_message_content_async_uses_base64_and_drops_failed()
+    test_attachment_url_to_base64_data_url_preserves_original()
+    test_attachment_data_url_to_base64_data_url_preserves_original()
+    test_build_user_message_content_async_describes_images_non_multimodal()
+    test_build_user_message_content_async_handles_failed_images()
+    test_build_user_message_content_async_multimodal_returns_image_blocks()
+    test_build_user_message_content_async_no_attachments()
     test_build_user_message_content_from_normalized_nvcf_returns_text()
-    test_build_user_message_content_from_normalized_multimodal_returns_list()
+    test_build_user_message_content_from_normalized_multimodal_returns_text()
+    test_nvcf_model_ids_empty_by_default()
+    test_async_builder_falls_back_to_text_when_conversion_fails()
+    test_resize_image_to_jpeg_sync_converts_png_to_jpeg()
     print("All multimodal integration tests passed")
     return 0
 

@@ -22,6 +22,7 @@ tests = [
     "tests/test_sendblue_debounce.py",
     "tests/test_sendblue_voice_memo.py",
     "tests/test_memory_maintenance.py",
+    "tests/test_orchestrated_pipeline.py",
     "tests/test_consortium_mode.py",
     "tests/test_skills.py",
     "tests/test_injection_scanner.py",

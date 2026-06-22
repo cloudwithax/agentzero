@@ -139,15 +139,6 @@ async def run_smoke(
                         tool_call.get("function", {}).get("name", "")
                         for tool_call in tool_calls
                     ],
-                    "pseudo_tool_syntax": agentic_loop.contains_pseudo_tool_syntax(
-                        content_text
-                    ),
-                    "action_intent_narration": (
-                        agentic_loop.contains_action_intent_narration(content_text)
-                    ),
-                    "hard_decision_language": (
-                        agentic_loop.contains_hard_decision_language(content_text)
-                    ),
                 }
             )
         return response_data

@@ -6,7 +6,8 @@ import logging
 import re
 import time
 import traceback
-import uuid
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Awaitable, Callable, Optional
 
 import aiohttp
@@ -21,10 +22,133 @@ logger = logging.getLogger(__name__)
 
 # ── Global rate limiter (token bucket) ────────────────────────────────────────
 # NVIDIA free-tier: 40 RPM → 1 request every 1.5s
+# Bumped to 2.0s (30 RPM effective) for safety cushion against upstream jitter.
 _RPM_LIMIT = 40
-_MIN_INTERVAL = 60.0 / _RPM_LIMIT  # 1.5s
+_MIN_INTERVAL = 2.0  # seconds between requests; floor at 1.5s for 40 RPM
 _rate_lock = asyncio.Lock()
 _last_request_time: float = 0.0
+
+# Upper bound on a single 429 backoff sleep.  A saturated free-tier window is a
+# rolling 60s, so the old 15s cap could exhaust all retries before the window
+# cleared.  20s gives a 5-retry sequence (3, 9, 20, 20) ≈ 52s of coverage while
+# staying short enough not to blow past benchmark/turn timeouts.
+_MAX_RATELIMIT_BACKOFF = 20.0
+
+
+# Substrings that mark a provider error as transient/server-side rather than a
+# permanent client mistake.  When a 200 body carries one of these, retrying the
+# request almost always succeeds, so we treat them like rate limits.
+_TRANSIENT_API_ERROR_MARKERS = (
+    "unterminated string",
+    "expecting value",
+    "expecting ',' delimiter",
+    "expecting property name",
+    "invalid \\escape",
+    "extra data",
+    "jsondecode",
+    "internal server error",
+    "internal error",
+    "service unavailable",
+    "temporarily unavailable",
+    "bad gateway",
+    "gateway timeout",
+    "timeout",
+    "timed out",
+    "overloaded",
+    "try again",
+    "please retry",
+    "upstream",
+    "connection reset",
+    "econnreset",
+)
+
+
+def _is_transient_api_error(error_msg: str) -> bool:
+    """Return True when a provider error string looks transient/retryable."""
+    if not error_msg:
+        return False
+    lowered = error_msg.lower()
+    return any(marker in lowered for marker in _TRANSIENT_API_ERROR_MARKERS)
+
+
+# A subset of transient markers that indicate the provider failed to *parse /
+# serialize the model's own output* (a malformed tool-call ``arguments`` JSON),
+# rather than a capacity/network blip.  For these, re-sending the identical
+# payload reproduces the identical bad generation, so the retry must perturb
+# sampling to make the model emit different tokens.
+_PARSE_CLASS_ERROR_MARKERS = (
+    "unterminated string",
+    "expecting value",
+    "expecting ',' delimiter",
+    "expecting property name",
+    "invalid \\escape",
+    "extra data",
+    "jsondecode",
+)
+
+
+def _is_parse_class_api_error(error_msg: str) -> bool:
+    """Return True when the error looks like a malformed-model-output parse failure."""
+    if not error_msg:
+        return False
+    lowered = error_msg.lower()
+    return any(marker in lowered for marker in _PARSE_CLASS_ERROR_MARKERS)
+
+
+def _perturb_sampling_for_retry(payload: dict[str, Any], attempt: int) -> None:
+    """Nudge sampling params in-place so a deterministic parse failure can recover.
+
+    The provider keeps choking on the same serialized tool call because the
+    identical payload yields the identical greedy generation.  Bumping the
+    temperature a little (and clearing any fixed seed) changes the emitted
+    tokens enough for the provider to serialize them, without meaningfully
+    changing task behavior.
+    """
+    base_temp = payload.get("temperature")
+    try:
+        base_temp = float(base_temp)
+    except (TypeError, ValueError):
+        base_temp = 0.6
+    # Escalate gently: +0.15 per attempt, capped so we never go incoherent.
+    payload["temperature"] = round(min(base_temp + 0.15 * attempt, 0.95), 3)
+    # A fixed seed would defeat the perturbation — drop it for the retry.
+    payload.pop("seed", None)
+
+
+def _retry_after_seconds(resp: Any) -> Optional[float]:
+    """Parse a ``Retry-After`` header into seconds, or None when absent/unusable.
+
+    The server is authoritative about when its rate-limit window will clear, so
+    when it sends ``Retry-After`` we prefer that over blind exponential backoff.
+    Handles both the numeric (delay-seconds) and HTTP-date header forms.
+    """
+    headers = getattr(resp, "headers", None)
+    if not headers:
+        return None
+    try:
+        raw = headers.get("Retry-After") or headers.get("retry-after")
+    except AttributeError:
+        return None
+    if not raw:
+        return None
+    raw = str(raw).strip()
+
+    # Numeric form: a delay in seconds.
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        pass
+
+    # HTTP-date form: an absolute timestamp to wait until.
+    try:
+        retry_dt = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if retry_dt is None:
+        return None
+    if retry_dt.tzinfo is None:
+        retry_dt = retry_dt.replace(tzinfo=timezone.utc)
+    return max(0.0, (retry_dt - datetime.now(timezone.utc)).total_seconds())
 
 
 async def _rate_limit_wait() -> None:
@@ -38,18 +162,6 @@ async def _rate_limit_wait() -> None:
             logger.debug("Rate limiter: waiting %.2fs", wait)
             await asyncio.sleep(wait)
         _last_request_time = time.monotonic()
-
-
-def _apply_cache_busting_headers(headers: dict[str, str]) -> dict[str, str]:
-    """Add per-request no-cache headers so upstream layers avoid reusing responses."""
-    request_headers = headers.copy()
-    request_headers["Cache-Control"] = "no-cache, no-store, max-age=0"
-    request_headers["Pragma"] = "no-cache"
-    request_headers["Expires"] = "0"
-    request_headers["X-Request-Id"] = request_headers.get(
-        "X-Request-Id", str(uuid.uuid4())
-    )
-    return request_headers
 
 
 def _message_content_to_text(content: Any) -> str:
@@ -117,7 +229,6 @@ _CODE_LEAK_FENCE_PATTERNS = [
     "```txt",
     "```text",
     "```diff",
-    "```",
 ]
 
 # Matches fenced code blocks (``` ... ```) and inline code (`...`).
@@ -401,7 +512,7 @@ def _parse_bare_json_tool_calls(content: str) -> list[dict[str, Any]]:
         if name in seen_names:
             continue
         # Skip if it looks like a variable assignment or other JS/Python code
-        if re.search(r'^[a-z]+\s*=\s*', content):
+        if re.search(r"^[a-z]+\s*=\s*", content):
             continue
         try:
             parsed_args = json.loads(args_str.strip())
@@ -573,33 +684,67 @@ async def _read_streaming_chat_response(
         "tool_calls": [],
     }
 
-    async for raw_line in resp.content:
-        line = raw_line.decode("utf-8").strip()
+    async def _handle_sse_line(line: str) -> bool:
+        """Process one complete SSE line. Returns True when the stream is done."""
         if not line or not line.startswith("data:"):
-            continue
+            return False
 
         payload = line[5:].strip()
         if not payload:
-            continue
+            return False
         if payload == "[DONE]":
-            break
+            return True
 
-        chunk = json.loads(payload)
+        try:
+            chunk = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            # A genuinely malformed/partial SSE line should never abort the
+            # whole stream (and thus the agentic run).  Skip it and keep
+            # assembling — large tool-call argument payloads in particular
+            # must not be lost to a single bad chunk.
+            logger.warning("Skipping unparseable SSE chunk: %s", exc)
+            return False
+
         choices = chunk.get("choices")
         if not isinstance(choices, list) or not choices:
-            continue
+            return False
 
         choice = choices[0]
         if not isinstance(choice, dict):
-            continue
+            return False
 
         delta = choice.get("delta")
         if not isinstance(delta, dict):
-            continue
+            return False
 
         content_delta = _merge_stream_delta(assembled_message, delta)
         if content_delta and stream_chunk_callback:
             await stream_chunk_callback(content_delta)
+        return False
+
+    # ``resp.content`` is a byte StreamReader that yields arbitrary network
+    # chunks, NOT complete lines — a single SSE ``data:`` line carrying a large
+    # tool-call ``arguments`` payload (e.g. an HTML file for ``write``) can be
+    # split across reads.  Buffer raw bytes and only parse complete newline-
+    # terminated lines so partial JSON is never handed to ``json.loads``.
+    buffer = b""
+    done = False
+    async for raw_chunk in resp.content.iter_any():
+        if not raw_chunk:
+            continue
+        buffer += raw_chunk
+        while b"\n" in buffer:
+            line_bytes, buffer = buffer.split(b"\n", 1)
+            line = line_bytes.decode("utf-8", errors="replace").strip()
+            if await _handle_sse_line(line):
+                done = True
+                break
+        if done:
+            break
+
+    # Flush any trailing complete line left in the buffer (no final newline).
+    if not done and buffer.strip():
+        await _handle_sse_line(buffer.decode("utf-8", errors="replace").strip())
 
     return {"choices": [{"message": _finalize_stream_message(assembled_message)}]}
 
@@ -615,7 +760,7 @@ async def api_call_with_retry(
     stream_chunk_callback: Optional[Callable[[str], Awaitable[None]]] = None,
 ) -> dict[str, Any]:
     """Make an API call with retry logic for transient errors."""
-    request_headers = _apply_cache_busting_headers(headers)
+    request_headers = headers.copy()
     request_headers["Accept"] = (
         "text/event-stream"
         if stream
@@ -623,6 +768,17 @@ async def api_call_with_retry(
     )
     request_payload = json_data.copy()
     request_payload["stream"] = stream
+
+    # The provider rejects an empty ``tools`` array outright ("`tools` must not
+    # be an empty array. Either provide at least one tool or omit the field
+    # entirely."), which kills every tool-free inference path (orchestrator
+    # plan, advisor, judges, reminders, self-heal — all pass ``tools=[]``).
+    # Normalize here so callers can keep expressing "no tools" as ``[]`` while
+    # the wire request omits the field. ``tool_choice`` is meaningless without
+    # tools, so drop it too.
+    if not request_payload.get("tools"):
+        request_payload.pop("tools", None)
+        request_payload.pop("tool_choice", None)
 
     for attempt in range(max_retries):
         await _rate_limit_wait()
@@ -657,10 +813,22 @@ async def api_call_with_retry(
                 # Handle NVIDIA/non-standard rate-limit format: {"status": 429, "title": "..."}
                 if resp.status == 429 or response_data.get("status") == 429:
                     if attempt < max_retries - 1:
-                        # Cap per-attempt wait at 15s so we don't blow past benchmark timeouts
-                        wait_time = min(backoff ** (attempt + 1), 15.0)
+                        # Prefer the server's Retry-After hint; otherwise fall
+                        # back to exponential backoff.  Either way cap the wait so
+                        # we don't blow past benchmark/turn timeouts.
+                        retry_after = _retry_after_seconds(resp)
+                        if retry_after is not None:
+                            wait_time = min(retry_after, _MAX_RATELIMIT_BACKOFF)
+                        else:
+                            wait_time = min(
+                                backoff ** (attempt + 1), _MAX_RATELIMIT_BACKOFF
+                            )
                         logger.warning(
-                            f"Rate limit (429) hit, retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})..."
+                            "Rate limit (429) hit, retrying in %.1fs (attempt %d/%d)%s...",
+                            wait_time,
+                            attempt + 1,
+                            max_retries,
+                            " [Retry-After]" if retry_after is not None else "",
                         )
                         await asyncio.sleep(wait_time)
                         continue
@@ -672,16 +840,45 @@ async def api_call_with_retry(
                     error_msg = error.get("message", "Unknown error")
                     error_type = error.get("type", "")
 
-                    # Retry on rate limits and certain server errors
-                    if "rate limit" in error_msg.lower() or error_type in [
-                        "rate_limit",
-                        "server_error",
-                    ]:
+                    # Retry on rate limits and transient server-side errors.
+                    # Providers intermittently return a 200 body carrying an
+                    # error (e.g. a malformed/truncated upstream response such as
+                    # "Unterminated string ...") when processing large tool-call
+                    # payloads.  These are transient and almost always succeed on
+                    # a retry, so a single bad round must not abort a multi-step
+                    # task (e.g. build-a-site-then-publish).
+                    if (
+                        "rate limit" in error_msg.lower()
+                        or error_type in ["rate_limit", "server_error"]
+                        or _is_transient_api_error(error_msg)
+                        or resp.status >= 500
+                    ):
                         if attempt < max_retries - 1:
                             wait_time = min(backoff ** (attempt + 1), 15.0)
-                            logger.warning(
-                                f"Rate limit hit, retrying in {wait_time}s..."
-                            )
+                            # A parse-class failure means the provider couldn't
+                            # serialize the model's own (malformed) tool call.
+                            # The same payload reproduces the same bad output, so
+                            # perturb sampling before the next attempt.
+                            if _is_parse_class_api_error(error_msg):
+                                _perturb_sampling_for_retry(request_payload, attempt + 1)
+                                logger.warning(
+                                    "Parse-class API error (%r); retrying in %ss with "
+                                    "temperature=%s (attempt %d/%d)...",
+                                    error_msg[:160],
+                                    wait_time,
+                                    request_payload.get("temperature"),
+                                    attempt + 1,
+                                    max_retries,
+                                )
+                            else:
+                                logger.warning(
+                                    "Transient API error (%r), retrying in %ss "
+                                    "(attempt %d/%d)...",
+                                    error_msg[:160],
+                                    wait_time,
+                                    attempt + 1,
+                                    max_retries,
+                                )
                             await asyncio.sleep(wait_time)
                             continue
 
@@ -697,6 +894,33 @@ async def api_call_with_retry(
                 await asyncio.sleep(wait_time)
             else:
                 logger.error(f"API call failed after {max_retries} attempts: {e}")
+                return {"error": {"message": str(e)}}
+
+        except (json.JSONDecodeError, ValueError) as e:
+            # Our own parse of the provider's response body failed (truncated /
+            # malformed body).  This is a ValueError, NOT an aiohttp.ClientError,
+            # so without this clause it would escape the retry loop entirely and
+            # surface a raw parser error to the user.  Treat it as transient and
+            # perturb sampling like any other parse-class failure.
+            if attempt < max_retries - 1:
+                wait_time = backoff**attempt
+                _perturb_sampling_for_retry(request_payload, attempt + 1)
+                logger.warning(
+                    "Failed to parse API response body (%r), retrying in %ss "
+                    "with temperature=%s (attempt %d/%d)...",
+                    str(e)[:160],
+                    wait_time,
+                    request_payload.get("temperature"),
+                    attempt + 1,
+                    max_retries,
+                )
+                await asyncio.sleep(wait_time)
+            else:
+                logger.error(
+                    "Failed to parse API response after %d attempts: %s",
+                    max_retries,
+                    e,
+                )
                 return {"error": {"message": str(e)}}
 
     return {"error": {"message": "Max retries exceeded"}}

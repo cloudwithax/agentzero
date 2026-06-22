@@ -4,6 +4,7 @@
 import asyncio
 import os
 import tempfile
+from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from integrations import _extract_sendblue_typing_state, _queue_sendblue_pending_message
@@ -194,7 +195,7 @@ async def test_send_imessage_normalizes_content_before_send() -> None:
         result = await send_imessage(
             "+15551234567",
             "line one\nline two",
-            session=fake_session,
+            session=fake_session,  # type: ignore[arg-type]
         )
     finally:
         if previous_api_key is None:
@@ -246,7 +247,7 @@ async def test_send_imessage_skips_empty_payload() -> None:
         result = await send_imessage(
             "+15551234567",
             "",
-            session=fake_session,
+            session=fake_session,  # type: ignore[arg-type]
         )
     finally:
         if previous_api_key is None:
@@ -307,7 +308,7 @@ async def test_send_reaction_posts_expected_payload() -> None:
             message_handle="abc-123",
             reaction="laugh",
             part_index=1,
-            session=fake_session,
+            session=fake_session,  # type: ignore[arg-type]
         )
     finally:
         if previous_api_key is None:
@@ -457,7 +458,7 @@ async def test_auto_tapback_sends_when_relevant_and_random_passes() -> None:
                 "lol this made my day",
                 "handle-42",
                 0,
-                session=object(),
+                session=object(),  # type: ignore[arg-type]
             )
     finally:
         if previous_enabled is None:
@@ -473,6 +474,7 @@ async def test_auto_tapback_sends_when_relevant_and_random_passes() -> None:
     assert result is not None
     assert result.get("success") is True
     assert send_reaction_mock.await_count == 1
+    assert send_reaction_mock.await_args is not None
     assert send_reaction_mock.await_args.kwargs.get("message_handle") == "handle-42"
     assert send_reaction_mock.await_args.kwargs.get("reaction") == "laugh"
 
@@ -516,7 +518,7 @@ async def test_send_imessage_sends_explicit_message_blocks_separately() -> None:
             "+15551234567",
             "<message>chunk one</message>\nrecalling memories...\n<message>chunk two</message>",
             media_urls=["https://img.example/final.png"],
-            session=fake_session,
+            session=fake_session,  # type: ignore[arg-type]
         )
     finally:
         if previous_api_key is None:
@@ -593,7 +595,7 @@ async def test_send_imessage_typing_directive_is_ignored() -> None:
             result = await send_imessage(
                 "+15551234567",
                 '<message>chunk one</message><typing seconds="1.4"/><message>chunk two</message>',
-                session=fake_session,
+                session=fake_session,  # type: ignore[arg-type]
             )
     finally:
         if previous_api_key is None:

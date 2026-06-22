@@ -302,6 +302,81 @@ async def test_reminder_create_tool_passes_run_at() -> None:
     assert controller.calls[0]["session_id"] == "tg_789", controller.calls[0]
 
 
+async def test_delay_seconds_creates_one_off_at_relative_time() -> None:
+    """delay_seconds should schedule a one-off ~N seconds from now (no client clock math)."""
+    scheduler = _build_scheduler()
+    before = int(time.time())
+    created = await scheduler.create_task(
+        delay_seconds=60,
+        message="take out the trash",
+        task_id="delay_task",
+    )
+    assert created["success"], created
+    task = created["task"]
+    assert task["one_off"] is True, task
+    next_run = datetime.datetime.fromisoformat(task["next_run_at"])
+    delta = (next_run - datetime.datetime.fromtimestamp(
+        before, tz=datetime.timezone.utc
+    )).total_seconds()
+    assert 58 <= delta <= 63, f"delay_seconds=60 scheduled at delta={delta}s"
+
+
+async def test_delay_seconds_rejects_non_positive() -> None:
+    """A zero/negative delay should be rejected with a clear error."""
+    scheduler = _build_scheduler()
+    created = await scheduler.create_task(
+        delay_seconds=0,
+        message="nope",
+        task_id="bad_delay",
+    )
+    assert created["success"] is False, created
+    assert "delay_seconds" in created["error"], created
+
+
+async def test_run_at_takes_precedence_over_delay_seconds() -> None:
+    """When both are given, an explicit run_at wins (delay is the convenience path)."""
+    scheduler = _build_scheduler()
+    future_ts = int(time.time()) + 3600
+    created = await scheduler.create_task(
+        run_at=future_ts,
+        delay_seconds=60,
+        message="absolute wins",
+        task_id="both_task",
+    )
+    assert created["success"], created
+    next_run = datetime.datetime.fromisoformat(created["task"]["next_run_at"])
+    expected = datetime.datetime.fromtimestamp(future_ts, tz=datetime.timezone.utc)
+    assert abs((next_run - expected).total_seconds()) < 2, created["task"]
+
+
+async def test_reminder_create_tool_passes_delay_seconds() -> None:
+    """The tool layer should forward delay_seconds to the controller."""
+
+    class FakeReminderController:
+        def __init__(self):
+            self.calls: list[dict] = []
+
+        async def create_reminder_task(self, **kwargs):
+            self.calls.append(kwargs)
+            return {"success": True, "task": kwargs}
+
+    controller = FakeReminderController()
+    set_reminder_controller(controller)
+    token = set_tool_runtime_session("imessage_+15551230000")
+    try:
+        result = await reminder_create_tool(
+            delay_seconds=60,
+            message="remind me in a minute",
+        )
+    finally:
+        reset_tool_runtime_session(token)
+        set_reminder_controller(None)
+
+    assert result["success"], result
+    assert controller.calls[0]["delay_seconds"] == 60, controller.calls[0]
+    assert controller.calls[0]["session_id"] == "imessage_+15551230000"
+
+
 if __name__ == "__main__":
     test_cron_expression_parser()
     asyncio.run(test_one_off_task_completes())
@@ -315,4 +390,8 @@ if __name__ == "__main__":
     asyncio.run(test_run_at_rejects_past_timestamp())
     asyncio.run(test_run_ai_with_tools_flag_passthrough())
     asyncio.run(test_reminder_create_tool_passes_run_at())
+    asyncio.run(test_delay_seconds_creates_one_off_at_relative_time())
+    asyncio.run(test_delay_seconds_rejects_non_positive())
+    asyncio.run(test_run_at_takes_precedence_over_delay_seconds())
+    asyncio.run(test_reminder_create_tool_passes_delay_seconds())
     print("Reminder scheduler tests passed")

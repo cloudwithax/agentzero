@@ -172,15 +172,31 @@ class GitWorktreeManager:
             timeout=30,
         )
 
+    @staticmethod
+    def _sanitize_branch_id(raw: str) -> str:
+        """Sanitize a session ID for safe use in git branch names.
+
+        Replaces invalid characters with underscores and ensures the
+        result is non-empty and doesn't start/end with a slash.
+        """
+        sanitized = re.sub(r"[^a-zA-Z0-9_.-]", "_", raw.strip())
+        sanitized = sanitized.strip("._-")
+        if not sanitized:
+            sanitized = "unknown"
+        if len(sanitized) > 100:
+            sanitized = sanitized[:100]
+        return sanitized
+
     def create_worktree(
         self, session_id: str, base_branch: str = "HEAD"
     ) -> Optional[str]:
+        safe_id = self._sanitize_branch_id(session_id)
         worktree_dir = tempfile.mkdtemp(
-            prefix=f"selfheal_{session_id}_", dir=self.repo_root
+            prefix=f"selfheal_{safe_id}_", dir=self.repo_root
         )
         shutil.rmtree(worktree_dir, ignore_errors=True)
 
-        branch_name = f"selfheal/{session_id}"
+        branch_name = f"selfheal/{safe_id}"
 
         r = self._git("worktree", "add", worktree_dir, "-b", branch_name, base_branch)
         if r.returncode != 0:
@@ -216,7 +232,7 @@ class GitWorktreeManager:
         if not worktree_path:
             return False
 
-        branch_name = f"selfheal/{session_id}"
+        branch_name = f"selfheal/{self._sanitize_branch_id(session_id)}"
 
         r = self._git("rev-parse", "--verify", branch_name)
         if r.returncode != 0:
@@ -242,7 +258,7 @@ class GitWorktreeManager:
         if not worktree_path:
             return True
 
-        branch_name = f"selfheal/{session_id}"
+        branch_name = f"selfheal/{self._sanitize_branch_id(session_id)}"
 
         self._git("worktree", "remove", worktree_path, "--force")
         if os.path.isdir(worktree_path):
@@ -394,17 +410,27 @@ class AgentSelfHealer:
         if error_report.user_query:
             parts.append(f"User query context: {error_report.user_query}")
 
+        # Include relevant source files inline since the healer API call
+        # has ``tools=[]`` and cannot read files itself.
+        tool_file = os.path.join(worktree_path, "tools.py")
+        if os.path.isfile(tool_file):
+            try:
+                with open(tool_file, "r", encoding="utf-8") as f:
+                    content = f.read()
+                if len(content) > 18000:
+                    content = content[:18000] + "\n# ... (truncated)"
+                parts.append(f"\n--- tools.py ---\n{content}")
+            except OSError:
+                parts.append("\n--- tools.py ---\n(could not read)")
+
         parts.extend(
             [
                 "",
-                f"Working directory: {worktree_path}",
-                "",
                 "Instructions:",
-                "1. Read the relevant source files in the working directory to understand the code.",
-                "2. Identify the root cause of the error.",
-                "3. Produce minimal, targeted patches that fix the error.",
-                "4. Each patch must include the full file path (relative to the repo root) and the complete corrected file content.",
-                "5. Do NOT modify files unrelated to the error.",
+                "1. Analyze the source code above to find the root cause.",
+                "2. Produce minimal, targeted patches that fix the error.",
+                "3. Each patch must include the full file path (relative to the repo root) and the complete corrected file content.",
+                "4. Do NOT modify files unrelated to the error.",
                 "",
                 "Return ONLY a JSON object with this exact structure (no other text):",
                 "{",

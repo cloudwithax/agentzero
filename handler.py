@@ -34,15 +34,12 @@ from tools import (
 from acp import ACPAgent
 from self_heal import SelfHealManager
 from prompt_templates import get_template
+from logging_setup import log_assistant_turn, log_user_turn
 
 logger = logging.getLogger(__name__)
 
 IMESSAGE_HANDLE_CONTEXT_LIMIT = 50
 TELEGRAM_REACTION_CONTEXT_LIMIT = 50
-REQUEST_FRESHNESS_INSTRUCTION = (
-    "[Request Freshness]: This turn includes a one-time freshness token to discourage "
-    "cache reuse and repeated phrasing. Treat the request as new and answer independently."
-)
 DELIVERY_MESSAGE_BLOCK_PATTERN = re.compile(
     r"<message>\s*(?P<message>.*?)\s*</message>",
     re.IGNORECASE | re.DOTALL,
@@ -64,8 +61,8 @@ INTERNAL_PROMPT_RESIDUE_PATTERNS = (
     ),
     # Strip leaked code blocks (```\n...\n```) from visible text.
     re.compile(r"```[\w]*[\s\S]*?```", re.DOTALL),
-    # Strip bare code fences that may be unmatched.
-    re.compile(r"```[\w]*\s*"),
+    # Strip bare unmatched code fences (only when alone on a line).
+    re.compile(r"^```[\w]*\s*$", re.MULTILINE),
 )
 
 
@@ -199,12 +196,6 @@ ADVISOR_MODEL_ID = (
     or os.environ.get("MAIN_MODEL", "").strip()
     or _DEFAULT_MODEL_ID
 )
-REVIEWER_MODEL_ID = (
-    os.environ.get("REVIEWER_MODEL", "").strip()
-    or os.environ.get("ADVISOR_MODEL", "").strip()
-    or os.environ.get("MAIN_MODEL", "").strip()
-    or _DEFAULT_MODEL_ID
-)
 PRIMARY_MODEL_ID = ADVISOR_MODEL_ID
 MODEL_ID = PRIMARY_MODEL_ID
 CONSORTIUM_MODEL_ID = os.environ.get("CONSORTIUM_MODEL", MODEL_ID).strip() or MODEL_ID
@@ -214,23 +205,83 @@ CONSORTIUM_MODEL_ID = os.environ.get("CONSORTIUM_MODEL", MODEL_ID).strip() or MO
 # Benchmarked TTFT shown from scripts/benchmark_models.py (single-sentence prompt).
 MODEL_CATALOG = [
     # ── Fast & reliable (TTFT < 500ms) ────────────────────────────────
-    {"id": "meta/llama-3.2-90b-vision-instruct",        "name": "Llama 3.2 90B Vision",   "labels": ["multimodal", "ttft:139ms"]},
-    {"id": "nvidia/llama-3.1-nemotron-nano-vl-8b-v1",  "name": "Nemotron Nano VL 8B",    "labels": ["multimodal", "small", "ttft:159ms"]},
-    {"id": "meta/llama-4-maverick-17b-128e-instruct",   "name": "Llama 4 Maverick",       "labels": ["multimodal", "128K_ctx", "ttft:232ms"]},
-    {"id": "moonshotai/kimi-k2.6",                      "name": "Kimi K2.6",              "labels": ["multimodal", "1T_params", "ttft:253ms"]},
-    {"id": "mistralai/mistral-small-4-119b-2603",       "name": "Mistral Small 4",        "labels": ["multimodal", "ttft:289ms"]},
-    {"id": "qwen/qwen3.5-122b-a10b",                    "name": "Qwen 3.5 122B",          "labels": ["agentic", "tool_calling", "ttft:330ms"]},
-    {"id": "qwen/qwen3-next-80b-a3b-instruct",          "name": "Qwen 3 Next 80B",        "labels": ["general", "ttft:409ms"]},
+    {
+        "id": "meta/llama-3.2-90b-vision-instruct",
+        "name": "Llama 3.2 90B Vision",
+        "labels": ["multimodal", "ttft:139ms"],
+    },
+    {
+        "id": "nvidia/llama-3.1-nemotron-nano-vl-8b-v1",
+        "name": "Nemotron Nano VL 8B",
+        "labels": ["multimodal", "small", "ttft:159ms"],
+    },
+    {
+        "id": "meta/llama-4-maverick-17b-128e-instruct",
+        "name": "Llama 4 Maverick",
+        "labels": ["multimodal", "128K_ctx", "ttft:232ms"],
+    },
+    {
+        "id": "moonshotai/kimi-k2.6",
+        "name": "Kimi K2.6",
+        "labels": ["multimodal", "1T_params", "ttft:253ms"],
+    },
+    {
+        "id": "mistralai/mistral-small-4-119b-2603",
+        "name": "Mistral Small 4",
+        "labels": ["multimodal", "ttft:289ms"],
+    },
+    {
+        "id": "qwen/qwen3.5-122b-a10b",
+        "name": "Qwen 3.5 122B",
+        "labels": ["agentic", "tool_calling", "ttft:330ms"],
+    },
+    {
+        "id": "qwen/qwen3-next-80b-a3b-instruct",
+        "name": "Qwen 3 Next 80B",
+        "labels": ["general", "ttft:409ms"],
+    },
     # ── Working but slower ────────────────────────────────────────────
-    {"id": "nvidia/nemotron-3-super-120b-a12b",         "name": "Nemotron 3 Super 120B",  "labels": ["agentic", "tool_calling", "planning", "ttft:1.8s"]},
-    {"id": "z-ai/glm-5.1",                              "name": "GLM 5.1",                "labels": ["agentic", "coding", "ttft:23.6s"]},
+    {
+        "id": "nvidia/nemotron-3-super-120b-a12b",
+        "name": "Nemotron 3 Super 120B",
+        "labels": ["agentic", "tool_calling", "planning", "ttft:1.8s"],
+    },
+    {
+        "id": "z-ai/glm-5.1",
+        "name": "GLM 5.1",
+        "labels": ["agentic", "coding", "ttft:23.6s"],
+    },
     # ── Intermittent (timeouts, no tokens) ────────────────────────────
-    {"id": "moonshotai/kimi-k2-instruct-0905",           "name": "Kimi K2",                "labels": ["general", "tool_calling", "may_timeout"]},
-    {"id": "deepseek-ai/deepseek-v4-pro",               "name": "DeepSeek V4 Pro",        "labels": ["coding", "1M_ctx", "may_timeout"]},
-    {"id": "deepseek-ai/deepseek-v3.1-terminus",        "name": "DeepSeek V3.1",          "labels": ["tool_calling", "think_mode", "may_timeout"]},
-    {"id": "nvidia/llama-3.3-nemotron-super-49b-v1.5",  "name": "Nemotron Super 49B",     "labels": ["general", "no_stream_tokens"]},
-    {"id": "minimaxai/minimax-m2.7",                    "name": "MiniMax M2.7",           "labels": ["coding", "no_stream_tokens"]},
-    {"id": "google/gemma-4-31b-it",                     "name": "Gemma 4 31B",            "labels": ["multimodal", "unstable"]},
+    {
+        "id": "moonshotai/kimi-k2-instruct-0905",
+        "name": "Kimi K2",
+        "labels": ["general", "tool_calling", "may_timeout"],
+    },
+    {
+        "id": "deepseek-ai/deepseek-v4-pro",
+        "name": "DeepSeek V4 Pro",
+        "labels": ["coding", "1M_ctx", "may_timeout"],
+    },
+    {
+        "id": "deepseek-ai/deepseek-v3.1-terminus",
+        "name": "DeepSeek V3.1",
+        "labels": ["tool_calling", "think_mode", "may_timeout"],
+    },
+    {
+        "id": "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+        "name": "Nemotron Super 49B",
+        "labels": ["general", "no_stream_tokens"],
+    },
+    {
+        "id": "minimaxai/minimax-m2.7",
+        "name": "MiniMax M2.7",
+        "labels": ["coding", "no_stream_tokens"],
+    },
+    {
+        "id": "google/gemma-4-31b-it",
+        "name": "Gemma 4 31B",
+        "labels": ["multimodal", "unstable"],
+    },
 ]
 
 # Workspace — all agent-created files must live here.
@@ -239,10 +290,6 @@ _DEFAULT_WORKSPACE = os.path.join(
 )
 AGENT_WORKSPACE = os.path.normpath(
     os.environ.get("AGENT_WORKSPACE", _DEFAULT_WORKSPACE).strip() or _DEFAULT_WORKSPACE
-)
-ADVISOR_RESPONSE_MAX_TOKENS = int(os.environ.get("ADVISOR_RESPONSE_MAX_TOKENS", "1200"))
-REVIEWER_RESPONSE_MAX_TOKENS = int(
-    os.environ.get("REVIEWER_RESPONSE_MAX_TOKENS", "1400")
 )
 
 # Base payload template (do not mutate globally)
@@ -254,589 +301,669 @@ BASE_PAYLOAD = {
     "presence_penalty": 0,
     "max_tokens": 4096,
     "stream": True,
-        "tools": [
+    "tools": [
         {
-                            "type": "function",
-                            "function": {
-                                "name": "read",
-                                "description": "Read the contents of a file",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "filepath": {
-                                            "type": "string",
-                                            "description": "Path to the file to read",
-                                        }
-                                    },
-                                    "required": ["filepath"],
-                                },
-                            },
-                        },
-        {
-                            "type": "function",
-                            "function": {
-                                "name": "write",
-                                "description": "Write content to a file (overwrites existing)",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "filepath": {
-                                            "type": "string",
-                                            "description": "Path to the file to write",
-                                        },
-                                        "content": {
-                                            "type": "string",
-                                            "description": "Content to write",
-                                        },
-                                    },
-                                    "required": ["filepath", "content"],
-                                },
-                            },
-                        },
-        {
-                            "type": "function",
-                            "function": {
-                                "name": "edit",
-                                "description": "Replace old_str with new_str in file. Requires exact match.",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "filepath": {
-                                            "type": "string",
-                                            "description": "Path to the file to edit",
-                                        },
-                                        "old_str": {
-                                            "type": "string",
-                                            "description": "Exact string to replace",
-                                        },
-                                        "new_str": {
-                                            "type": "string",
-                                            "description": "New string to insert",
-                                        },
-                                    },
-                                    "required": ["filepath", "old_str", "new_str"],
-                                },
-                            },
-                        },
-        {
-                            "type": "function",
-                            "function": {
-                                "name": "glob",
-                                "description": "Find files matching a glob pattern",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "pattern": {
-                                            "type": "string",
-                                            "description": "Glob pattern (e.g., '**/*.py')",
-                                        }
-                                    },
-                                    "required": ["pattern"],
-                                },
-                            },
-                        },
-        {
-                            "type": "function",
-                            "function": {
-                                "name": "grep",
-                                "description": "Search for pattern in files. Returns matching lines with filenames.",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "pattern": {
-                                            "type": "string",
-                                            "description": "Regex pattern to search for",
-                                        },
-                                        "path": {
-                                            "type": "string",
-                                            "description": "Directory to search in (default: current directory)",
-                                        },
-                                    },
-                                    "required": ["pattern"],
-                                },
-                            },
-                        },
-        {
-                            "type": "function",
-                            "function": {
-                                "name": "bash",
-                                "description": "Execute a shell command and return output",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "command": {
-                                            "type": "string",
-                                            "description": "Shell command to execute",
-                                        }
-                                    },
-                                    "required": ["command"],
-                                },
-                            },
-                        },
-        {
-                            "type": "function",
-                            "function": {
-                                "name": "remember",
-                                "description": "Store important information in persistent memory for future reference. Keep the subject correct: if the user names or renames the assistant, remember that as assistant identity, not as a user fact.",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "content": {
-                                            "type": "string",
-                                            "description": "The information to remember, written from the correct subject perspective",
-                                        },
-                                        "topics": {
-                                            "type": "array",
-                                            "items": {"type": "string"},
-                                            "description": "Optional topics/tags for categorization",
-                                        },
-                                        "importance": {
-                                            "type": "string",
-                                            "enum": ["low", "medium", "high"],
-                                            "description": "Importance level of this memory",
-                                        },
-                                    },
-                                    "required": ["content"],
-                                },
-                            },
-                        },
-        {
-                            "type": "function",
-                            "function": {
-                                "name": "recall",
-                                "description": "Search and retrieve information from persistent memory",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "query": {
-                                            "type": "string",
-                                            "description": "What to search for in memory",
-                                        },
-                                        "top_k": {
-                                            "type": "integer",
-                                            "description": "Number of memories to retrieve (default: 5)",
-                                        },
-                                        "topic": {
-                                            "type": "string",
-                                            "description": "Optional topic filter",
-                                        },
-                                    },
-                                    "required": ["query"],
-                                },
-                            },
-                        },
-        {
-                            "type": "function",
-                            "function": {
-                                "name": "web_search",
-                                "description": "Search the web for any topic and get clean, ready-to-use content from top results",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "query": {
-                                            "type": "string",
-                                            "description": "The search query string",
-                                        },
-                                        "numResults": {
-                                            "type": "integer",
-                                            "description": "Number of results to return (1-100, default: 10)",
-                                        },
-                                        "category": {
-                                            "type": "string",
-                                            "enum": ["company", "research paper", "news", "people"],
-                                            "description": "Optional category filter for search results",
-                                        },
-                                        "type": {
-                                            "type": "string",
-                                            "enum": [
-                                                "neural",
-                                                "fast",
-                                                "auto",
-                                                "deep",
-                                                "deep-reasoning",
-                                                "instant",
-                                            ],
-                                            "description": "Search type: auto (default), neural, fast, deep, deep-reasoning, instant",
-                                        },
-                                    },
-                                    "required": ["query"],
-                                },
-                            },
-                        },
-        {
-                            "type": "function",
-                            "function": {
-                                "name": "send_message",
-                                "description": "Send a plain-text message to the user via the active chat channel (iMessage or Telegram). Use this when you need to deliver a direct message.",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "text": {
-                                            "type": "string",
-                                            "description": "The message text to send",
-                                        },
-                                    },
-                                    "required": ["text"],
-                                },
-                            },
-                        },
-        {
-                            "type": "function",
-                            "function": {
-                                "name": "declare_message_count",
-                                "description": "Declare how many send_message calls will be made this turn. Call this BEFORE any send_message calls. After sending all declared messages, output <DONE> to signal completion.",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "count": {
-                                            "type": "integer",
-                                            "description": "The number of send_message calls that will be made this turn",
-                                        },
-                                    },
-                                    "required": ["count"],
-                                },
-                            },
-                        },
-        {
-                            "type": "function",
-                            "function": {
-                                "name": "send_tapback",
-                                "description": "Send an iMessage tapback reaction (like, dislike, love, laugh, emphasize, question) to a message by its handle",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "message_handle": {
-                                            "type": "string",
-                                            "description": "The iMessage message handle (available in [Available iMessage tapback handles])",
-                                        },
-                                        "reaction": {
-                                            "type": "string",
-                                            "enum": ["like", "dislike", "love", "laugh", "emphasize", "question"],
-                                            "description": "The tapback reaction to send",
-                                        },
-                                    },
-                                    "required": ["message_handle", "reaction"],
-                                },
-                            },
-                        },
-        {
-                            "type": "function",
-                            "function": {
-                                "name": "send_telegram_reaction",
-                                "description": "Send a Telegram emoji reaction to a message",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "chat_id": {
-                                            "type": "string",
-                                            "description": "The Telegram chat ID (available in [Available Telegram reaction targets])",
-                                        },
-                                        "message_id": {
-                                            "type": "string",
-                                            "description": "The Telegram message ID to react to",
-                                        },
-                                        "reaction": {
-                                            "type": "string",
-                                            "description": "The emoji reaction to send (e.g. 👍, ❤️, 😂)",
-                                        },
-                                    },
-                                    "required": ["chat_id", "message_id", "reaction"],
-                                },
-                            },
-                        },
-        {
-                            "type": "function",
-                            "function": {
-                                "name": "activate_skill",
-                                "description": "Activate an installed skill for the current session so its instructions are loaded into the system prompt",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "name": {
-                                            "type": "string",
-                                            "description": "The name of the skill to activate",
-                                        },
-                                    },
-                                    "required": ["name"],
-                                },
-                            },
-                        },
-        {
-                            "type": "function",
-                            "function": {
-                                "name": "add_skill",
-                                "description": (
-                                    "Fetch a skill from a URL, scan it for prompt-injection attacks, "
-                                    "and install it for the current and future sessions. Use when the user "
-                                    "mentions a URL to a SKILL.md or asks you to add/install a skill from a link."
-                                ),
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "url": {
-                                            "type": "string",
-                                            "description": "HTTPS or HTTP URL pointing to a SKILL.md file",
-                                        },
-                                        "auto_activate": {
-                                            "type": "boolean",
-                                            "description": "Automatically activate the skill for this session after install (default: true)",
-                                        },
-                                    },
-                                    "required": ["url"],
-                                },
-                            },
-                        },
-        {
-                            "type": "function",
-                            "function": {
-                                "name": "consult_advisor",
-                                "description": (
-                                    "Consult the advisor model for a concise strategy when you hit a hard "
-                                    "decision, branching choice, architecture tradeoff, or repeated failure "
-                                    "mid-run. The advisor reads the same shared context and returns a plan; "
-                                    "after the tool result, continue executing yourself."
-                                ),
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "question": {
-                                            "type": "string",
-                                            "description": "The exact decision or blocker you need the advisor to resolve",
-                                        },
-                                        "context": {
-                                            "type": "string",
-                                            "description": "Optional extra context, options under consideration, or recent failed attempts",
-                                        },
-                                    },
-                                    "required": ["question"],
-                                },
-                            },
-                        },
-        {
-                            "type": "function",
-                            "function": {
-                                "name": "consult_reviewer",
-                                "description": (
-                                    "Consult the reviewer model for a concise implementation review focused "
-                                    "on bugs, regressions, missing validation, and residual risks. Use this "
-                                    "after inspection or implementation work when you want a fast risk pass "
-                                    "before finalizing."
-                                ),
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "question": {
-                                            "type": "string",
-                                            "description": "The exact thing you want the reviewer to evaluate",
-                                        },
-                                        "context": {
-                                            "type": "string",
-                                            "description": "Optional extra context, change summary, known risks, or open questions",
-                                        },
-                                    },
-                                    "required": ["question"],
-                                },
-                            },
-                        },
-        {
-                            "type": "function",
-                            "function": {
-                                "name": "consortium_start",
-                                "description": (
-                                    "Start a consortium task where multiple internal models deliberate "
-                                    "and converge on a shared verdict. Use for complex reasoning, "
-                                    "critical decisions, fact-checking, or multi-perspective analysis."
-                                ),
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "task": {
-                                            "type": "string",
-                                            "description": "The question, decision, or task for the consortium to resolve",
-                                        },
-                                        "context": {
-                                            "type": "string",
-                                            "description": "Optional context or constraints for the consortium",
-                                        },
-                                        "members": {
-                                            "type": "array",
-                                            "items": {"type": "string"},
-                                            "description": "Optional list of consortium member names to include",
-                                        },
-                                        "max_rounds": {
-                                            "type": "integer",
-                                            "description": "Maximum deliberation rounds (default: 4)",
-                                        },
-                                    },
-                                    "required": ["task"],
-                                },
-                            },
-                        },
-        {
-                            "type": "function",
-                            "function": {
-                                "name": "consortium_stop",
-                                "description": "Stop a running consortium task by its task ID",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "task_id": {
-                                            "type": "string",
-                                            "description": "The consortium task ID to stop",
-                                        },
-                                    },
-                                    "required": ["task_id"],
-                                },
-                            },
-                        },
-        {
-                            "type": "function",
-                            "function": {
-                                "name": "consortium_status",
-                                "description": "Get status for all consortium tasks or a specific one",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "task_id": {
-                                            "type": "string",
-                                            "description": "Optional task ID to check. Omit to list all tasks.",
-                                        },
-                                    },
-                                },
-                            },
-                        },
-        {
-                            "type": "function",
-                            "function": {
-                                "name": "reminder_create",
-                                "description": (
-                                    "Create a scheduled reminder task. Use 'run_at' (Unix timestamp in seconds) "
-                                    "for short-duration one-off tasks (e.g. remind me in 20 seconds). "
-                                    "Use 'cron' (5-field cron expression) for recurring tasks. "
-                                    "Set 'run_ai'=true with an 'ai_prompt' to have the model generate text at "
-                                    "execution time. Set 'run_ai_with_tools'=true to give the AI full tool access "
-                                    "during scheduled execution. Always set 'session_id' so the output can be "
-                                    "delivered back to the correct chat channel."
-                                ),
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "cron": {
-                                            "type": "string",
-                                            "description": "5-field cron expression (minute hour day month weekday). Required unless run_at is provided. Use for recurring tasks.",
-                                        },
-                                        "run_at": {
-                                            "type": "integer",
-                                            "description": "Unix timestamp (seconds since epoch) for the first/only execution. Preferred for short-duration one-off tasks. If combined with cron, sets the first execution time.",
-                                        },
-                                        "message": {
-                                            "type": "string",
-                                            "description": "Static message to deliver when the task fires (used when run_ai is false)",
-                                        },
-                                        "session_id": {
-                                            "type": "string",
-                                            "description": "The chat session to deliver output to (e.g. 'tg_12345' or 'imessage_...'). Defaults to the current session.",
-                                        },
-                                        "one_off": {
-                                            "type": "boolean",
-                                            "description": "If true, the task runs once then auto-completes. Implied when only run_at is provided.",
-                                        },
-                                        "run_ai": {
-                                            "type": "boolean",
-                                            "description": "If true, the AI model generates the output at execution time using ai_prompt",
-                                        },
-                                        "ai_prompt": {
-                                            "type": "string",
-                                            "description": "The prompt for the AI to generate output at execution time. Required when run_ai is true.",
-                                        },
-                                        "run_ai_with_tools": {
-                                            "type": "boolean",
-                                            "description": "If true, the AI has full tool access during scheduled execution (bash, read, write, web_search, etc.)",
-                                        },
-                                        "task_id": {
-                                            "type": "string",
-                                            "description": "Optional custom task ID (letters, numbers, hyphens, underscores)",
-                                        },
-                                        "name": {
-                                            "type": "string",
-                                            "description": "Optional human-readable name for this task",
-                                        },
-                                    },
-                                    "required": [],
-                                },
-                            },
-                        },
-        {
-                            "type": "function",
-                            "function": {
-                                "name": "reminder_list",
-                                "description": "List all scheduled reminder tasks with their status and next run times",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "include_disabled": {
-                                            "type": "boolean",
-                                            "description": "Include disabled/cancelled tasks (default: true)",
-                                        },
-                                    },
-                                },
-                            },
-                        },
-        {
-                            "type": "function",
-                            "function": {
-                                "name": "reminder_status",
-                                "description": "Get detailed status for a single reminder task",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "task_id": {
-                                            "type": "string",
-                                            "description": "The task ID to check",
-                                        },
-                                    },
-                                    "required": ["task_id"],
-                                },
-                            },
-                        },
-        {
-                            "type": "function",
-                            "function": {
-                                "name": "reminder_cancel",
-                                "description": "Cancel a scheduled reminder task",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "task_id": {
-                                            "type": "string",
-                                            "description": "The task ID to cancel",
-                                        },
-                                        "reason": {
-                                            "type": "string",
-                                            "description": "Optional reason for cancellation",
-                                        },
-                                    },
-                                    "required": ["task_id"],
-                                },
-                            },
-                        },
-        {
-                            "type": "function",
-                            "function": {
-                                "name": "reminder_run_now",
-                                "description": "Run a scheduled reminder task immediately instead of waiting for its next scheduled time",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "task_id": {
-                                            "type": "string",
-                                            "description": "The task ID to execute immediately",
-                                        },
-                                    },
-                                    "required": ["task_id"],
-                                },
-                            },
+            "type": "function",
+            "function": {
+                "name": "read",
+                "description": "Read the contents of a file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "filepath": {
+                            "type": "string",
+                            "description": "Path to the file to read",
                         }
+                    },
+                    "required": ["filepath"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "write",
+                "description": "Write content to a file (overwrites existing)",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "filepath": {
+                            "type": "string",
+                            "description": "Path to the file to write",
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "Content to write",
+                        },
+                    },
+                    "required": ["filepath", "content"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "edit",
+                "description": "Replace old_str with new_str in file. Requires exact match.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "filepath": {
+                            "type": "string",
+                            "description": "Path to the file to edit",
+                        },
+                        "old_str": {
+                            "type": "string",
+                            "description": "Exact string to replace",
+                        },
+                        "new_str": {
+                            "type": "string",
+                            "description": "New string to insert",
+                        },
+                    },
+                    "required": ["filepath", "old_str", "new_str"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "glob",
+                "description": "Find files matching a glob pattern",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "Glob pattern (e.g., '**/*.py')",
+                        }
+                    },
+                    "required": ["pattern"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "grep",
+                "description": "Search for pattern in files. Returns matching lines with filenames.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "Regex pattern to search for",
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Directory to search in (default: current directory)",
+                        },
+                    },
+                    "required": ["pattern"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Execute a shell command and return output",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "Shell command to execute",
+                        }
+                    },
+                    "required": ["command"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "remember",
+                "description": "Store important information in persistent memory for future reference. Keep the subject correct: if the user names or renames the assistant, remember that as assistant identity, not as a user fact.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "content": {
+                            "type": "string",
+                            "description": "The information to remember, written from the correct subject perspective",
+                        },
+                        "topics": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional topics/tags for categorization",
+                        },
+                        "importance": {
+                            "type": "string",
+                            "enum": ["low", "medium", "high"],
+                            "description": "Importance level of this memory",
+                        },
+                    },
+                    "required": ["content"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "recall",
+                "description": "Search and retrieve information from persistent memory",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "What to search for in memory",
+                        },
+                        "top_k": {
+                            "type": "integer",
+                            "description": "Number of memories to retrieve (default: 5)",
+                        },
+                        "topic": {
+                            "type": "string",
+                            "description": "Optional topic filter",
+                        },
+                    },
+                    "required": ["query"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_recent_memories",
+                "description": "List the most recent stored memories in order. Use this to enumerate, export, or dump all saved memories when the user asks what you remember about them or to list/export everything (recall only does keyword search and may miss vague requests).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {
+                            "type": "integer",
+                            "description": "How many recent memories to return (default: 10, raise it to export more)",
+                        },
+                    },
+                    "required": [],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Search the web for any topic and get clean, ready-to-use content from top results",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "The search query string",
+                        },
+                        "numResults": {
+                            "type": "integer",
+                            "description": "Number of results to return (1-100, default: 10)",
+                        },
+                        "category": {
+                            "type": "string",
+                            "enum": ["company", "research paper", "news", "people"],
+                            "description": "Optional category filter for search results",
+                        },
+                        "search_type": {
+                            "type": "string",
+                            "enum": [
+                                "neural",
+                                "fast",
+                                "auto",
+                                "deep",
+                                "deep-reasoning",
+                                "instant",
+                            ],
+                            "description": "Search type: auto (default), neural, fast, deep, deep-reasoning, instant",
+                        },
+                    },
+                    "required": ["query"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "browser_open",
+                "description": "Open a persistent stealth browser session for interactive web automation. Reuses the existing session if one is already open.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "browser_navigate",
+                "description": "Navigate the browser to a URL. Opens the browser session automatically if not already open. Returns the final URL, HTTP status, and page title.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "The URL to navigate to",
+                        },
+                        "wait_until": {
+                            "type": "string",
+                            "enum": ["load", "domcontentloaded", "networkidle", "commit"],
+                            "description": "When navigation is considered finished (default: domcontentloaded)",
+                        },
+                    },
+                    "required": ["url"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "browser_click",
+                "description": "Click an element on the current page matching a CSS selector. Requires an open browser page (call browser_navigate first).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "selector": {
+                            "type": "string",
+                            "description": "CSS selector of the element to click",
+                        }
+                    },
+                    "required": ["selector"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "browser_type",
+                "description": "Fill text into an input or textarea on the current page matching a CSS selector. Replaces any existing value.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "selector": {
+                            "type": "string",
+                            "description": "CSS selector of the input/textarea",
+                        },
+                        "text": {
+                            "type": "string",
+                            "description": "Text to enter into the field",
+                        },
+                    },
+                    "required": ["selector", "text"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "browser_read",
+                "description": "Read the visible text of the current page (or a specific element by CSS selector). Use this to see what is on the page.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "selector": {
+                            "type": "string",
+                            "description": "Optional CSS selector to read a specific element; defaults to the whole page body",
+                        },
+                        "max_chars": {
+                            "type": "integer",
+                            "description": "Maximum characters of text to return (default: 5000)",
+                        },
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "browser_screenshot",
+                "description": "Capture a PNG screenshot of the current page, saved to the agent workspace. Returns the file path.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "filename": {
+                            "type": "string",
+                            "description": "Optional output filename (defaults to a timestamped name)",
+                        },
+                        "full_page": {
+                            "type": "boolean",
+                            "description": "Capture the full scrollable page instead of just the viewport (default: false)",
+                        },
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "browser_close",
+                "description": "Close the persistent browser session and free its resources.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "send_message",
+                "description": "Send a plain-text message to the user via the active chat channel (iMessage or Telegram). Use this when you need to deliver a direct message.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {
+                            "type": "string",
+                            "description": "The message text to send",
+                        },
+                    },
+                    "required": ["text"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "declare_message_count",
+                "description": "Declare how many send_message calls will be made this turn. Call this BEFORE any send_message calls. After sending all declared messages, output <DONE> to signal completion.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "count": {
+                            "type": "integer",
+                            "description": "The number of send_message calls that will be made this turn",
+                        },
+                    },
+                    "required": ["count"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "send_tapback",
+                "description": "Send an iMessage tapback reaction (like, dislike, love, laugh, emphasize, question) to a message by its handle",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "message_handle": {
+                            "type": "string",
+                            "description": "The iMessage message handle (available in [Available iMessage tapback handles])",
+                        },
+                        "reaction": {
+                            "type": "string",
+                            "enum": [
+                                "like",
+                                "dislike",
+                                "love",
+                                "laugh",
+                                "emphasize",
+                                "question",
+                            ],
+                            "description": "The tapback reaction to send",
+                        },
+                    },
+                    "required": ["message_handle", "reaction"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "send_telegram_reaction",
+                "description": "Send a Telegram emoji reaction to a message",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "chat_id": {
+                            "type": "string",
+                            "description": "The Telegram chat ID (available in [Available Telegram reaction targets])",
+                        },
+                        "message_id": {
+                            "type": "string",
+                            "description": "The Telegram message ID to react to",
+                        },
+                        "reaction": {
+                            "type": "string",
+                            "description": "The emoji reaction to send (e.g. 👍, ❤️, 😂)",
+                        },
+                    },
+                    "required": ["chat_id", "message_id", "reaction"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "activate_skill",
+                "description": "Activate an installed skill for the current session so its instructions are loaded into the system prompt",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "The name of the skill to activate",
+                        },
+                    },
+                    "required": ["name"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "add_skill",
+                "description": (
+                    "Fetch a skill from a URL, scan it for prompt-injection attacks, "
+                    "and install it for the current and future sessions. Use when the user "
+                    "mentions a URL to a SKILL.md or asks you to add/install a skill from a link."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "HTTPS or HTTP URL pointing to a SKILL.md file",
+                        },
+                        "auto_activate": {
+                            "type": "boolean",
+                            "description": "Automatically activate the skill for this session after install (default: true)",
+                        },
+                    },
+                    "required": ["url"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "consortium_start",
+                "description": (
+                    "Start a consortium task where multiple internal models deliberate "
+                    "and converge on a shared verdict. Use for complex reasoning, "
+                    "critical decisions, fact-checking, or multi-perspective analysis."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task": {
+                            "type": "string",
+                            "description": "The question, decision, or task for the consortium to resolve",
+                        },
+                    },
+                    "required": ["task"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "consortium_stop",
+                "description": "Stop a running consortium task by its task ID",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {
+                            "type": "string",
+                            "description": "The consortium task ID to stop",
+                        },
+                    },
+                    "required": ["task_id"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "consortium_status",
+                "description": "Get status for all consortium tasks or a specific one",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {
+                            "type": "string",
+                            "description": "Optional task ID to check. Omit to list all tasks.",
+                        },
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "reminder_create",
+                "description": (
+                    "Create a scheduled reminder task. For relative requests like "
+                    "'remind me in a minute' or 'in 2 hours', ALWAYS use 'delay_seconds' "
+                    "(e.g. 'in a minute' -> delay_seconds=60) — do NOT compute a Unix "
+                    "timestamp yourself. Use 'run_at' only when the user gives an absolute "
+                    "epoch. Use 'cron' (5-field) for recurring tasks. Set 'run_ai'=true with "
+                    "an 'ai_prompt' to have the model generate text at execution time. Set "
+                    "'run_ai_with_tools'=true to give the AI full tool access during scheduled "
+                    "execution. Always set 'session_id' so the output is delivered to the right chat."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "delay_seconds": {
+                            "type": "integer",
+                            "description": "Relative delay in seconds from now for a one-off reminder. USE THIS for 'remind me in N seconds/minutes/hours' (e.g. 'in a minute' -> 60, 'in 5 minutes' -> 300, 'in 2 hours' -> 7200). No timestamp or timezone math needed.",
+                        },
+                        "cron": {
+                            "type": "string",
+                            "description": "5-field cron expression (minute hour day month weekday). Use for recurring tasks. Not needed when delay_seconds or run_at is given.",
+                        },
+                        "run_at": {
+                            "type": "integer",
+                            "description": "Unix timestamp (seconds since epoch) for the first/only execution. Only use when the user specifies an absolute time; prefer delay_seconds for relative reminders.",
+                        },
+                        "message": {
+                            "type": "string",
+                            "description": "Static message to deliver when the task fires (used when run_ai is false)",
+                        },
+                        "session_id": {
+                            "type": "string",
+                            "description": "The chat session to deliver output to (e.g. 'tg_12345' or 'imessage_...'). Defaults to the current session.",
+                        },
+                        "one_off": {
+                            "type": "boolean",
+                            "description": "If true, the task runs once then auto-completes. Implied when only run_at is provided.",
+                        },
+                        "run_ai": {
+                            "type": "boolean",
+                            "description": "If true, the AI model generates the output at execution time using ai_prompt",
+                        },
+                        "ai_prompt": {
+                            "type": "string",
+                            "description": "The prompt for the AI to generate output at execution time. Required when run_ai is true.",
+                        },
+                        "run_ai_with_tools": {
+                            "type": "boolean",
+                            "description": "If true, the AI has full tool access during scheduled execution (bash, read, write, web_search, etc.)",
+                        },
+                        "task_id": {
+                            "type": "string",
+                            "description": "Optional custom task ID (letters, numbers, hyphens, underscores)",
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": "Optional human-readable name for this task",
+                        },
+                    },
+                    "required": [],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "reminder_list",
+                "description": "List all scheduled reminder tasks with their status and next run times",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "include_disabled": {
+                            "type": "boolean",
+                            "description": "Include disabled/cancelled tasks (default: true)",
+                        },
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "reminder_status",
+                "description": "Get detailed status for a single reminder task",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {
+                            "type": "string",
+                            "description": "The task ID to check",
+                        },
+                    },
+                    "required": ["task_id"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "reminder_cancel",
+                "description": "Cancel a scheduled reminder task",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {
+                            "type": "string",
+                            "description": "The task ID to cancel",
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "Optional reason for cancellation",
+                        },
+                    },
+                    "required": ["task_id"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "reminder_run_now",
+                "description": "Run a scheduled reminder task immediately instead of waiting for its next scheduled time",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {
+                            "type": "string",
+                            "description": "The task ID to execute immediately",
+                        },
+                    },
+                    "required": ["task_id"],
+                },
+            },
+        },
     ],
 }
 
@@ -845,6 +972,67 @@ CONSORTIUM_COMPLETION_MESSAGE = "the consortium has reached an agreement."
 CONSORTIUM_MAX_ROUNDS = 4
 
 FINAL_RESPONSE_MAX_TOKENS = int(os.environ.get("FINAL_RESPONSE_MAX_TOKENS", "150"))
+
+# ── Orchestrated 3-stage pipeline (orchestrator → blind worker → finalize) ────
+# For non-trivial tasks, an advisor-model orchestrator plans a brief, a blind
+# executor-model worker does all the tool-calling work, then the orchestrator
+# writes the final user-facing reply.  Set AGENTZERO_ORCHESTRATED_PIPELINE=0 to
+# revert to the single-model path.
+ORCHESTRATED_PIPELINE_ENABLED = (
+    os.environ.get("AGENTZERO_ORCHESTRATED_PIPELINE", "1").strip() != "0"
+)
+ORCHESTRATOR_PLAN_MAX_TOKENS = int(os.environ.get("ORCHESTRATOR_PLAN_MAX_TOKENS", "800"))
+ORCHESTRATOR_FINALIZE_MAX_TOKENS = int(
+    os.environ.get("ORCHESTRATOR_FINALIZE_MAX_TOKENS", "2000")
+)
+ORCHESTRATOR_WORKER_RESULT_CHAR_LIMIT = int(
+    os.environ.get("ORCHESTRATOR_WORKER_RESULT_CHAR_LIMIT", "8000")
+)
+# Tools the blind worker must never call — user-facing delivery is the
+# orchestrator's job, and reentrant consortium/orchestration is disallowed.
+_WORKER_EXCLUDED_TOOLS: frozenset[str] = frozenset(
+    {
+        "send_message",
+        "declare_message_count",
+        "send_tapback",
+        "send_telegram_reaction",
+        "consortium_start",
+        "consortium_stop",
+        "consortium_status",
+    }
+)
+
+# Greetings / acknowledgements that should bypass the orchestrated pipeline.
+_TRIVIAL_QUERY_RE = re.compile(
+    r"^(?:hi|hello|hey|yo|sup|howdy|morning|good (?:morning|evening|night|afternoon)|"
+    r"thanks?(?:\s+you)?|thank you|thx|ty|cool|ok(?:ay)?|sure|got it|np|yw|"
+    r"lol|lmao|haha|nice|great|awesome|sounds good|word|bet|k)[.!?]*\s*$",
+    re.IGNORECASE,
+)
+
+
+def _is_trivial_query(
+    user_query: str,
+    task: Optional[Any],
+    task_plan: Optional[Any] = None,
+) -> bool:
+    """Return True for greetings, acks, and short unclassified queries.
+
+    Trivial turns bypass the orchestrated pipeline and use the single-model
+    path so a simple "hey" doesn't pay for a plan + worker + finalize round
+    trip.
+    """
+    stripped = (user_query or "").strip()
+    if not stripped:
+        return True
+    if _TRIVIAL_QUERY_RE.match(stripped):
+        return True
+    if len(stripped) < 60 and (
+        task is None or getattr(task, "type", None) == TaskType.GENERIC.value
+    ):
+        return True
+    return False
+
 
 AUTO_MEMORY_ENABLED = os.environ.get("AUTO_MEMORY_ENABLED", "1").strip() != "0"
 AUTO_MEMORY_MIN_MESSAGES_PER_MEMORY = max(
@@ -903,22 +1091,6 @@ MEMORY_RELEVANCE_THRESHOLD = max(
     0.0,
     float(os.environ.get("MEMORY_RELEVANCE_THRESHOLD", "0.15")),
 )
-
-DREAM_MODE_ENABLED = os.environ.get("MEMORY_DREAM_ENABLED", "1").strip() != "0"
-DREAM_LOOKBACK_DAYS = max(7, int(os.environ.get("MEMORY_DREAM_LOOKBACK_DAYS", "21")))
-DREAM_MIN_DAYS_FOR_PROFILE = max(7, int(os.environ.get("MEMORY_DREAM_MIN_DAYS", "14")))
-DREAM_OFFPEAK_WINDOW_HOURS = max(
-    2, min(12, int(os.environ.get("MEMORY_DREAM_OFFPEAK_WINDOW_HOURS", "6")))
-)
-DREAM_MIN_INTERVAL_HOURS = max(
-    6, int(os.environ.get("MEMORY_DREAM_MIN_INTERVAL_HOURS", "24"))
-)
-DREAM_MIN_CANDIDATES = max(1, int(os.environ.get("MEMORY_DREAM_MIN_CANDIDATES", "4")))
-DREAM_CANDIDATE_LIMIT = max(
-    DREAM_MIN_CANDIDATES,
-    int(os.environ.get("MEMORY_DREAM_CANDIDATE_LIMIT", "24")),
-)
-DREAM_MIN_AGE_HOURS = max(1, int(os.environ.get("MEMORY_DREAM_MIN_AGE_HOURS", "24")))
 
 CONSORTIUM_MEMBERS = [
     {
@@ -1020,6 +1192,7 @@ class AgentHandler:
         name: str = "",
         run_at: Optional[int] = None,
         run_ai_with_tools: bool = False,
+        delay_seconds: Optional[int] = None,
     ) -> dict[str, Any]:
         """Create one reminder task."""
         return await self.reminder_scheduler.create_task(
@@ -1033,6 +1206,7 @@ class AgentHandler:
             name=name,
             run_at=run_at,
             run_ai_with_tools=run_ai_with_tools,
+            delay_seconds=delay_seconds,
         )
 
     async def list_reminder_tasks(
@@ -1105,166 +1279,6 @@ class AgentHandler:
             )
 
         return (output or "").strip()
-
-    async def consult_advisor(
-        self,
-        question: str,
-        context: str = "",
-        session_id: Optional[str] = None,
-        shared_messages: Optional[list[dict[str, Any]]] = None,
-    ) -> dict[str, Any]:
-        """Consult the advisor model using the current turn's shared context."""
-        normalized_question = str(question or "").strip()
-        if not normalized_question:
-            return {"success": False, "error": "question is required"}
-
-        runtime_messages = [
-            dict(message)
-            for message in (shared_messages or [])
-            if isinstance(message, dict)
-        ]
-        base_system_content = ""
-        non_system_messages: list[dict[str, Any]] = []
-
-        for message in runtime_messages:
-            if message.get("role") == "system" and not base_system_content:
-                base_system_content = _content_to_text(message.get("content", ""))
-                continue
-            non_system_messages.append(message)
-
-        advisor_system_content = get_template(
-            "advisor_consultation",
-            {
-                "base_system_content": base_system_content,
-                "session_id": session_id or "",
-            },
-        )
-        consultation_request = (
-            "[Executor consultation request]\n"
-            f"Decision needed: {normalized_question}\n"
-            f"Additional context: {str(context or '').strip() or 'None provided.'}\n\n"
-            "Return a concise operational memo for the executor with these exact sections:\n"
-            "Decision:\nWhy:\nNext steps:\nRisks:\n"
-        )
-
-        payload = BASE_PAYLOAD.copy()
-        payload["model"] = ADVISOR_MODEL_ID
-        payload["tools"] = []
-        payload["max_tokens"] = ADVISOR_RESPONSE_MAX_TOKENS
-        payload["messages"] = [
-            {"role": "system", "content": advisor_system_content},
-            *non_system_messages,
-            {"role": "user", "content": consultation_request},
-        ]
-
-        async with aiohttp.ClientSession() as session:
-            response_data = await api_call_with_retry(
-                session,
-                BASE_URL,
-                payload,
-                {"Authorization": f"Bearer {API_KEY}"},
-            )
-
-        if "error" in response_data:
-            error_msg = response_data["error"].get("message", "Unknown API error")
-            return {"success": False, "error": error_msg}
-
-        choices = response_data.get("choices") or []
-        if not choices:
-            return {"success": False, "error": "No response from advisor model"}
-
-        advice = safe_strip_markdown(
-            _content_to_text(choices[0].get("message", {}).get("content", ""))
-        ).strip()
-        if not advice:
-            return {"success": False, "error": "Advisor returned empty advice"}
-
-        return {
-            "success": True,
-            "advisor_model": ADVISOR_MODEL_ID,
-            "question": normalized_question,
-            "advice": advice,
-        }
-
-    async def consult_reviewer(
-        self,
-        question: str,
-        context: str = "",
-        session_id: Optional[str] = None,
-        shared_messages: Optional[list[dict[str, Any]]] = None,
-    ) -> dict[str, Any]:
-        """Consult the reviewer model using the current turn's shared context."""
-        normalized_question = str(question or "").strip()
-        if not normalized_question:
-            return {"success": False, "error": "question is required"}
-
-        runtime_messages = [
-            dict(message)
-            for message in (shared_messages or [])
-            if isinstance(message, dict)
-        ]
-        base_system_content = ""
-        non_system_messages: list[dict[str, Any]] = []
-
-        for message in runtime_messages:
-            if message.get("role") == "system" and not base_system_content:
-                base_system_content = _content_to_text(message.get("content", ""))
-                continue
-            non_system_messages.append(message)
-
-        reviewer_system_content = get_template(
-            "reviewer_consultation",
-            {
-                "base_system_content": base_system_content,
-                "session_id": session_id or "",
-            },
-        )
-        review_request = (
-            "[Executor review request]\n"
-            f"Review target: {normalized_question}\n"
-            f"Additional context: {str(context or '').strip() or 'None provided.'}\n\n"
-            "Return a concise operational memo for the executor with these exact sections:\n"
-            "Verdict:\nFindings:\nFixes:\nResidual risks:\n"
-        )
-
-        payload = BASE_PAYLOAD.copy()
-        payload["model"] = REVIEWER_MODEL_ID
-        payload["tools"] = []
-        payload["max_tokens"] = REVIEWER_RESPONSE_MAX_TOKENS
-        payload["messages"] = [
-            {"role": "system", "content": reviewer_system_content},
-            *non_system_messages,
-            {"role": "user", "content": review_request},
-        ]
-
-        async with aiohttp.ClientSession() as session:
-            response_data = await api_call_with_retry(
-                session,
-                BASE_URL,
-                payload,
-                {"Authorization": f"Bearer {API_KEY}"},
-            )
-
-        if "error" in response_data:
-            error_msg = response_data["error"].get("message", "Unknown API error")
-            return {"success": False, "error": error_msg}
-
-        choices = response_data.get("choices") or []
-        if not choices:
-            return {"success": False, "error": "No response from reviewer model"}
-
-        review = safe_strip_markdown(
-            _content_to_text(choices[0].get("message", {}).get("content", ""))
-        ).strip()
-        if not review:
-            return {"success": False, "error": "Reviewer returned empty review"}
-
-        return {
-            "success": True,
-            "reviewer_model": REVIEWER_MODEL_ID,
-            "question": normalized_question,
-            "review": review,
-        }
 
     async def _deliver_reminder_output(
         self,
@@ -1374,7 +1388,9 @@ class AgentHandler:
             return val.strip()
         return None
 
-    def set_session_model_override(self, session_id: str, model_id: Optional[str]) -> None:
+    def set_session_model_override(
+        self, session_id: str, model_id: Optional[str]
+    ) -> None:
         """Persist a per-session model override.  Pass None to clear."""
         if not session_id or not self.memory_store:
             return
@@ -1386,7 +1402,9 @@ class AgentHandler:
         else:
             self.memory_store.set_agent_state(key, model_id.strip())
 
-    def _build_request_payload_template(self, session_id: Optional[str] = None) -> dict[str, Any]:
+    def _build_request_payload_template(
+        self, session_id: Optional[str] = None
+    ) -> dict[str, Any]:
         """Build base payload with dynamic tool registration (including skills)."""
         payload = BASE_PAYLOAD.copy()
         payload["tools"] = list(BASE_PAYLOAD.get("tools", []))
@@ -2017,8 +2035,16 @@ class AgentHandler:
         memory_lower = normalized_content
 
         keyword_overlap = 0.0
-        query_words = set(re.sub(r"[^\w]", "", qw) for qw in query_lower.split() if len(re.sub(r"[^\w]", "", qw)) > 2)
-        memory_words = set(re.sub(r"[^\w]", "", mw) for mw in memory_lower.split() if len(re.sub(r"[^\w]", "", mw)) > 2)
+        query_words = set(
+            re.sub(r"[^\w]", "", qw)
+            for qw in query_lower.split()
+            if len(re.sub(r"[^\w]", "", qw)) > 2
+        )
+        memory_words = set(
+            re.sub(r"[^\w]", "", mw)
+            for mw in memory_lower.split()
+            if len(re.sub(r"[^\w]", "", mw)) > 2
+        )
 
         if query_words and memory_words:
             intersection = query_words & memory_words
@@ -2224,8 +2250,12 @@ class AgentHandler:
 
         if user_query:
             relevance_score = self._score_memory_relevance_to_query(
-                type("Memory", (), {"content": f"Your name is {assistant_name}", "metadata": {}}),
-                user_query
+                type(
+                    "Memory",
+                    (),
+                    {"content": f"Your name is {assistant_name}", "metadata": {}},
+                ),
+                user_query,
             )
             if relevance_score < 0.1:
                 return ""
@@ -2304,7 +2334,9 @@ class AgentHandler:
                 continue
 
             if user_query:
-                relevance_score = self._score_memory_relevance_to_query(memory, user_query)
+                relevance_score = self._score_memory_relevance_to_query(
+                    memory, user_query
+                )
                 if relevance_score < 0.05:
                     continue
 
@@ -2355,9 +2387,7 @@ class AgentHandler:
             profile_lines = [
                 "[No relevant continuity notes found for this conversation]"
             ]
-            history_lines = [
-                "[Recent conversation thread not available]"
-            ]
+            history_lines = ["[Recent conversation thread not available]"]
 
         lines = [
             "",
@@ -2900,9 +2930,9 @@ class AgentHandler:
             session_id=session_id, limit=20
         )
         user_messages = [
-            msg.content
+            msg["content"]
             for msg in recent_messages
-            if msg.role == "user" and msg.content.strip()
+            if msg.get("role") == "user" and str(msg.get("content", "")).strip()
         ]
         if len(user_messages) < self.SPEECH_PATTERN_MIN_MESSAGES:
             return None
@@ -2983,7 +3013,9 @@ class AgentHandler:
             if style_notes:
                 full_content = f"{patterns}\n\n{style_notes}"
             if vocabulary:
-                full_content = f"{full_content}\n\nDistictive vocabulary: {', '.join(vocabulary)}"
+                full_content = (
+                    f"{full_content}\n\nDistictive vocabulary: {', '.join(vocabulary)}"
+                )
 
             return {
                 "content": full_content,
@@ -3020,7 +3052,9 @@ class AgentHandler:
             session=session, session_id=session_id, user_query=user_query
         )
         if not extracted:
-            logger.info("Speech pattern extraction returned nothing for session %s", session_id)
+            logger.info(
+                "Speech pattern extraction returned nothing for session %s", session_id
+            )
             return
 
         metadata = {
@@ -3038,9 +3072,7 @@ class AgentHandler:
         )
         logger.info("Speech pattern stored: id=%s session=%s", memory_id, session_id)
 
-    def _build_speech_pattern_context(
-        self, session_id: Optional[str]
-    ) -> str:
+    def _build_speech_pattern_context(self, session_id: Optional[str]) -> str:
         """Build speech pattern context block for system prompt."""
         if not session_id:
             return ""
@@ -3051,255 +3083,13 @@ class AgentHandler:
         if not patterns:
             return ""
 
-        lines = [
-            "\n\n[User speaking style - adapt to match]:\n"
-        ]
+        lines = ["\n\n[User speaking style - adapt to match]:\n"]
         for i, pattern in enumerate(patterns, 1):
             content = pattern.content.strip()
             if content:
                 lines.append(f"{i}. {content}")
 
         return "\n".join(lines)
-
-    def _get_or_refresh_dream_profile(self) -> dict[str, Any]:
-        """Compute or refresh the learned off-peak profile used for dream mode."""
-        now = datetime.datetime.now()
-        profile = self.memory_store.get_agent_state("dream.profile", default={})
-        if not isinstance(profile, dict):
-            profile = {}
-
-        profiled_at = self._parse_state_timestamp(profile.get("profiled_at"))
-        should_refresh = (
-            not profile
-            or not profile.get("hours")
-            or not profiled_at
-            or (now - profiled_at).total_seconds() >= 24 * 3600
-        )
-
-        if not should_refresh:
-            return profile
-
-        inferred = self.memory_store.infer_offpeak_hours(
-            lookback_days=DREAM_LOOKBACK_DAYS,
-            min_days=DREAM_MIN_DAYS_FOR_PROFILE,
-            window_hours=DREAM_OFFPEAK_WINDOW_HOURS,
-        )
-        refreshed_profile = {
-            "hours": inferred.get("hours", []),
-            "reason": inferred.get("reason", "unknown"),
-            "stats": inferred.get("stats", {}),
-            "window_score": inferred.get("window_score", 0),
-            "profiled_at": now.isoformat(timespec="seconds"),
-        }
-        self.memory_store.set_agent_state("dream.profile", refreshed_profile)
-        return refreshed_profile
-
-    async def _extract_dream_consolidation_payload(
-        self,
-        session: aiohttp.ClientSession,
-        candidates_payload: str,
-        candidate_ids: set[int],
-    ) -> list[dict[str, Any]]:
-        """Generate long-term consolidated memories from short-term memory candidates."""
-        payload = BASE_PAYLOAD.copy()
-        payload["model"] = MODEL_ID
-        payload["temperature"] = 0.2
-        payload["max_tokens"] = 700
-        payload["tools"] = []
-        payload["messages"] = [
-            {
-                "role": "system",
-                "content": (
-                    "You are running an offline memory consolidation pass. "
-                    "Merge related short-term memories into a small set of durable long-term memories. "
-                    "Only keep information likely to matter in future conversations. "
-                    "Output JSON only with schema: "
-                    '{"consolidated": [{"content": string, "significance": number, '
-                    '"topics": string[], "source_memory_ids": number[]}]}'
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    "Candidate memories:\n"
-                    f"{candidates_payload}\n\n"
-                    "Return at most 6 consolidated memories."
-                ),
-            },
-        ]
-
-        response_data = await api_call_with_retry(
-            session,
-            BASE_URL,
-            payload,
-            {"Authorization": f"Bearer {API_KEY}"},
-        )
-        raw_output = await process_response(
-            response_data,
-            payload["messages"],
-            session,
-            BASE_URL,
-            API_KEY,
-            payload,
-        )
-
-        parsed = self._coerce_json_dict(raw_output)
-        entries = parsed.get("consolidated", [])
-        if not isinstance(entries, list):
-            return []
-
-        consolidated: list[dict[str, Any]] = []
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-
-            content = str(entry.get("content", "")).strip()
-            if len(content) < 25:
-                continue
-
-            significance = max(
-                0.0,
-                min(1.0, self._coerce_float(entry.get("significance"), default=0.5)),
-            )
-
-            topics_raw = entry.get("topics", [])
-            topics: list[str] = []
-            if isinstance(topics_raw, list):
-                for topic_item in topics_raw:
-                    topic = str(topic_item).strip().lower()
-                    if topic and topic not in topics:
-                        topics.append(topic)
-                    if len(topics) >= 6:
-                        break
-
-            source_ids_raw = entry.get("source_memory_ids", [])
-            source_ids: list[int] = []
-            if isinstance(source_ids_raw, list):
-                for item in source_ids_raw:
-                    try:
-                        source_id = int(item)
-                    except (TypeError, ValueError):
-                        continue
-                    if source_id in candidate_ids and source_id not in source_ids:
-                        source_ids.append(source_id)
-
-            if not source_ids:
-                continue
-
-            consolidated.append(
-                {
-                    "content": content,
-                    "significance": significance,
-                    "topics": topics,
-                    "source_memory_ids": source_ids,
-                }
-            )
-
-            if len(consolidated) >= 6:
-                break
-
-        return consolidated
-
-    async def _run_dream_cycle_if_due(self, session: aiohttp.ClientSession):
-        """Run periodic memory consolidation during inferred off-peak hours."""
-        if not DREAM_MODE_ENABLED:
-            return
-
-        profile = self._get_or_refresh_dream_profile()
-        hours = profile.get("hours", [])
-        if not isinstance(hours, list) or not hours:
-            return
-
-        now = datetime.datetime.now()
-        if now.hour not in {int(hour) for hour in hours if isinstance(hour, int)}:
-            return
-
-        last_run_at = self._parse_state_timestamp(
-            self.memory_store.get_agent_state("dream.last_run_at")
-        )
-        if (
-            last_run_at
-            and (now - last_run_at).total_seconds() < DREAM_MIN_INTERVAL_HOURS * 3600
-        ):
-            return
-
-        candidates = self.memory_store.get_memories_for_consolidation(
-            limit=DREAM_CANDIDATE_LIMIT,
-            min_age_hours=DREAM_MIN_AGE_HOURS,
-        )
-        if len(candidates) < DREAM_MIN_CANDIDATES:
-            return
-
-        candidate_ids = {memory.id for memory in candidates if memory.id is not None}
-        candidate_lines: list[str] = []
-        for memory in candidates:
-            if memory.id is None:
-                continue
-            importance = str((memory.metadata or {}).get("importance", "medium"))
-            candidate_lines.append(
-                f"id={memory.id} | importance={importance} | content={memory.content}"
-            )
-
-        consolidated = await self._extract_dream_consolidation_payload(
-            session=session,
-            candidates_payload="\n".join(candidate_lines),
-            candidate_ids=candidate_ids,
-        )
-
-        created_ids: list[int] = []
-        source_significance: dict[int, float] = {}
-        for entry in consolidated:
-            content = entry["content"]
-            if self._is_duplicate_memory(content, session_id=None):
-                continue
-
-            significance = max(0.0, min(1.0, float(entry["significance"])))
-            metadata = {
-                "type": "long_term_memory",
-                "source": "dream_cycle",
-                "long_term": True,
-                "significance": significance,
-                "importance": "high" if significance >= 0.8 else "medium",
-                "source_memory_ids": entry["source_memory_ids"],
-                "dream_hours": hours,
-            }
-
-            new_memory_id = await self.memory_store.add_memory(
-                content=content,
-                metadata=metadata,
-                topics=entry.get("topics", []),
-                generate_embedding=True,
-            )
-            if new_memory_id is not None:
-                created_ids.append(int(new_memory_id))
-
-            for source_id in entry["source_memory_ids"]:
-                source_significance[source_id] = max(
-                    source_significance.get(source_id, 0.0),
-                    significance,
-                )
-
-        for source_id, significance in source_significance.items():
-            self.memory_store.mark_memories_dream_consolidated(
-                [source_id], significance=significance
-            )
-
-        run_timestamp = now.isoformat(timespec="seconds")
-        self.memory_store.set_agent_state("dream.last_run_at", run_timestamp)
-        self.memory_store.set_agent_state(
-            "dream.last_result",
-            {
-                "run_at": run_timestamp,
-                "candidate_count": len(candidates),
-                "consolidated_count": len(created_ids),
-                "created_memory_ids": created_ids,
-            },
-        )
-
-        if created_ids:
-            logger.info(
-                "Dream cycle consolidated %d long-term memories", len(created_ids)
-            )
 
     async def _run_memory_maintenance(
         self,
@@ -3308,7 +3098,7 @@ class AgentHandler:
         user_query: str,
         assistant_response: str,
     ):
-        """Run post-response memory upkeep: cadence capture + dream consolidation."""
+
         try:
             await self._auto_capture_memory(
                 session=session,
@@ -3325,11 +3115,6 @@ class AgentHandler:
             )
         except Exception as exc:
             logger.warning("Speech pattern update failed: %s", exc)
-
-        try:
-            await self._run_dream_cycle_if_due(session=session)
-        except Exception as exc:
-            logger.warning("Dream-cycle maintenance failed: %s", exc)
 
     def _extract_consortium_vote(
         self, messages: list[dict[str, Any]]
@@ -3416,10 +3201,18 @@ class AgentHandler:
         skills_catalog_context: str = "",
         active_skills_context: str = "",
         session_prompt_suffix: str = "",
-        request_freshness_token: Optional[str] = None,
     ) -> str:
         """Build the canonical system prompt used by the primary agent."""
-        current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _now_local = datetime.datetime.now().astimezone()
+        _now_utc = datetime.datetime.now(datetime.timezone.utc)
+        # Unambiguous time context: local time WITH timezone, plus UTC and the
+        # current Unix epoch. For relative reminders the model should use
+        # reminder_create(delay_seconds=...) rather than computing an epoch.
+        current_time = (
+            f"{_now_local.strftime('%Y-%m-%d %H:%M:%S %Z')} "
+            f"(UTC {_now_utc.strftime('%Y-%m-%d %H:%M:%S')}, "
+            f"unix epoch {int(_now_utc.timestamp())})"
+        )
 
         context = {
             "current_time": current_time,
@@ -3427,7 +3220,6 @@ class AgentHandler:
             "memory_context": memory_context,
             "skills_catalog_context": skills_catalog_context,
             "active_skills_context": active_skills_context,
-            "request_freshness_token": request_freshness_token,
             "session_prompt_suffix": session_prompt_suffix,
             "identity": (custom_prompt if custom_prompt else ""),
             "plan_context": plan_context,
@@ -3470,25 +3262,17 @@ class AgentHandler:
         if complex_task:
             lines.extend(
                 [
-                    "This request appears complex enough to use the primary-model-plus-review pattern.",
-                    "Stay on the advisor-capable primary model for the actual work.",
-                    "Use consult_advisor() only if you want a second strategic pass.",
-                    "Use consult_reviewer() after non-trivial implementation or before finalizing risky work.",
+                    "This request appears complex. Work it carefully on the advisor-capable primary model.",
                 ]
             )
         else:
             lines.extend(
                 [
-                    "This request appears low-complexity. Prefer staying entirely on the advisor-capable primary model unless you hit a real blocker.",
-                    "Do not escalate to consultation tools unless strategy or risk genuinely requires it.",
+                    "This request appears low-complexity. Handle it directly on the advisor-capable primary model.",
                 ]
             )
 
         return "\n".join(lines)
-
-    def _build_request_freshness_token(self) -> str:
-        """Return a unique token for the current visible response generation."""
-        return uuid.uuid4().hex
 
     _SKILL_URL_PATTERN = re.compile(
         r"https?://\S*?skill\S*?\.md(?:\b|[?#]|$)",
@@ -3668,7 +3452,6 @@ class AgentHandler:
         skills_catalog_context: str,
         active_skills_context: str,
         session_prompt_suffix: str,
-        request_freshness_token: str = "",
     ) -> tuple[str, dict[str, Any] | None]:
         """Run one model turn in consortium mode."""
         system_content = get_template(
@@ -3686,7 +3469,6 @@ class AgentHandler:
                 "active_skills_context": (
                     active_skills_context.strip() if active_skills_context else ""
                 ),
-                "request_freshness_token": request_freshness_token,
             },
         )
 
@@ -3755,7 +3537,6 @@ class AgentHandler:
         skills_catalog_context: str = "",
         active_skills_context: str = "",
         session_prompt_suffix: str = "",
-        request_freshness_token: str = "",
     ) -> str:
         """Run four-persona consortium debate and then judge synthesis."""
         transcript: list[dict[str, Any]] = []
@@ -3787,7 +3568,6 @@ class AgentHandler:
                         skills_catalog_context=skills_catalog_context,
                         active_skills_context=active_skills_context,
                         session_prompt_suffix=session_prompt_suffix,
-                        request_freshness_token=request_freshness_token,
                     )
                 except Exception as exc:
                     logger.exception(
@@ -3833,7 +3613,6 @@ class AgentHandler:
                 "active_skills_context": (
                     active_skills_context.strip() if active_skills_context else ""
                 ),
-                "request_freshness_token": request_freshness_token,
             },
         )
 
@@ -3903,7 +3682,303 @@ class AgentHandler:
 
         return task
 
+    def _summarize_recent_turns(
+        self, session_id: Optional[str], limit: int = 4
+    ) -> str:
+        """Plain-text join of the last few conversation turns for plan context."""
+        if not session_id:
+            return ""
+        try:
+            history = self.memory_store.get_conversation_history(
+                session_id=session_id, limit=limit
+            )
+        except Exception as exc:
+            logger.warning("Failed to load recent turns for orchestrator plan: %s", exc)
+            return ""
+        # get_conversation_history returns newest-first; render oldest-first.
+        lines: list[str] = []
+        for msg in reversed(history or []):
+            role = msg.get("role", "")
+            if role not in ("user", "assistant"):
+                continue
+            text = _content_to_text(msg.get("content", "")).strip()
+            if not text:
+                continue
+            speaker = "User" if role == "user" else "Assistant"
+            lines.append(f"{speaker}: {text}")
+        return "\n".join(lines)
+
+    async def _run_blind_worker(
+        self,
+        *,
+        brief: str,
+        session_id: Optional[str],
+        memory_context: str,
+        skills_catalog_context: str,
+        active_skills_context: str,
+        session: aiohttp.ClientSession,
+        user_query: str,
+    ) -> str:
+        """Execute the orchestrator's brief with full work tools, blind to the
+        orchestration.  Returns the worker's results report."""
+        _now_local = datetime.datetime.now().astimezone()
+        _now_utc = datetime.datetime.now(datetime.timezone.utc)
+        current_time = (
+            f"{_now_local.strftime('%Y-%m-%d %H:%M:%S %Z')} "
+            f"(UTC {_now_utc.strftime('%Y-%m-%d %H:%M:%S')})"
+        )
+        worker_system = {
+            "role": "system",
+            "content": get_template(
+                "worker_system",
+                {
+                    "current_time": current_time,
+                    "memory_context": memory_context,
+                    "active_skills_context": active_skills_context,
+                    "skills_catalog_context": skills_catalog_context,
+                },
+            ),
+        }
+        worker_messages = self._build_rolling_context(
+            system_message=worker_system,
+            current_messages=[{"role": "user", "content": brief}],
+            session_id=session_id,
+            context_window=128000,
+            buffer_tokens=2000,
+        )
+
+        worker_payload = self._build_request_payload_template(session_id=None)
+        worker_payload["model"] = EXECUTOR_MODEL_ID
+        worker_payload["tools"] = [
+            tool
+            for tool in worker_payload.get("tools", [])
+            if tool.get("function", {}).get("name") not in _WORKER_EXCLUDED_TOOLS
+        ]
+        worker_payload["stream"] = False
+
+        logger.info(
+            "Orchestrated pipeline: worker executing (executor=%s, %d tools)",
+            EXECUTOR_MODEL_ID,
+            len(worker_payload["tools"]),
+        )
+        # Neutralize any leaked user-facing send: a non-channel sentinel session
+        # makes send_message_tool buffer instead of texting iMessage/Telegram.
+        worker_token = set_tool_runtime_session(
+            "orchestrated_worker__" + (session_id or "")
+        )
+        try:
+            first_response = await api_call_with_retry(
+                session,
+                BASE_URL,
+                {**worker_payload, "messages": worker_messages},
+                {"Authorization": f"Bearer {API_KEY}"},
+            )
+            worker_content = await process_response(
+                first_response,
+                worker_messages,
+                session,
+                BASE_URL,
+                API_KEY,
+                worker_payload,
+                stream_chunk_callback=None,
+            )
+            if (
+                self._self_heal_manager
+                and worker_content
+                and worker_content.startswith("Error:")
+            ):
+                heal_result = await self._self_heal_manager.try_heal(
+                    error_string=worker_content,
+                    context={
+                        "session_id": session_id,
+                        "user_query": user_query,
+                        "iteration": _extract_iteration_from_error(worker_content),
+                        "tools_executed": _extract_tools_from_error(worker_content),
+                    },
+                )
+                if heal_result.success and heal_result.applied:
+                    worker_content = (
+                        f"{worker_content}\n\n[Self-healed: {heal_result.summary}]"
+                    )
+        finally:
+            reset_tool_runtime_session(worker_token)
+
+        # Defensive: unwrap a delivered-via-tool envelope if one leaked through.
+        try:
+            envelope = json.loads(worker_content or "")
+            if isinstance(envelope, dict) and envelope.get("delivered_via_tool"):
+                worker_content = envelope.get("text") or "[task completed]"
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        logger.info(
+            "Orchestrated pipeline: worker done (%d chars)", len(worker_content or "")
+        )
+        return worker_content or ""
+
+    async def _run_orchestrated_task(
+        self,
+        *,
+        user_query: str,
+        session_id: Optional[str],
+        data: dict[str, Any],
+        memory_context: str,
+        skills_catalog_context: str,
+        active_skills_context: str,
+        session: aiohttp.ClientSession,
+    ) -> str:
+        """Run a non-trivial task as orchestrator-plan → blind worker → finalize.
+
+        Returns the final user-facing string.  Raises on stage-1 failure so the
+        caller can fall back to the single-model path; stage-3 failure degrades
+        to returning the worker's own results.
+        """
+        auth_headers = {"Authorization": f"Bearer {API_KEY}"}
+        logger.info(
+            "Orchestrated pipeline: planning (session=%s, advisor=%s)",
+            session_id or "-",
+            ADVISOR_MODEL_ID,
+        )
+
+        # ── Stage 1: orchestrator plan (advisor model, no tools) ──────────────
+        plan_system = get_template(
+            "orchestrator_plan",
+            {
+                "user_query": user_query,
+                "memory_context": memory_context,
+                "conversation_summary": self._summarize_recent_turns(session_id),
+            },
+        )
+        plan_payload = BASE_PAYLOAD.copy()
+        plan_payload["model"] = ADVISOR_MODEL_ID
+        plan_payload["tools"] = []
+        plan_payload["max_tokens"] = ORCHESTRATOR_PLAN_MAX_TOKENS
+        plan_payload["stream"] = False
+        plan_payload["messages"] = [
+            {"role": "system", "content": plan_system},
+            {"role": "user", "content": user_query},
+        ]
+        plan_response = await api_call_with_retry(
+            session, BASE_URL, plan_payload, auth_headers
+        )
+        if "error" in plan_response or not plan_response.get("choices"):
+            raise RuntimeError(
+                f"orchestrator plan failed: {plan_response.get('error', 'no choices')}"
+            )
+        brief = safe_strip_markdown(
+            _content_to_text(plan_response["choices"][0]["message"].get("content", ""))
+        ).strip()
+        if not brief:
+            raise RuntimeError("orchestrator plan returned an empty brief")
+        logger.info("Orchestrated pipeline: brief ready (%d chars)", len(brief))
+
+        # ── Stage 2: blind worker (executor model, full work tools) ───────────
+        worker_content = await self._run_blind_worker(
+            brief=brief,
+            session_id=session_id,
+            memory_context=memory_context,
+            skills_catalog_context=skills_catalog_context,
+            active_skills_context=active_skills_context,
+            session=session,
+            user_query=user_query,
+        )
+
+        # ── Stage 3: orchestrator finalize (advisor model, no tools) ──────────
+        worker_results = (worker_content or "").strip() or "[No results returned]"
+        if len(worker_results) > ORCHESTRATOR_WORKER_RESULT_CHAR_LIMIT:
+            worker_results = (
+                worker_results[:ORCHESTRATOR_WORKER_RESULT_CHAR_LIMIT]
+                + "\n\n[results truncated]"
+            )
+        finalize_system = get_template(
+            "orchestrator_finalize",
+            {"user_query": user_query, "worker_results": worker_results},
+        )
+        finalize_payload = BASE_PAYLOAD.copy()
+        finalize_payload["model"] = ADVISOR_MODEL_ID
+        finalize_payload["tools"] = []
+        finalize_payload["max_tokens"] = ORCHESTRATOR_FINALIZE_MAX_TOKENS
+        finalize_payload["stream"] = False
+        finalize_payload["messages"] = [
+            {"role": "system", "content": finalize_system},
+            {"role": "user", "content": user_query},
+        ]
+        logger.info(
+            "Orchestrated pipeline: finalizing reply (advisor=%s)", ADVISOR_MODEL_ID
+        )
+        finalize_response = await api_call_with_retry(
+            session, BASE_URL, finalize_payload, auth_headers
+        )
+        if "error" in finalize_response or not finalize_response.get("choices"):
+            logger.warning(
+                "Orchestrated pipeline: finalize failed (%s); returning worker results",
+                finalize_response.get("error", "no choices"),
+            )
+            return worker_content or ""
+        final_text = safe_strip_markdown(
+            _content_to_text(
+                finalize_response["choices"][0]["message"].get("content", "")
+            )
+        ).strip()
+        if not final_text:
+            logger.warning(
+                "Orchestrated pipeline: finalize returned empty; returning worker results"
+            )
+            return worker_content or ""
+        logger.info("Orchestrated pipeline: finalize complete")
+        return final_text
+
     async def handle(
+        self,
+        request,
+        session_id: Optional[str] = None,
+        interim_response_callback: Optional[Callable[[str], Awaitable[None]]] = None,
+        response_chunk_callback: Optional[Callable[[str], Awaitable[None]]] = None,
+        request_metadata: Optional[dict[str, Any]] = None,
+    ):
+        """Log the turn, run the pipeline, and bubble any failure cleanly.
+
+        Wraps ``_handle_impl`` so the inbound user message and outbound reply are
+        logged consistently, and any exception raised ANYWHERE in the pipeline is
+        logged with full context and returned as a clean ``Error:`` string rather
+        than crashing the caller.
+        """
+        try:
+            _user_msgs = [
+                m
+                for m in (request or {}).get("messages", [])
+                if m.get("role") == "user"
+            ]
+            _user_query = (
+                _content_to_text(_user_msgs[-1].get("content")) if _user_msgs else ""
+            )
+        except Exception:
+            _user_query = ""
+        log_user_turn(session_id, _user_query)
+
+        try:
+            content = await self._handle_impl(
+                request,
+                session_id=session_id,
+                interim_response_callback=interim_response_callback,
+                response_chunk_callback=response_chunk_callback,
+                request_metadata=request_metadata,
+            )
+        except Exception as exc:
+            logger.exception("handle() failed for session=%s", session_id or "-")
+            error_reply = f"Error: {exc}"
+            log_assistant_turn(session_id, error_reply, is_error=True)
+            return error_reply
+
+        _visible = self._visible_text_from_response(content) if content else ""
+        log_assistant_turn(
+            session_id,
+            _visible or content,
+            is_error=bool(content) and str(content).startswith("Error:"),
+        )
+        return content
+
+    async def _handle_impl(
         self,
         request,
         session_id: Optional[str] = None,
@@ -4110,8 +4185,6 @@ class AgentHandler:
                 example_context += f"Input: {ex['input']}\n"
                 example_context += f"Output: {ex['output']}\n\n"
 
-        request_freshness_token = self._build_request_freshness_token()
-
         system_content = self._build_system_content(
             custom_prompt=custom_prompt,
             memory_context=memory_context,
@@ -4121,7 +4194,6 @@ class AgentHandler:
             skills_catalog_context=skills_catalog_context,
             active_skills_context=active_skills_context,
             session_prompt_suffix=session_prompt_suffix,
-            request_freshness_token=request_freshness_token,
         )
 
         should_contact_consortium = False
@@ -4162,7 +4234,6 @@ class AgentHandler:
                         skills_catalog_context=skills_catalog_context,
                         active_skills_context=active_skills_context,
                         session_prompt_suffix=session_prompt_suffix,
-                        request_freshness_token=request_freshness_token,
                     )
                 finally:
                     reset_tool_runtime_session(session_token)
@@ -4199,6 +4270,65 @@ class AgentHandler:
                 self.example_bank.auto_feedback(task.type, success=True, efficiency=1.0)
 
             return content
+
+        # ── Orchestrated pipeline: plan → blind worker → finalize ─────────────
+        # Non-trivial tasks run through a separate planner/worker/finalizer split.
+        # Any failure falls through to the standard single-model path below.
+        if (
+            ORCHESTRATED_PIPELINE_ENABLED
+            and user_query
+            and not _is_trivial_query(user_query, task, task_plan)
+        ):
+            try:
+                async with aiohttp.ClientSession() as orch_session:
+                    content = await self._run_orchestrated_task(
+                        user_query=user_query,
+                        session_id=session_id,
+                        data=data,
+                        memory_context=memory_context,
+                        skills_catalog_context=skills_catalog_context or "",
+                        active_skills_context=active_skills_context or "",
+                        session=orch_session,
+                    )
+
+                content = self._finalize_visible_response(content, session_id)
+                visible_text = self._visible_text_from_response(content)
+
+                if session_id and user_query:
+                    self.memory_store.add_conversation_message(
+                        role="user",
+                        content=user_query,
+                        session_id=session_id,
+                        metadata=normalized_request_metadata or None,
+                    )
+                if session_id and visible_text:
+                    self.memory_store.add_conversation_message(
+                        role="assistant",
+                        content=visible_text,
+                        session_id=session_id,
+                    )
+
+                async with aiohttp.ClientSession() as maint_session:
+                    await self._run_memory_maintenance(
+                        session=maint_session,
+                        session_id=session_id,
+                        user_query=user_query,
+                        assistant_response=visible_text,
+                    )
+
+                if task and visible_text and not visible_text.startswith("Error:"):
+                    self.example_bank.auto_feedback(
+                        task.type, success=True, efficiency=1.0
+                    )
+
+                return content
+            except Exception:
+                logger.exception(
+                    "Orchestrated pipeline failed for session=%s; "
+                    "falling back to single-model path",
+                    session_id,
+                )
+                # fall through to the standard single-model path below
 
         system_message = {
             "role": "system",

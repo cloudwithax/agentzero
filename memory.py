@@ -118,7 +118,7 @@ class MemoryStore:
         """
         )
 
-        # Agent-wide state for long-running behavior (e.g., dream schedule)
+        # Agent-wide state for long-running behavior
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS agent_state (
@@ -1081,46 +1081,6 @@ class MemoryStore:
             "hour_counts": hour_counts,
         }
 
-    def infer_offpeak_hours(
-        self,
-        lookback_days: int = 21,
-        min_days: int = 14,
-        window_hours: int = 6,
-    ) -> dict[str, Any]:
-        """Infer a contiguous low-traffic hour window for dream-mode maintenance."""
-        stats = self.get_conversation_activity_by_hour(lookback_days=lookback_days)
-        min_days = max(1, int(min_days))
-        window_hours = max(2, min(12, int(window_hours)))
-
-        if stats["distinct_days"] < min_days:
-            return {
-                "hours": [],
-                "reason": "insufficient_history",
-                "stats": stats,
-            }
-
-        hour_counts = stats["hour_counts"]
-        best_start = 0
-        best_score: Optional[int] = None
-
-        for start in range(24):
-            window = [(start + offset) % 24 for offset in range(window_hours)]
-            score = sum(hour_counts[hour] for hour in window)
-            if best_score is None or score < best_score:
-                best_score = score
-                best_start = start
-
-        selected_hours = sorted(
-            [(best_start + offset) % 24 for offset in range(window_hours)]
-        )
-
-        return {
-            "hours": selected_hours,
-            "reason": "ok",
-            "window_score": best_score if best_score is not None else 0,
-            "stats": stats,
-        }
-
     def set_agent_state(self, key: str, value: Any):
         """Persist a small JSON-serializable state value."""
         conn = sqlite3.connect(self.db_path)
@@ -1274,118 +1234,7 @@ class MemoryStore:
 
         return reminders
 
-    def get_memories_for_consolidation(
-        self,
-        limit: int = 24,
-        min_age_hours: int = 24,
-    ) -> list[Memory]:
-        """Return memory candidates eligible for dream consolidation."""
-        limit = max(1, int(limit))
-        min_age_hours = max(1, int(min_age_hours))
-        cutoff = (datetime.now() - timedelta(hours=min_age_hours)).strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
 
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT id, content, embedding, metadata, created_at, updated_at
-            FROM memories
-            WHERE created_at <= ?
-            ORDER BY created_at DESC
-            LIMIT ?
-        """,
-            (cutoff, limit * 3),
-        )
-        rows = cursor.fetchall()
-        conn.close()
-
-        disallowed_types = {"system_prompt", "long_term_memory"}
-        candidates: list[Memory] = []
-
-        for row in rows:
-            (
-                memory_id,
-                content,
-                embedding_bytes,
-                metadata_blob,
-                created_at,
-                updated_at,
-            ) = row
-            metadata = self._parse_metadata_blob(metadata_blob)
-            memory_type = str(metadata.get("type", "")).strip()
-
-            if memory_type in disallowed_types:
-                continue
-            if metadata.get("dream_consolidated"):
-                continue
-
-            embedding = (
-                self._bytes_to_embedding(embedding_bytes) if embedding_bytes else None
-            )
-
-            candidates.append(
-                Memory(
-                    id=memory_id,
-                    content=content,
-                    embedding=embedding,
-                    metadata=metadata,
-                    created_at=created_at,
-                    updated_at=updated_at,
-                )
-            )
-
-            if len(candidates) >= limit:
-                break
-
-        return candidates
-
-    def mark_memories_dream_consolidated(
-        self,
-        memory_ids: list[int],
-        significance: Optional[float] = None,
-    ) -> int:
-        """Mark source memories as consolidated by the dream cycle."""
-        unique_ids = sorted({int(m_id) for m_id in memory_ids if int(m_id) > 0})
-        if not unique_ids:
-            return 0
-
-        consolidated_at = datetime.now().isoformat(timespec="seconds")
-        clamped_significance = None
-        if significance is not None:
-            clamped_significance = max(0.0, min(1.0, float(significance)))
-
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        updated = 0
-
-        for memory_id in unique_ids:
-            cursor.execute("SELECT metadata FROM memories WHERE id = ?", (memory_id,))
-            row = cursor.fetchone()
-            if not row:
-                continue
-
-            metadata = self._parse_metadata_blob(row[0])
-            metadata["dream_consolidated"] = True
-            metadata["dream_consolidated_at"] = consolidated_at
-            if clamped_significance is not None:
-                metadata["dream_significance"] = clamped_significance
-
-            cursor.execute(
-                """
-                UPDATE memories
-                SET metadata = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-            """,
-                (json.dumps(metadata), memory_id),
-            )
-            if cursor.rowcount:
-                updated += 1
-
-        conn.commit()
-        conn.close()
-        return updated
 
     def get_system_prompt(self) -> Optional[str]:
         """Get the custom system prompt."""

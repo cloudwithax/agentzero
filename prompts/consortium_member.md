@@ -21,7 +21,4 @@ User-configured system prompt: {{custom_prompt}}{{/if}}{{#if session_prompt_suff
 
 {{skills_catalog_context}}{{/if}}{{#if active_skills_context}}
 
-{{active_skills_context}}{{/if}}{{#if request_freshness_token}}
-
-[Request Freshness]: This turn includes a one-time freshness token to discourage cache reuse and repeated phrasing. Treat the request as new and answer independently.
-[Freshness Token]: {{request_freshness_token}}{{/if}}
+{{active_skills_context}}{{/if}}

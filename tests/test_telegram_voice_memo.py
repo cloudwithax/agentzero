@@ -28,16 +28,18 @@ async def test_telegram_file_url_preserves_absolute_file_paths() -> None:
 
     url = await _telegram_file_url(bot, "photo-id")
 
-    assert (
-        url
-        == "https://api.telegram.org/file/bottest-token/photos/file_1.jpg"
-    )
+    assert url == "https://api.telegram.org/file/bottest-token/photos/file_1.jpg"
 
 
-async def test_extract_telegram_attachment_urls_includes_voice_audio_and_images() -> None:
+async def test_extract_telegram_attachment_urls_includes_voice_audio_and_images() -> (
+    None
+):
     """Telegram attachment extraction should include image and audio payloads."""
     message = SimpleNamespace(
-        photo=[SimpleNamespace(file_id="photo-small"), SimpleNamespace(file_id="photo-large")],
+        photo=[
+            SimpleNamespace(file_id="photo-small"),
+            SimpleNamespace(file_id="photo-large"),
+        ],
         voice=SimpleNamespace(file_id="voice-note"),
         audio=SimpleNamespace(file_id="audio-track"),
         document=SimpleNamespace(file_id="audio-doc", mime_type="audio/ogg"),
@@ -57,7 +59,9 @@ async def test_extract_telegram_attachment_urls_includes_voice_audio_and_images(
     ]
 
 
-async def test_build_telegram_user_content_transcribes_voice_notes_and_keeps_images() -> None:
+async def test_build_telegram_user_content_transcribes_voice_notes_and_keeps_images() -> (
+    None
+):
     """Telegram voice notes should be transcribed before multimodal image handling."""
     previous_enabled = os.environ.get("TELEGRAM_VOICE_MEMO_TRANSCRIPTION_ENABLED")
     os.environ["TELEGRAM_VOICE_MEMO_TRANSCRIPTION_ENABLED"] = "1"
@@ -90,9 +94,11 @@ async def test_build_telegram_user_content_transcribes_voice_notes_and_keeps_ima
 
     assert result == "compiled telegram content"
     assert transcribe_mock.await_count == 1
+    assert transcribe_mock.await_args is not None
     assert transcribe_mock.await_args.kwargs.get("config_prefix") == "TELEGRAM"
     assert build_content_mock.await_count == 1
 
+    assert build_content_mock.await_args is not None
     build_args = build_content_mock.await_args.args
     assert "Please summarize this voice note" in build_args[0]
     assert "[Voice memo transcript]" in build_args[0]
@@ -110,10 +116,16 @@ async def test_transcribe_audio_bytes_uses_telegram_voice_memo_overrides() -> No
     os.environ["TELEGRAM_VOICE_MEMO_LANGUAGE"] = "es-US"
 
     transcribe_mock = Mock(return_value="transcript")
+    convert_mock = Mock(
+        return_value=(b"wav-bytes", "voice-memo-converted.wav", "audio/wav")
+    )
     try:
         with patch(
             "integrations._transcribe_audio_bytes_with_whisper_sync",
             new=transcribe_mock,
+        ), patch(
+            "integrations._convert_m4a_audio_with_ffmpeg_sync",
+            new=convert_mock,
         ):
             transcript = await _transcribe_audio_bytes_with_whisper(
                 cast(Any, None),
@@ -140,12 +152,13 @@ async def test_transcribe_audio_bytes_uses_telegram_voice_memo_overrides() -> No
 
     assert transcript == "transcript"
     transcribe_mock.assert_called_once_with(
-        b"audio-bytes",
+        b"wav-bytes",
         "test-key",
         "grpc.nvcf.nvidia.com:443",
         "telegram-function",
         "es-US",
         "",
+        16000,
     )
 
 

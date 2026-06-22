@@ -223,12 +223,12 @@ async def test_backfill_untranscribed_voice_memos_updates_conversation_content()
     assert "[Voice memo attachments not transcribed]" in updated_content
 
 
-async def test_transcribe_audio_bytes_retries_m4a_with_ffmpeg() -> None:
-    """Retry m4a voice memos with ffmpeg-converted bytes when first pass fails."""
+async def test_transcribe_audio_bytes_converts_to_wav_then_transcribes() -> None:
+    """Voice memos are converted to WAV with ffmpeg, then transcribed once."""
     previous_api_key = os.environ.get("NVIDIA_API_KEY")
     os.environ["NVIDIA_API_KEY"] = "test-key"
 
-    transcribe_mock = Mock(side_effect=[None, "converted transcript"])
+    transcribe_mock = Mock(return_value="converted transcript")
     convert_mock = Mock(
         return_value=(b"wav-bytes", "voice-memo-converted.wav", "audio/wav")
     )
@@ -254,19 +254,21 @@ async def test_transcribe_audio_bytes_retries_m4a_with_ffmpeg() -> None:
             os.environ["NVIDIA_API_KEY"] = previous_api_key
 
     assert transcript == "converted transcript"
-    assert transcribe_mock.call_count == 2
     assert convert_mock.call_count == 1
+    # Transcribe runs once, on the converted WAV bytes (not the raw input).
+    assert transcribe_mock.call_count == 1
+    assert transcribe_mock.call_args.args[0] == b"wav-bytes"
+    # Sample rate is passed so Parakeet does not reject sample_rate=0.
+    assert transcribe_mock.call_args.args[6] == 16000
 
 
-async def test_transcribe_audio_bytes_retries_caf_with_ffmpeg() -> None:
-    """Retry caf voice memos with ffmpeg-converted bytes when first pass fails."""
+async def test_transcribe_audio_bytes_returns_none_when_conversion_fails() -> None:
+    """When ffmpeg conversion fails, transcription is skipped (no transcribe call)."""
     previous_api_key = os.environ.get("NVIDIA_API_KEY")
     os.environ["NVIDIA_API_KEY"] = "test-key"
 
-    transcribe_mock = Mock(side_effect=[None, "caf converted transcript"])
-    convert_mock = Mock(
-        return_value=(b"wav-bytes", "voice-memo-converted.wav", "audio/wav")
-    )
+    transcribe_mock = Mock(return_value="should not be called")
+    convert_mock = Mock(return_value=None)
 
     try:
         with patch(
@@ -288,9 +290,9 @@ async def test_transcribe_audio_bytes_retries_caf_with_ffmpeg() -> None:
         else:
             os.environ["NVIDIA_API_KEY"] = previous_api_key
 
-    assert transcript == "caf converted transcript"
-    assert transcribe_mock.call_count == 2
+    assert transcript is None
     assert convert_mock.call_count == 1
+    assert transcribe_mock.call_count == 0
 
 
 async def test_transcribe_audio_bytes_uses_parakeet_defaults() -> None:
@@ -301,11 +303,17 @@ async def test_transcribe_audio_bytes_uses_parakeet_defaults() -> None:
     os.environ["NVIDIA_API_KEY"] = "test-key"
 
     transcribe_mock = Mock(return_value="transcript")
+    convert_mock = Mock(
+        return_value=(b"wav-bytes", "voice-memo-converted.wav", "audio/wav")
+    )
 
     try:
         with patch(
             "integrations._transcribe_audio_bytes_with_whisper_sync",
             new=transcribe_mock,
+        ), patch(
+            "integrations._convert_m4a_audio_with_ffmpeg_sync",
+            new=convert_mock,
         ):
             transcript = await _transcribe_audio_bytes_with_whisper(
                 cast(Any, None),
@@ -331,12 +339,13 @@ async def test_transcribe_audio_bytes_uses_parakeet_defaults() -> None:
 
     assert transcript == "transcript"
     transcribe_mock.assert_called_once_with(
-        b"audio-bytes",
+        b"wav-bytes",
         "test-key",
         "grpc.nvcf.nvidia.com:443",
-        "d8dd4e9b-fbf5-4fb0-9dba-8cf436c8d965",
+        "71203149-d3b7-4460-8231-1be2543a1fca",
         "en-US",
         "",
+        16000,
     )
 
 
@@ -348,8 +357,8 @@ async def main() -> int:
     await test_transcribe_sendblue_voice_memos_merges_and_filters()
     await test_transcribe_sendblue_voice_memos_respects_disable_flag()
     await test_backfill_untranscribed_voice_memos_updates_conversation_content()
-    await test_transcribe_audio_bytes_retries_m4a_with_ffmpeg()
-    await test_transcribe_audio_bytes_retries_caf_with_ffmpeg()
+    await test_transcribe_audio_bytes_converts_to_wav_then_transcribes()
+    await test_transcribe_audio_bytes_returns_none_when_conversion_fails()
     await test_transcribe_audio_bytes_uses_parakeet_defaults()
     print("All Sendblue voice memo tests passed")
     return 0
